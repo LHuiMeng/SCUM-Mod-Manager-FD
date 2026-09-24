@@ -83,7 +83,7 @@ flutter build windows --release --dart-define=APP_VERSION=2.6.5
 
 ## 五、验证清单（对外版发布前）
 
-1. `grep -r 'scum-mods\.' build/windows/x64/runner/Release/data/app.so` 无命中
+1. `grep -r '你的私有域名字符串' build/windows/x64/runner/Release/data/app.so` 无命中
    （对外版产物不得含任何私有域名字节）。
 2. 便携版顶层含 `app.json` + `versions/<ver>/` 完整结构。
 3. 启动后标题栏版本号正确、无更新按钮、云上mod 面板显示空态。
