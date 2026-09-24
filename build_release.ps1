@@ -9,7 +9,7 @@
 #   4. 清干净 build/windows/x64/runner/Release/（确保无 .bak 残留）
 #   5. 打 ZIP（排除 ~mods/、logs/、ue4ss_runtime/、assets/、flutter_assets/、config.json、mods_meta.json、*.bak）
 #   6. node make_manifest.js 生成签名 manifest（自验 HMAC）
-#   7. scp 上传 ZIP + manifest 到 {SSH_HOST}:/opt/scum-mod-registry/data/app/v{version}/
+#   7. scp 上传 ZIP + manifest 到 {SSH_HOST}:{REMOTE_BASE}/data/app/v{version}/
 #   8. 验证远端 manifest + ZIP 可达
 #
 # 用法：
@@ -56,6 +56,9 @@ param(
 
         [Parameter(Mandatory=$false)]
         [string]$SshHost = "",     # 服务器 SSH 别名（~/.ssh/config 主机名），上传目标。缺省空=不上传
+
+        [Parameter(Mandatory=$false)]
+        [string]$ServerDir = "",                        # 服务器端更新根目录（如 /opt/your-registry，含 app/v<ver>/ 等）
     )
 
 $ErrorActionPreference = "Stop"
@@ -287,7 +290,7 @@ if ($SkipUpload) {
     # 上传段临时降为 Continue —— 成败完全以显式的 $LASTEXITCODE 检查为准。
     $oldEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $serverDir = "/opt/scum-mod-registry/data/app/v$Version"
+    $serverDir = "$ServerDir/data/app/v$Version"
     $upDir = "$serverDir/.uploading"
 
     # ★ 原子上传：先传 staging（.uploading/），全部到位后再 mv 落位。
