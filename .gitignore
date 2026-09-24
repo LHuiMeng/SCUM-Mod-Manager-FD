@@ -1,0 +1,40 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+.pub/
+build/
+*.lock
+*.iml
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.env.local
+config.json
+mods_meta.json
+*_token*
+# 在线更新 HMAC verify key（dart-define-from-file 注入，绝不上仓库）
+update_secret.json
+
+# Hermes
+.hermes/
+.worktrees/
+*.bak
+
+# Build artifacts (Flutter release output copied to repo root by build scripts)
+data/
+scum_mod_manager.exe
+scum_mod_manager_updater.exe
+flutter_windows.dll
+scum_mod_manager.zip
