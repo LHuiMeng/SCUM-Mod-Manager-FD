@@ -14,17 +14,32 @@ REM ============================================================================
 setlocal enabledelayedexpansion
 
 set PROJECT_DIR=%~dp0
-set FLUTTER_BAT=W:\hermes\flutter\flutter\bin\flutter.bat
-set NSIS_EXE=C:\Program Files (x86)\NSIS\makensis.exe
 set VERSION=2.6.5
+
+REM --- Locate flutter (PATH or FLUTTER_BAT) ---
+set "FLUTTER="
+where flutter >nul 2>&1 && set "FLUTTER=flutter"
+if not defined FLUTTER (
+    if defined FLUTTER_BAT (
+        if exist "%FLUTTER_BAT%" set "FLUTTER=%FLUTTER_BAT%"
+    )
+)
+if not defined FLUTTER (
+    echo [ERROR] Flutter SDK not found. Install from https://flutter.dev
+    echo   and add to PATH, or set FLUTTER_BAT.
+    pause
+    exit /b 1
+)
+echo   Flutter: %FLUTTER%
 
 echo.
 echo === [1/4] Flutter build (release, NO cloud defines) ===
 echo.
 cd /d "%PROJECT_DIR%"
-call "%FLUTTER_BAT%" build windows --release --dart-define=APP_VERSION=%VERSION%
+call "%FLUTTER%" build windows --release --dart-define=APP_VERSION=%VERSION%
 if errorlevel 1 (
     echo ERROR: flutter build failed
+    pause
     exit /b 1
 )
 
@@ -36,11 +51,20 @@ if not exist "%PROJECT_DIR%\build\dist" mkdir "%PROJECT_DIR%\build\dist"
 echo.
 echo === [3/4] Build NSIS installer (public) ===
 echo.
-cd /d "%PROJECT_DIR%\installer"
-"%NSIS_EXE%" /DPUBLIC_BUILD installer.nsi
-if errorlevel 1 (
-    echo ERROR: NSIS build failed
-    exit /b 1
+set "NSIS="
+where makensis >nul 2>&1 && set "NSIS=makensis"
+if not defined NSIS (
+    if exist "C:\Program Files (x86)\NSIS\makensis.exe" set "NSIS=C:\Program Files (x86)\NSIS\makensis.exe"
+)
+if defined NSIS (
+    cd /d "%PROJECT_DIR%\installer"
+    call "%NSIS%" /DPUBLIC_BUILD installer.nsi
+    if errorlevel 1 (
+        echo [WARN] NSIS build failed (continuing with portable only).
+    )
+) else (
+    echo [SKIP] NSIS not found - skipping installer. Portable will still be built.
+    echo   Install NSIS: https://nsis.sourceforge.io
 )
 
 echo.
@@ -73,3 +97,4 @@ echo.
 echo Installer : %PROJECT_DIR%\build\dist\scum_mod_manager_v%VERSION%_public_setup.exe
 echo Portable  : %PORTABLE_DIR%\scum_mod_manager.exe
 echo.
+pause
