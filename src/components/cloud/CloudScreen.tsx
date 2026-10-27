@@ -80,7 +80,7 @@ export function CloudScreen({
         <EmptyState
           icon="cloud"
           title="尚未配置云源"
-          description="云源地址不写死在程序里。请先在设置中配置线路，或通过 secrets 注入开发环境。"
+          description="安装包没有预置可用云源。请先在设置中配置线路，或安装带默认云源的正式版本。"
           action={
             <Button variant="primary" onClick={onOpenSettings}>
               打开云源设置

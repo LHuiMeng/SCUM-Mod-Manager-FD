@@ -8,7 +8,21 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $runtimeSecret = Join-Path $root "secrets\runtime.toml"
 $outputRoot = Join-Path $root "release-output"
 
+function Assert-CloudSources {
+  if (-not (Test-Path -LiteralPath $runtimeSecret -PathType Leaf)) {
+    throw "Release build requires secrets/runtime.toml with [cloud].base_urls."
+  }
+  $secretText = Get-Content -LiteralPath $runtimeSecret -Raw
+  if ($secretText -notmatch '(?ms)^\s*base_urls\s*=\s*\[(?<urls>.*?)\]') {
+    throw "Release build requires [cloud].base_urls in secrets/runtime.toml."
+  }
+  if ($Matches.urls -notmatch 'https://') {
+    throw "Release build requires at least one HTTPS URL in [cloud].base_urls."
+  }
+}
+
 function Build-Edition([string]$Name) {
+  Assert-CloudSources
   if ($Name -eq "server" -and -not (Test-Path -LiteralPath $runtimeSecret -PathType Leaf)) {
     throw "Server build requires secrets/runtime.toml with [cloud].auth_token."
   }

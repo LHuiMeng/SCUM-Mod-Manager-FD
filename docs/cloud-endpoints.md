@@ -1,8 +1,10 @@
 # 云源接口与安全约定
 
-本文描述 SCUM Mod Desk v3 当前的 React + Rust 云源实现。云源地址不写死在
-前端或程序里，由用户在本机设置页配置；服务器版共享密钥只由 Rust 后端从
-`secrets/runtime.toml` 或安装包内的 `runtime-secrets/runtime.toml` 读取。
+本文描述 SCUM Mod Desk v3 当前的 React + Rust 云源实现。发布构建可从被 Git
+忽略的 `secrets/runtime.toml` 的 `[cloud].base_urls` 注入默认线路；地址不出现
+在 React、Rust 源码或测试中。首次启动会把默认线路写入本机配置，之后用户配置
+优先。服务器版共享密钥只由 Rust 后端从 `secrets/runtime.toml` 或安装包内的
+`runtime-secrets/runtime.toml` 读取。
 
 ## 本机配置
 
@@ -22,6 +24,8 @@
 
 - `baseUrls` 是有序候选线路；读取配置时会去重并从前到后尝试。
 - `activeBaseUrl` 是最近成功线路；刷新时会优先尝试，成功后再写回配置。
+- `config.json` 当前没有线路时，Rust 会写入构建时注入的默认线路；已有线路
+  不会被覆盖。
 - 云源只接受 HTTPS。仅 `localhost`、`127.0.0.1` 和 `::1` 允许使用 HTTP，
   用于本机开发。
 - 带用户名或密码的 URL 会被拒绝。配置中不得写入访问令牌。

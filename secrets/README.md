@@ -26,5 +26,9 @@ Server installers bundle `runtime.toml` as a build resource. Public
 installers never include it, and the Rust backend ignores `[cloud].auth_token`
 when compiled as the public edition.
 
+Both editions require `[cloud].base_urls` when producing a release build. The
+public build embeds only the validated directory URLs at compile time so the
+first launch is ready to use; it never embeds or bundles the shared token.
+
 The repository tracks only `README.md` and `example.toml` from this directory.
 Everything else, including nested files, is local-only.

@@ -66,8 +66,9 @@ npm run package:portable -- -Edition public
 
 ### 公开发行版与服务器版
 
-服务器版需要先复制 `secrets/example.toml` 为 `secrets/runtime.toml`，填写
-`[cloud].auth_token`，然后构建：
+发布构建前先复制 `secrets/example.toml` 为 `secrets/runtime.toml`，并在
+`[cloud].base_urls` 填写公开云目录线路。公开版只会把线路编入程序，不打包该
+文件；服务器版还需要填写 `[cloud].auth_token`，然后构建：
 
 ```powershell
 npm run build:editions -- -Edition public
@@ -76,7 +77,7 @@ npm run build:editions -- -Edition both
 ```
 
 安装器输出到 `release-output/public/` 与 `release-output/server/`。公开版不包含
-`runtime.toml`，Rust 也会强制忽略共享密钥；服务器版把 `runtime.toml` 打入
+`runtime.toml`，Rust 也会强制忽略共享密钥；服务器版另外把 `runtime.toml` 打入
 `runtime-secrets/runtime.toml`，仅由 Rust 后端读取。
 
 共享密钥会随服务器安装包分发，具备本机文件读取能力的人最终可以提取它。

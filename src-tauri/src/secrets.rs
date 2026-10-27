@@ -1,10 +1,14 @@
 use crate::edition::Edition;
 use crate::paths::AppPaths;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+const PACKAGED_CLOUD_BASE_URLS_JSON: &str = env!("SCUM_PACKAGED_CLOUD_BASE_URLS_JSON");
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeSecrets {
+    pub cloud_base_urls: Vec<String>,
     pub cloud_auth_token: String,
     pub update_endpoint: String,
     pub update_public_key: String,
@@ -14,14 +18,20 @@ pub fn load_runtime_secrets(paths: &AppPaths, edition: Edition) -> RuntimeSecret
     let text = secret_candidates(paths)
         .into_iter()
         .find_map(|path| std::fs::read_to_string(path).ok());
-    let Some(text) = text else {
-        return RuntimeSecrets::default();
-    };
-    let Ok(value) = text.parse::<toml::Value>() else {
-        return RuntimeSecrets::default();
-    };
-    let cloud = value.get("cloud");
-    let update = value.get("update");
+    parse_runtime_secrets(text.as_deref(), edition, packaged_cloud_base_urls())
+}
+
+fn parse_runtime_secrets(
+    text: Option<&str>,
+    edition: Edition,
+    packaged_cloud_base_urls: Vec<String>,
+) -> RuntimeSecrets {
+    let value = text.and_then(|text| text.parse::<toml::Value>().ok());
+    let cloud = value.as_ref().and_then(|value| value.get("cloud"));
+    let update = value.as_ref().and_then(|value| value.get("update"));
+    let cloud_base_urls = cloud
+        .and_then(cloud_base_urls_from_toml)
+        .unwrap_or_else(|| normalize_cloud_base_urls(packaged_cloud_base_urls));
     let mut cloud_auth_token = ["auth_token", "catalog_token", "gate_token"]
         .into_iter()
         .find_map(|key| {
@@ -37,6 +47,7 @@ pub fn load_runtime_secrets(paths: &AppPaths, edition: Edition) -> RuntimeSecret
         cloud_auth_token.clear();
     }
     RuntimeSecrets {
+        cloud_base_urls,
         cloud_auth_token,
         update_endpoint: update
             .and_then(|item| item.get("endpoint"))
@@ -49,6 +60,35 @@ pub fn load_runtime_secrets(paths: &AppPaths, edition: Edition) -> RuntimeSecret
             .unwrap_or_default()
             .to_string(),
     }
+}
+
+fn packaged_cloud_base_urls() -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(PACKAGED_CLOUD_BASE_URLS_JSON).unwrap_or_default()
+}
+
+fn cloud_base_urls_from_toml(cloud: &toml::Value) -> Option<Vec<String>> {
+    if let Some(items) = cloud.get("base_urls").and_then(toml::Value::as_array) {
+        let urls = normalize_cloud_base_urls(
+            items
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(ToString::to_string),
+        );
+        return (!urls.is_empty()).then_some(urls);
+    }
+    cloud
+        .get("base_url")
+        .and_then(toml::Value::as_str)
+        .map(|url| normalize_cloud_base_urls([url.to_string()]))
+        .filter(|urls| !urls.is_empty())
+}
+
+fn normalize_cloud_base_urls(urls: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    urls.into_iter()
+        .filter_map(|url| crate::config::normalize_cloud_url(&url))
+        .filter(|url| seen.insert(url.to_ascii_lowercase()))
+        .collect()
 }
 
 fn secret_candidates(paths: &AppPaths) -> Vec<PathBuf> {
@@ -175,7 +215,7 @@ fn unprotect(_input: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_runtime_secrets, read_secret, write_secret};
+    use super::{load_runtime_secrets, parse_runtime_secrets, read_secret, write_secret};
     use crate::edition::Edition;
     use crate::test_support::TempRoot;
     use std::fs;
@@ -188,6 +228,7 @@ mod tests {
             paths.secrets.join("runtime.toml"),
             concat!(
                 "[cloud]\n",
+                "base_urls = [\"https://catalog.example.test/\", \"ftp://invalid.example.test\"]\n",
                 "auth_token = \"unit-test-auth-token\"\n",
                 "catalog_token = \"unit-test-catalog-token\"\n",
                 "gate_token = \"unit-test-gate-token\"\n",
@@ -200,6 +241,10 @@ mod tests {
 
         let secrets = load_runtime_secrets(&paths, Edition::Server);
 
+        assert_eq!(
+            secrets.cloud_base_urls,
+            vec!["https://catalog.example.test"]
+        );
         assert_eq!(secrets.cloud_auth_token, "unit-test-auth-token");
         assert_eq!(
             secrets.update_endpoint,
@@ -244,6 +289,53 @@ mod tests {
         assert_eq!(
             secrets.update_endpoint,
             "https://updates.example.test/latest.json"
+        );
+    }
+
+    #[test]
+    fn packaged_cloud_sources_are_used_when_runtime_config_omits_them() {
+        let secrets = parse_runtime_secrets(
+            Some("[cloud]\nauth_token = \"unit-test-token\"\n"),
+            Edition::Public,
+            vec![
+                "https://primary.example.test/".to_string(),
+                "https://primary.example.test".to_string(),
+                "http://insecure.example.test".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            secrets.cloud_base_urls,
+            vec!["https://primary.example.test"]
+        );
+        assert!(secrets.cloud_auth_token.is_empty());
+    }
+
+    #[test]
+    fn packaged_cloud_sources_are_used_when_runtime_source_list_is_empty() {
+        let secrets = parse_runtime_secrets(
+            Some("[cloud]\nbase_urls = []\n"),
+            Edition::Public,
+            vec!["https://packaged.example.test".to_string()],
+        );
+
+        assert_eq!(
+            secrets.cloud_base_urls,
+            vec!["https://packaged.example.test"]
+        );
+    }
+
+    #[test]
+    fn runtime_cloud_sources_override_packaged_defaults() {
+        let secrets = parse_runtime_secrets(
+            Some("[cloud]\nbase_urls = [\"https://runtime.example.test\"]\n"),
+            Edition::Server,
+            vec!["https://packaged.example.test".to_string()],
+        );
+
+        assert_eq!(
+            secrets.cloud_base_urls,
+            vec!["https://runtime.example.test"]
         );
     }
 

@@ -42,10 +42,14 @@ impl AppState {
     }
 
     fn from_paths(paths: AppPaths) -> Result<Self> {
-        let settings = config::load_settings(&paths).unwrap_or_else(|error| {
-            eprintln!("读取配置失败，使用默认值：{error:#}");
-            AppSettings::default()
-        });
+        let secrets = load_runtime_secrets(&paths, edition::current());
+        let settings = config::load_settings_with_cloud_defaults(&paths, &secrets.cloud_base_urls)
+            .unwrap_or_else(|error| {
+                eprintln!("读取配置失败，使用默认值：{error:#}");
+                let mut settings = AppSettings::default();
+                config::apply_default_cloud_sources(&mut settings, &secrets.cloud_base_urls);
+                settings
+            });
         let mut metadata = metadata::load_metadata(&paths).unwrap_or_else(|error| {
             eprintln!("读取模组元数据失败，使用默认值：{error:#}");
             MetadataFile::default()
@@ -54,7 +58,6 @@ impl AppState {
         let mods = scan_local_mods(&paths, &mut metadata, &deployed).unwrap_or_default();
         let _ = metadata::save_metadata(&paths, &metadata);
         let deployed_at = read_manifest(&paths).map(|manifest| manifest.deployed_at);
-        let secrets = load_runtime_secrets(&paths, edition::current());
         let state = Self {
             paths,
             settings: Mutex::new(settings),
@@ -441,5 +444,36 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn applies_runtime_cloud_sources_on_startup_and_persists_them() {
+        let temp = TempRoot::new("state-default-cloud");
+        let paths = temp.paths();
+        fs::write(
+            paths.secrets.join("runtime.toml"),
+            concat!(
+                "[cloud]\n",
+                "base_urls = [\"https://primary.example.test\", \"https://backup.example.test\"]\n"
+            ),
+        )
+        .unwrap();
+
+        let state = AppState::from_paths(paths.clone()).unwrap();
+
+        let settings = state.settings.lock().unwrap();
+        assert_eq!(
+            settings.cloud.base_urls,
+            vec![
+                "https://primary.example.test",
+                "https://backup.example.test"
+            ]
+        );
+        assert_eq!(
+            settings.cloud.active_base_url,
+            "https://primary.example.test"
+        );
+        let saved = fs::read_to_string(paths.config_file).unwrap();
+        assert!(saved.contains("https://primary.example.test"));
     }
 }

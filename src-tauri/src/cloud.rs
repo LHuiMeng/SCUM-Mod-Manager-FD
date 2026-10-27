@@ -4,7 +4,7 @@ use crate::mods::extract_zip_file;
 use crate::paths::{safe_file_component, AppPaths};
 use crate::secrets::RuntimeSecrets;
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
@@ -317,6 +317,7 @@ fn parse_catalog(paths: &AppPaths, base: &str, value: Value) -> Result<Vec<Remot
             .unwrap_or_default();
         let file_size = number(object.get("file_size"))
             .or_else(|| number(object.get("fileSize")))
+            .or_else(|| number(object.get("size_bytes")))
             .or_else(|| number(object.get("size")))
             .unwrap_or(0);
         let mod_type = text(object.get("type"))
@@ -336,6 +337,10 @@ fn parse_catalog(paths: &AppPaths, base: &str, value: Value) -> Result<Vec<Remot
             tags,
             updated_at: text(object.get("updated_at"))
                 .or_else(|| text(object.get("updatedAt")))
+                .or_else(|| text(object.get("released_at")))
+                .or_else(|| text(object.get("releasedAt")))
+                .or_else(|| timestamp(object.get("uploaded_at")))
+                .or_else(|| timestamp(object.get("uploadedAt")))
                 .unwrap_or_else(|| Utc::now().to_rfc3339()),
             mod_type,
         });
@@ -429,14 +434,26 @@ fn number(value: Option<&Value>) -> Option<u64> {
     })
 }
 
+fn timestamp(value: Option<&Value>) -> Option<String> {
+    if let Some(text) = text(value) {
+        return Some(text);
+    }
+    value
+        .and_then(Value::as_i64)
+        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_cloud_transport, download_remote, download_source_allowed, ordered_urls,
-        parse_catalog, remote_filename, should_attach_credentials, AppSettings, CloudAccess,
-        RuntimeSecrets,
+        allowed_cloud_transport, download_remote, download_source_allowed, fetch_catalog,
+        ordered_urls, parse_catalog, remote_filename, should_attach_credentials, AppSettings,
+        CloudAccess, RuntimeSecrets,
     };
+    use crate::edition::Edition;
     use crate::models::RemoteMod;
+    use crate::secrets::load_runtime_secrets;
     use crate::test_support::TempRoot;
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -557,15 +574,17 @@ mod tests {
                 "slug": "installed-weapon",
                 "author": "Tester",
                 "version": "2.0.0",
-                "fileSize": "4096",
+                "size_bytes": "4096",
                 "sha256": "ABC123",
                 "tags": ["weapon", 7],
-                "updatedAt": "2026-10-26T00:00:00Z",
+                "released_at": "2026-10-26T00:00:00Z",
                 "type": "clientPak"
             }, {
                 "id": "script-pack",
                 "name": "ScriptPack",
-                "mod_type": "ue4ssMod"
+                "mod_type": "ue4ssMod",
+                "fileSize": 1024,
+                "uploaded_at": 1788465403
             }]
         });
 
@@ -582,6 +601,8 @@ mod tests {
         );
         assert!(mods[1].installed);
         assert_eq!(mods[1].mod_type, "ue4ssMod");
+        assert_eq!(mods[1].file_size, 1024);
+        assert_eq!(mods[1].updated_at, "2026-09-03T19:56:43+00:00");
     }
 
     #[test]
@@ -919,5 +940,35 @@ mod tests {
         assert!(!error.contains("SHA-256"), "unexpected error: {error}");
         assert!(!paths.local_mods.join("Demo.pak").exists());
         assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    #[ignore = "requires packaged cloud sources and network access"]
+    fn live_packaged_cloud_catalog_is_reachable() {
+        let temp = TempRoot::new("cloud-live-catalog");
+        let paths = temp.paths();
+        let secrets = load_runtime_secrets(&paths, Edition::Public);
+        assert!(
+            !secrets.cloud_base_urls.is_empty(),
+            "packaged cloud sources are empty"
+        );
+        let mut settings = AppSettings::default();
+        crate::config::apply_default_cloud_sources(&mut settings, &secrets.cloud_base_urls);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mods = runtime
+            .block_on(fetch_catalog(
+                &paths,
+                &mut settings,
+                &secrets,
+                CloudAccess::Public,
+            ))
+            .unwrap();
+
+        assert!(!mods.is_empty(), "live catalog returned no mods");
+        assert!(mods.iter().any(|item| item.file_size > 0));
     }
 }

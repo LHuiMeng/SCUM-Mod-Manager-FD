@@ -14,6 +14,16 @@ $destinationFull = [IO.Path]::GetFullPath($destination)
 if (-not $destinationFull.StartsWith($releaseRoot + "\", [StringComparison]::OrdinalIgnoreCase)) {
   throw "Portable destination escaped release-output: $destinationFull"
 }
+if (-not (Test-Path -LiteralPath $runtimeSecret -PathType Leaf)) {
+  throw "Portable package requires secrets/runtime.toml with [cloud].base_urls."
+}
+$secretText = Get-Content -LiteralPath $runtimeSecret -Raw
+if ($secretText -notmatch '(?ms)^\s*base_urls\s*=\s*\[(?<urls>.*?)\]') {
+  throw "Portable package requires [cloud].base_urls in secrets/runtime.toml."
+}
+if ($Matches.urls -notmatch 'https://') {
+  throw "Portable package requires at least one HTTPS URL in [cloud].base_urls."
+}
 if ($Edition -eq "server" -and -not (Test-Path -LiteralPath $runtimeSecret -PathType Leaf)) {
   throw "Server portable package requires secrets/runtime.toml."
 }

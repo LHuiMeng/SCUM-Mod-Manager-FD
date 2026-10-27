@@ -10,9 +10,18 @@ use std::path::Path;
 use uuid::Uuid;
 
 pub fn load_settings(paths: &AppPaths) -> Result<AppSettings> {
+    load_settings_with_cloud_defaults(paths, &[])
+}
+
+pub fn load_settings_with_cloud_defaults(
+    paths: &AppPaths,
+    default_cloud_urls: &[String],
+) -> Result<AppSettings> {
     migrate_legacy_files(paths);
     if !paths.config_file.exists() {
-        let settings = AppSettings::default();
+        let mut settings = AppSettings::default();
+        normalize_settings(paths, &mut settings, None);
+        apply_default_cloud_sources(&mut settings, default_cloud_urls);
         save_settings(paths, &settings)?;
         return Ok(settings);
     }
@@ -23,6 +32,7 @@ pub fn load_settings(paths: &AppPaths) -> Result<AppSettings> {
     let mut settings: AppSettings =
         serde_json::from_value(value.clone()).context("config.json 字段无法解析")?;
     normalize_settings(paths, &mut settings, Some(&value));
+    apply_default_cloud_sources(&mut settings, default_cloud_urls);
     save_settings(paths, &settings)?;
     Ok(settings)
 }
@@ -168,7 +178,30 @@ fn account_id(account: &SftpAccount) -> String {
     }
 }
 
-fn normalize_cloud_url(value: &str) -> Option<String> {
+pub(crate) fn apply_default_cloud_sources(
+    settings: &mut AppSettings,
+    default_cloud_urls: &[String],
+) {
+    if !settings.cloud.base_urls.is_empty() {
+        return;
+    }
+    let mut seen = HashSet::new();
+    settings.cloud.base_urls = default_cloud_urls
+        .iter()
+        .filter_map(|url| normalize_cloud_url(url))
+        .filter(|url| seen.insert(url.to_ascii_lowercase()))
+        .collect();
+    if settings.cloud.active_base_url.is_empty() {
+        settings.cloud.active_base_url = settings
+            .cloud
+            .base_urls
+            .first()
+            .cloned()
+            .unwrap_or_default();
+    }
+}
+
+pub(crate) fn normalize_cloud_url(value: &str) -> Option<String> {
     let trimmed = value.trim().trim_end_matches('/');
     let parsed = url::Url::parse(trimmed).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -219,7 +252,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::load_settings;
+    use super::{load_settings, load_settings_with_cloud_defaults};
     use crate::test_support::TempRoot;
     use serde_json::json;
     use std::fs;
@@ -255,6 +288,61 @@ mod tests {
             vec!["https://Mods.Example", "http://127.0.0.1:8080"]
         );
         assert_eq!(settings.cloud.active_base_url, "https://Mods.Example");
+    }
+
+    #[test]
+    fn injects_packaged_cloud_sources_when_config_is_missing_or_empty() {
+        let temp = TempRoot::new("config-default-cloud-sources");
+        let paths = temp.paths();
+        let defaults = vec![
+            "https://primary.example.test/".to_string(),
+            "https://primary.example.test".to_string(),
+            "https://backup.example.test".to_string(),
+            "ftp://invalid.example.test".to_string(),
+        ];
+
+        let settings = load_settings_with_cloud_defaults(&paths, &defaults).unwrap();
+
+        assert_eq!(
+            settings.cloud.base_urls,
+            vec![
+                "https://primary.example.test",
+                "https://backup.example.test"
+            ]
+        );
+        assert_eq!(
+            settings.cloud.active_base_url,
+            "https://primary.example.test"
+        );
+        let saved = fs::read_to_string(&paths.config_file).unwrap();
+        assert!(saved.contains("https://primary.example.test"));
+        assert!(saved.contains("https://backup.example.test"));
+    }
+
+    #[test]
+    fn keeps_user_cloud_sources_ahead_of_packaged_defaults() {
+        let temp = TempRoot::new("config-user-cloud-sources");
+        let paths = temp.paths();
+        fs::write(
+            &paths.config_file,
+            serde_json::to_vec_pretty(&json!({
+                "cloud": {
+                    "baseUrls": ["https://user.example.test"],
+                    "activeBaseUrl": "https://user.example.test"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let settings = load_settings_with_cloud_defaults(
+            &paths,
+            &["https://packaged.example.test".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(settings.cloud.base_urls, vec!["https://user.example.test"]);
+        assert_eq!(settings.cloud.active_base_url, "https://user.example.test");
     }
 
     #[test]
