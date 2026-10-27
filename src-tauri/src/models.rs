@@ -230,6 +230,10 @@ pub struct SftpConnectionResult {
     pub ok: bool,
     pub message: String,
     pub detected_mods_path: Option<String>,
+    #[serde(default)]
+    pub host_key_fingerprint: Option<String>,
+    #[serde(default)]
+    pub requires_trust: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

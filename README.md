@@ -6,12 +6,12 @@
 ## 功能
 
 - 扫描、导入和启用本地 `~mods/*.pak`
-- 部署到客户端/服务端 `Paks/~mod/`，退出后自动回收
+- 部署到客户端/服务端 `Paks/~mods/`，覆盖原文件前自动备份，退出后恢复并回收
 - 管理 UE4SS 目录模组并同步 `mods.txt`
 - 拖拽调整 PAK 加载顺序，编辑标签与本地备注
 - 从 Steam 注册表和 `libraryfolders.vdf` 检测游戏路径
-- 浏览云模组目录，SHA-256 校验后下载
-- SFTP 浏览、连接测试与服务器模组上传
+- 浏览云模组目录，云目录提供 SHA-256 时强制校验，缺少时明确提示未校验
+- SFTP 浏览、主机指纹确认、连接测试与服务器模组上传
 - 亮色纸张主题与中性石墨暗色主题
 
 ## 技术栈
@@ -62,7 +62,7 @@ npm run package:portable -- -Edition public
 便携包输出到 `release-output/portable/`。解压后将整个 `SCUM Mod Desk`
 目录放到非 C 盘的可写位置，例如 `R:\SCUM Mod Desk`，再运行
 `scum-mod-manager.exe`。不要放进 `Program Files`，普通用户无法在那里写入
-运行数据。
+运行数据。NSIS 安装器同样会拒绝安装到 C 盘。
 
 ### 公开发行版与服务器版
 
@@ -110,6 +110,7 @@ app-data/
   deployment_manifest.json
   ~mods/
   ue4ss_runtime/
+  backups/deploy/
   logs/
   secrets/
 ```
@@ -135,6 +136,8 @@ npm run migrate:data -- -Destination "R:\SCUM Mod Desk\app-data" -Edition public
   `secrets/runtime.toml`，前端无法直接读取该文件。
 - SFTP 密码由 Windows DPAPI 加密，写入
   `app-data/secrets/sftp/*.bin`；React 只接收 `hasPassword`，不接收密码。
+- SFTP 首次连接必须核对并确认服务器主机密钥指纹，结果保存在
+  `app-data/secrets/sftp_known_hosts.json`；指纹变化时连接会被拒绝。
 - 运行 `npm run secrets:check` 可检查敏感文件是否被 Git 跟踪。
 
 ## 第三方资源

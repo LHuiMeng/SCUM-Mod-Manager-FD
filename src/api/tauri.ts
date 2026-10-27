@@ -52,6 +52,8 @@ export const api = {
     call<RemoteFile[]>("list_remote_files", { path }),
   testSftpConnection: (accountId: string) =>
     call<SftpConnectionResult>("test_sftp_connection", { accountId }),
+  trustSftpHost: (accountId: string, fingerprint: string) =>
+    call<SftpConnectionResult>("trust_sftp_host", { accountId, fingerprint }),
   saveSftpAccount: (
     account: { name: string; host: string; port: number; username: string; modsPath: string },
     password: string,

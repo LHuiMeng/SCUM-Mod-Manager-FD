@@ -11,8 +11,15 @@ interface ServerScreenProps {
   files: RemoteFile[];
   loading: boolean;
   error: string | null;
+  trustPrompt: {
+    accountId: string;
+    fingerprint: string;
+    message: string;
+  } | null;
   onSaveAccount: (account: Omit<SftpAccount, "id" | "hasPassword">, password: string) => void;
   onTestAccount: (accountId: string) => void;
+  onTrustHost: () => void;
+  onDismissTrust: () => void;
   onLoadFiles: (accountId: string, path: string) => void;
   onUpload: (accountId: string, localPaths: string[]) => void;
   onOpenSettings: () => void;
@@ -24,8 +31,11 @@ export function ServerScreen({
   files,
   loading,
   error,
+  trustPrompt,
   onSaveAccount,
   onTestAccount,
+  onTrustHost,
+  onDismissTrust,
   onLoadFiles,
   onUpload,
   onOpenSettings,
@@ -139,6 +149,23 @@ export function ServerScreen({
               安全保存账户
             </Button>
           </div>
+          {trustPrompt && trustPrompt.accountId === active?.id ? (
+            <div className="sftp-trust-prompt" role="alert">
+              <div>
+                <b>请核对服务器主机密钥</b>
+                <p>{trustPrompt.message}</p>
+                <code>{trustPrompt.fingerprint}</code>
+              </div>
+              <div className="sftp-trust-actions">
+                <Button size="sm" onClick={onDismissTrust}>
+                  取消
+                </Button>
+                <Button size="sm" icon="lock" onClick={onTrustHost}>
+                  信任此主机
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </form>
 
         <section className="server-browser">

@@ -251,7 +251,7 @@ export function mockSnapshot(): LibrarySnapshot {
     lastDeployedAt: null,
     lastScannedAt: new Date().toISOString(),
     localModsPath: "W:/hermes/SCUM_Mod_Desk_v3/app-data/~mods",
-    clientModsPath: "X:/SteamLibrary/steamapps/common/SCUM/SCUM/Content/Paks/~mod",
+    clientModsPath: "X:/SteamLibrary/steamapps/common/SCUM/SCUM/Content/Paks/~mods",
   });
 }
 
@@ -346,7 +346,21 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
     case "list_remote_files":
       return structuredClone(remoteFiles) as T;
     case "test_sftp_connection":
-      return { ok: true, message: "连接成功（演示环境）", detectedModsPath: "/srv/scum/SCUM/Content/Paks/~mods" } as T;
+      return {
+        ok: true,
+        message: "连接成功（演示环境）",
+        detectedModsPath: "/srv/scum/SCUM/Content/Paks/~mods",
+        hostKeyFingerprint: "SHA256:demo-fingerprint",
+        requiresTrust: false,
+      } as T;
+    case "trust_sftp_host":
+      return {
+        ok: true,
+        message: "已信任服务器主机密钥（演示环境）",
+        detectedModsPath: null,
+        hostKeyFingerprint: String(args?.fingerprint ?? "SHA256:demo-fingerprint"),
+        requiresTrust: false,
+      } as T;
     case "save_sftp_account": {
       const account = args?.account as
         | { name: string; host: string; port: number; username: string; modsPath: string }

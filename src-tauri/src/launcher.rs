@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub struct ManagedProcess {
     pub child: Child,
@@ -90,6 +90,7 @@ pub fn launch(app: AppHandle, state: &AppState, mode: &str) -> Result<GameStatus
     };
     *state.game.lock().unwrap() = status.clone();
     *state.process.lock().unwrap() = Some(ManagedProcess { child, token, pid });
+    let _ = app.emit("game-status-changed", &status);
     monitor_process(app, state, token, pid);
     Ok(status)
 }
@@ -110,7 +111,17 @@ pub fn stop(state: &AppState) -> Result<GameStatus> {
         let _ = managed.child.kill();
         let _ = managed.child.wait();
     }
-    let reclaimed = reclaim_mods(&state.paths).unwrap_or(0);
+    let reclaimed = match reclaim_mods(&state.paths) {
+        Ok(reclaimed) => reclaimed,
+        Err(error) => {
+            state.log(
+                "error",
+                "launcher",
+                &format!("游戏已关闭，但部署文件回收失败：{error:#}"),
+            );
+            0
+        }
+    };
     let status = GameStatus::default();
     *state.game.lock().unwrap() = status.clone();
     state.log(
@@ -159,13 +170,25 @@ fn monitor_process(app: AppHandle, state: &AppState, token: u64, pid: u32) {
         };
         if exited {
             let _ = state.process.lock().unwrap().take();
-            let reclaimed = reclaim_mods(&state.paths).unwrap_or(0);
-            *state.game.lock().unwrap() = GameStatus::default();
+            let reclaimed = match reclaim_mods(&state.paths) {
+                Ok(reclaimed) => reclaimed,
+                Err(error) => {
+                    state.log(
+                        "error",
+                        "launcher",
+                        &format!("检测到游戏退出，但部署文件回收失败：{error:#}"),
+                    );
+                    0
+                }
+            };
+            let status = GameStatus::default();
+            *state.game.lock().unwrap() = status.clone();
             state.log(
                 "info",
                 "launcher",
                 &format!("检测到游戏退出（PID {pid}），回收 {reclaimed} 个部署文件"),
             );
+            let _ = app.emit("game-status-changed", &status);
             return;
         }
     });

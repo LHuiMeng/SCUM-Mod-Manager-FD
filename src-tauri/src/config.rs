@@ -5,6 +5,7 @@ use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -173,7 +174,22 @@ fn normalize_cloud_url(value: &str) -> Option<String> {
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return None;
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    if parsed.scheme() == "http" && !is_loopback_host(&parsed) {
+        return None;
+    }
     Some(trimmed.to_string())
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address == Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(address)) => address == Ipv6Addr::LOCALHOST,
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
 }
 
 fn migrate_legacy_files(paths: &AppPaths) {
@@ -221,7 +237,8 @@ mod tests {
                         " https://Mods.Example/ ",
                         "https://Mods.Example",
                         "ftp://invalid.example",
-                        "http://backup.example/"
+                        "http://backup.example/",
+                        "http://127.0.0.1:8080/"
                     ],
                     "activeBaseUrl": "javascript:alert(1)"
                 }
@@ -235,7 +252,7 @@ mod tests {
         assert_eq!(settings.theme, "light");
         assert_eq!(
             settings.cloud.base_urls,
-            vec!["https://Mods.Example", "http://backup.example"]
+            vec!["https://Mods.Example", "http://127.0.0.1:8080"]
         );
         assert_eq!(settings.cloud.active_base_url, "https://Mods.Example");
     }

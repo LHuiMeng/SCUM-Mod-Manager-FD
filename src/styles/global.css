@@ -1716,6 +1716,44 @@ textarea:focus-visible,
   border-top: 1px solid var(--line);
 }
 
+.sftp-trust-prompt {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 13px;
+  border: 1px solid color-mix(in srgb, var(--warn) 34%, var(--line));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warn) 7%, var(--paper-hi));
+}
+
+.sftp-trust-prompt b {
+  color: var(--ink);
+  font-size: var(--type-body);
+  font-weight: 600;
+}
+
+.sftp-trust-prompt p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: var(--type-meta);
+  line-height: 1.55;
+}
+
+.sftp-trust-prompt code {
+  display: block;
+  margin-top: 9px;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--type-meta);
+}
+
+.sftp-trust-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .server-browser .empty-state {
   flex: 1;
 }

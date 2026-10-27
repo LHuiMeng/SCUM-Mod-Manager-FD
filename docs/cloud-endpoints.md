@@ -1,148 +1,102 @@
-# 云源多线路（镜像域名）说明
+# 云源接口与安全约定
 
-> 仓库内文档只保留脱敏后的运维流程。真实账户、隧道、Zone、DNS 记录标识与生产
-> 域名保存在本机被 Git 忽略的 `secrets/cloud-infrastructure.private.md`。
+本文描述 SCUM Mod Desk v3 当前的 React + Rust 云源实现。云源地址不写死在
+前端或程序里，由用户在本机设置页配置；服务器版共享密钥只由 Rust 后端从
+`secrets/runtime.toml` 或安装包内的 `runtime-secrets/runtime.toml` 读取。
 
-## 背景
+## 本机配置
 
-部分玩家（尤其大陆部分 ISP / 被安全软件与家庭路由器黑名单误拦的网络）
-无法访问云库主域名（Cloudflare 前置）。客户端原先只有单个 `base_url`，
-请求失败即静默返回空列表 —— 玩家只看到「云上暂无可用 mod」，无法自查、
-也无法自动恢复。
-
-## 客户端行为（方案 A：多端点自动切换）
-
-- `config.json` 的 `cloud_sources.base_urls` 是**有序候选线路**；启动时
-  `RegistryClient.ensureCloudSourceConfigured` 会把打包默认线路并入
-  （仅当用户仍在使用官方云源时；自建源保持用户自己的线路不变）。
-- 刷新云目录 [`fetchModList`]：
-  1. 先单独请求首选线路（30s 超时，成功即返回，正常路径零额外开销）；
-  2. 首选失败 → 其余线路**并行**探测（各 8s），取最先成功者；
-  3. 胜出线路写入 `cloud_sources.active_base_url`，下次直连它。
-- 下载 [`downloadMod`]：按 `自定义地址 → 清单直达地址（R2/CDN）→ 各候选线路
-  默认拼接地址` 依次尝试，任一条成功即止；走通 registry 线路时记为活跃线路。
-- 全部线路失败：返回空列表，并写入 `AppLogger`（含各线路失败详情），
-  面板空态显示「无法连接云服务器」。
-
-## config.json 相关字段
+配置保存在 `{程序目录}/app-data/config.json`：
 
 ```json
 {
-  "cloud_sources": {
-    "base_url": "https://<primary_domain>",
-    "base_urls": [
-      "https://<primary_domain>",
-      "https://<mirror_domain>"
+  "cloud": {
+    "baseUrls": [
+      "https://mods.example.test",
+      "https://mirror.example.test"
     ],
-    "active_base_url": "https://<mirror_domain>",
-    "mods": {}
+    "activeBaseUrl": "https://mods.example.test"
   }
 }
 ```
 
-- `base_url`：旧版单地址，仍兼容（无 `base_urls` 时视为单元素列表）。
-- `base_urls`：候选线路（自动切换依据）。用户手改后以此为准。
-- `active_base_url`：**自动写入**的最近成功线路，无需手工维护。
+- `baseUrls` 是有序候选线路；读取配置时会去重并从前到后尝试。
+- `activeBaseUrl` 是最近成功线路；刷新时会优先尝试，成功后再写回配置。
+- 云源只接受 HTTPS。仅 `localhost`、`127.0.0.1` 和 `::1` 允许使用 HTTP，
+  用于本机开发。
+- 带用户名或密码的 URL 会被拒绝。配置中不得写入访问令牌。
 
-## 新增镜像线路（方案 B 第一条）
+## 目录接口
 
-要点：换一个与主域名**不同后缀/注册商**的域名，规避域名级拦截与
-「免费 DDNS 后缀被整段拉黑」，但仍指向**同一个 Cloudflare Tunnel**。
+客户端请求：
 
-1. Cloudflare Zero Trust → Networks → Tunnels → 选中隧道 → **Public Hostnames**
-   → Add a public hostname：hostname 填 `<mirror_domain>`，Service 指向与主域名
-   完全相同的 origin（同一隧道可挂多个 hostname）。保存后 Cloudflare 会自动
-   创建 DNS 记录（`CNAME <tunnel-id>.cfargotunnel.com`）。
-2. 若隧道由本地 `config.yml` 管理：在 `ingress` 增加一条
-   `- hostname: <mirror_domain>` + `service: ...`，并保留末尾
-   `- service: http_status:404` 兜底，然后重启 cloudflared。
-3. 纯 API 等价操作（本例实际走的路；Token 需带 `Cloudflare Tunnel:Edit`）：
-
-   ```bash
-   ACCT=<account_id>; TOKEN=<api_token>
-   TID=<tunnel_id>                                 # scum-mods-tunnel
-   ZID=<zone_id>                                   # 镜像域名所在 Zone
-
-   # 先读现有 ingress —— 写入是整体覆盖，必须带上原有规则
-   curl -s -H "Authorization: Bearer $TOKEN" \
-     "https://api.cloudflare.com/client/v4/accounts/$ACCT/cfd_tunnel/$TID/configurations"
-
-   # 追加 hostname（末尾 http_status:404 兜底不可省）
-   curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-     "https://api.cloudflare.com/client/v4/accounts/$ACCT/cfd_tunnel/$TID/configurations" \
-     --data '{"config":{"ingress":[{"hostname":"<primary_domain>","service":"http://127.0.0.1:6000"},{"hostname":"<mirror_domain>","service":"http://127.0.0.1:6000"},{"service":"http_status:404"}],"warp-routing":{"enabled":false}}}'
-
-   # 建 DNS（apex 走 CNAME 展平，必须 proxied=true）
-   curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-     "https://api.cloudflare.com/client/v4/zones/$ZID/dns_records" \
-     --data '{"type":"CNAME","name":"<mirror_domain>","content":"<tunnel_id>.cfargotunnel.com","proxied":true,"ttl":1}'
-   ```
-
-4. 验证可达（应返回 200；断点续传应为 206）：
-
-   ```bash
-   curl -sS -o /dev/null -w "%{http_code}\n" https://<mirror_domain>/mods
-   curl -sS -o /dev/null -w "%{http_code} %{size_download}\n" \
-     https://<mirror_domain>/mods/chest-max-weight/download
-   curl -sS -o /dev/null -w "%{http_code}\n" -r 0-1023 \
-     https://<mirror_domain>/mods/chest-max-weight/download
-   ```
-
-### 上线记录（2026-10-18，已实测）
-
-| 资源 | 值 |
-|------|-----|
-| 镜像域名 | `<mirror_domain>`（apex，非子域） |
-| zone | `<zone_id>` |
-| 隧道 | `scum-mods-tunnel` / `<tunnel_id>`（远端托管） |
-| ingress | `<primary_domain>`、`<mirror_domain>` → `http://127.0.0.1:6000`，末尾 `http_status:404` |
-| DNS | `CNAME <mirror_domain>` → `<tunnel_id>.cfargotunnel.com`（proxied） |
-| 安全等级 | `essentially_off`（新域名默认是 `medium`，已主动对齐主域名） |
-
-实测：`/mods` 返回 200，目录与主域名逐字段一致（仅 `generated_at` 时间戳不同）；
-`/mods/chest-max-weight/download` 返回 200 / 43285 B；Range 请求返回 206；Dart 与
-启动器 UA 均未被挑战。
-
-### 回滚
-
-```bash
-# 1) 删 DNS 记录
-curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "https://api.cloudflare.com/client/v4/zones/<zone_id>/dns_records/<dns_record_id>"
-# 2) 把 ingress 改回只含主域名的那一份（PUT 同一 URL，body 里去掉镜像域名那条）
+```http
+GET {baseUrl}/mods
+Accept: application/json
 ```
 
-## 发布注入
+服务器版在请求目标与已配置云源同源时，额外发送：
 
-旧版 `build_release.ps1` 默认带
-`-RegistryMirrorUrls "https://<mirror_domain>"`，会注入
-`--dart-define=REGISTRY_BASE_URLS=...`（仅当同时提供了 `-RegistryUrl`）。
+```http
+Authorization: Bearer <shared-key>
+X-Scum-Gate: <shared-key>
+```
 
-- 想加更多镜像：`-RegistryMirrorUrls "https://a,https://b"`。
-- 想临时关闭镜像：`-RegistryMirrorUrls ""`。
-- 对外分发（`build_public.bat`）不注入任何域名 → 天然无云源，不受影响。
+公开版不加载也不发送共享密钥。服务器版凭据不会发送给 CDN、第三方域名或
+任何未在 `baseUrls` / `activeBaseUrl` 中配置的来源。HTTP 客户端只跟随同源
+重定向，跨源重定向会停止并作为失败处理。
 
-## 2026-10-20 架构变更：目录改由 Worker 直读 R2
+响应可以是数组，也可以使用 `mods`、`items` 或 `catalog` 字段包裹：
 
-原来的目录（`/mods`）由 `scum-mods-tunnel` 背后那台机器上的 Python registry
-提供，写入口只有那台机器的 SSH。该机已不可用（且不属于本账号），因此：
+```json
+{
+  "mods": [
+    {
+      "id": "example-mod",
+      "name": "示例模组",
+      "author": "Example",
+      "version": "1.0.0",
+      "description": "目录说明",
+      "fileSize": 1048576,
+      "downloadUrl": "https://cdn.example.test/example-mod.pak",
+      "sha256": "64-character-lowercase-hex",
+      "tags": ["client"],
+      "updatedAt": "2026-10-27T00:00:00Z",
+      "type": "clientPak"
+    }
+  ]
+}
+```
 
-| 层 | 旧 | 新 |
-|---|---|---|
-| 目录 | 隧道 → 源站 `python server.py` | Worker `scum-mods-catalog` → R2 桶 `scum-mods` |
-| 文件 | CDN 网关（gate）← R2 | 不变（`mods-cdn` + `X-Scum-Gate`） |
-| 回退下载 | 源站 `/mods/<id>/download` | Worker 直接从 R2 流式返回（支持 Range） |
-| 发布 | SSH 进源站拷文件 | **往 R2 PUT `mods/<id>/pak` + `mods/<id>/manifest.json`** |
+字段兼容 `download_url`、`fileSize`/`file_size`/`size`、`updated_at` 和
+`mod_type` 等旧写法。`id` 缺失时使用 `slug`，再回退到安全化后的名称。
 
-- Worker 源码：`<catalog_worker_directory>/{worker.js,wrangler.toml}`
-- 目录在 isolate 内缓存 30 秒；manifest 里的 `download_url` 仍指向 CDN 网关
-- 两个主机名（`<primary_domain>`、`<mirror_domain>`）都以
-  Workers Custom Domain 形式绑到同一个 Worker
-- 旧隧道 `scum-mods-tunnel` 已强制清连接并删除
+## 下载与校验
 
-发布脚本：`<catalog_worker_directory>/publish_mod.py <manifest.json> <pak>`
-（自动补 size/sha256/download_url、上传、回读校验）。
+下载地址按以下顺序尝试：
 
-回滚到隧道方案（若那台机恢复可控）：删掉两个 Workers Custom Domain，
-再把 CNAME 指回 `<tunnel-id>.cfargotunnel.com` 并在隧道 ingress 里配
-`http://127.0.0.1:6000`。
+1. 清单中的 `downloadUrl` / `download_url`
+2. `{baseUrl}/mods/{id}/download`
+
+客户端执行以下约束：
+
+- 下载地址必须使用 HTTPS；仅本机回环地址允许 HTTP。
+- 清单提供 `sha256` 时，下载完成后必须匹配，否则删除临时文件并继续尝试
+  下一候选地址。
+- 清单未提供 `sha256` 时，只允许从已配置云源的同源地址下载；跨源 CDN
+  下载会被跳过。
+- 未提供校验值时下载结果会明确提示“未执行完整性校验”，不会显示为已通过
+  校验。
+- 云目录响应与下载文件使用独立的超时；临时文件名包含进程 ID 和原子序号，
+  同一模组 ID 的并发下载会被 Rust 后端拒绝。
+- 下载完成后 PAK 放入本地 `~mods/`，UE4SS ZIP 使用安全解包并放入
+  `ue4ss_runtime/ue4ss/Mods/<模组名>/`。
+
+生产云目录应始终提供 SHA-256。它是跨源 CDN 下载和完整性问题定位的必要
+校验值。
+
+## 错误处理
+
+候选线路、目录请求或下载全部失败时，错误信息会汇总各线路的 HTTP 状态或
+校验失败原因。日志和错误信息不得包含共享密钥、Cookie、Authorization 头或
+带凭据的 URL。

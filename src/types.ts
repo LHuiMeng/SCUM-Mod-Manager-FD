@@ -113,6 +113,8 @@ export interface SftpConnectionResult {
   ok: boolean;
   message: string;
   detectedModsPath?: string | null;
+  hostKeyFingerprint: string | null;
+  requiresTrust: boolean;
 }
 
 export interface ImportResult {

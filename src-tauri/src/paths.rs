@@ -13,6 +13,8 @@ pub struct AppPaths {
     pub metadata_file: PathBuf,
     pub deployment_manifest: PathBuf,
     pub logs_dir: PathBuf,
+    pub sftp_known_hosts: PathBuf,
+    pub backups_dir: PathBuf,
     resource_dir: PathBuf,
 }
 
@@ -24,7 +26,11 @@ impl AppPaths {
             .context("无法定位程序目录")?
             .to_path_buf();
 
-        let root_override = std::env::var("SCUM_MM_ROOT").ok();
+        let root_override = if cfg!(debug_assertions) {
+            std::env::var("SCUM_MM_ROOT").ok()
+        } else {
+            None
+        };
         let root = resolve_data_root(&exe_dir, root_override.as_deref());
 
         let resource_dir = app
@@ -41,6 +47,8 @@ impl AppPaths {
             metadata_file: root.join("mods_meta.json"),
             deployment_manifest: root.join("deployment_manifest.json"),
             logs_dir: root.join("logs"),
+            sftp_known_hosts: root.join("secrets").join("sftp_known_hosts.json"),
+            backups_dir: root.join("backups"),
             resource_dir,
             root,
         };
@@ -119,6 +127,8 @@ impl AppPaths {
             metadata_file: root.join("mods_meta.json"),
             deployment_manifest: root.join("deployment_manifest.json"),
             logs_dir: root.join("logs"),
+            sftp_known_hosts: root.join("secrets").join("sftp_known_hosts.json"),
+            backups_dir: root.join("backups"),
             resource_dir: root.clone(),
             root,
         }

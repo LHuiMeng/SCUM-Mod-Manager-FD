@@ -10,9 +10,13 @@ use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
 use url::Url;
+
+static DOWNLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudAccess {
@@ -39,14 +43,28 @@ pub async fn fetch_catalog(
     if urls.is_empty() {
         bail!("尚未配置云源地址");
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(25))
-        .user_agent(format!("SCUM-Mod-Desk/{}", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let client = cloud_client(std::time::Duration::from_secs(25))?;
     let mut errors = Vec::new();
     for base in urls {
         let url = format!("{}/mods", base.trim_end_matches('/'));
-        let request = authorize_cloud_request(client.get(&url), secrets, access);
+        let parsed = match Url::parse(&url) {
+            Ok(parsed) if allowed_cloud_transport(&parsed) => parsed,
+            Ok(_) => {
+                errors.push(format!("{url}: 仅允许 HTTPS 云源（本机回环除外）"));
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!("{url}: {error}"));
+                continue;
+            }
+        };
+        let request = authorize_cloud_request(
+            client.get(parsed.clone()),
+            &parsed,
+            settings,
+            secrets,
+            access,
+        );
         match request.send().await {
             Ok(response) => {
                 if !response.status().is_success() {
@@ -80,22 +98,44 @@ pub async fn download_remote(
         .find(|item| item.id == id)
         .with_context(|| format!("云端目录中不存在模组 {id}"))?;
     let filename = remote_filename(remote);
-    let temp = paths
-        .root
-        .join("downloads")
-        .join(format!("{}.part", safe_file_component(id)));
+    let sequence = DOWNLOAD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = paths.root.join("downloads").join(format!(
+        "{}.{}.{}.part",
+        safe_file_component(id),
+        std::process::id(),
+        sequence
+    ));
     if let Some(parent) = temp.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .user_agent(format!("SCUM-Mod-Desk/{}", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let client = cloud_client(std::time::Duration::from_secs(600))?;
     let mut candidates = download_candidates(settings, remote);
     candidates.dedup();
     let mut errors = Vec::new();
     for url in candidates {
-        let request = authorize_cloud_request(client.get(&url), secrets, access);
+        let parsed = match Url::parse(&url) {
+            Ok(parsed) if allowed_cloud_transport(&parsed) => parsed,
+            Ok(_) => {
+                errors.push(format!("{url}: 仅允许 HTTPS 下载地址（本机回环除外）"));
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!("{url}: {error}"));
+                continue;
+            }
+        };
+        let has_declared_hash = !remote.sha256.trim().is_empty();
+        if !download_source_allowed(settings, &parsed, has_declared_hash) {
+            errors.push(format!("{url}: 跨源下载缺少 SHA-256，已跳过"));
+            continue;
+        }
+        let request = authorize_cloud_request(
+            client.get(parsed.clone()),
+            &parsed,
+            settings,
+            secrets,
+            access,
+        );
         let response = match request.send().await {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
@@ -117,7 +157,7 @@ pub async fn download_remote(
         }
         file.flush().await?;
         let digest = hex::encode(hasher.finalize());
-        if !remote.sha256.trim().is_empty() && !digest.eq_ignore_ascii_case(remote.sha256.trim()) {
+        if has_declared_hash && !digest.eq_ignore_ascii_case(remote.sha256.trim()) {
             let _ = tokio::fs::remove_file(&temp).await;
             errors.push(format!("{url}: SHA-256 校验失败"));
             continue;
@@ -134,7 +174,7 @@ pub async fn download_remote(
             .await
             .context("解压任务异常")??;
             let _ = tokio::fs::remove_file(&temp).await;
-            return Ok(format!("{} 已下载并解压到 UE4SS 模组目录", remote.name));
+            return Ok(download_message(remote, has_declared_hash));
         }
 
         tokio::fs::create_dir_all(&paths.local_mods).await?;
@@ -143,14 +183,70 @@ pub async fn download_remote(
             let _ = tokio::fs::remove_file(&destination).await;
         }
         tokio::fs::rename(&temp, &destination).await?;
-        return Ok(format!("{} 已下载并通过校验", remote.name));
+        return Ok(download_message(remote, has_declared_hash));
     }
     let _ = tokio::fs::remove_file(&temp).await;
     bail!("下载失败：{}", errors.join("；"))
 }
 
+fn cloud_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let same_origin = attempt
+                .previous()
+                .last()
+                .is_some_and(|previous| previous.origin() == attempt.url().origin());
+            if same_origin {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .user_agent(format!("SCUM-Mod-Desk/{}", env!("CARGO_PKG_VERSION")))
+        .build()?)
+}
+
+fn allowed_cloud_transport(url: &Url) -> bool {
+    url.scheme() == "https" || (url.scheme() == "http" && is_loopback_host(url))
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address == Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(address)) => address == Ipv6Addr::LOCALHOST,
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+fn is_configured_cloud_origin(settings: &AppSettings, url: &Url) -> bool {
+    ordered_urls(settings).iter().any(|base| {
+        Url::parse(base)
+            .ok()
+            .is_some_and(|configured| configured.origin() == url.origin())
+    })
+}
+
+fn download_source_allowed(settings: &AppSettings, url: &Url, has_declared_hash: bool) -> bool {
+    has_declared_hash || is_configured_cloud_origin(settings, url)
+}
+
+fn download_message(remote: &RemoteMod, verified: bool) -> String {
+    if verified {
+        format!("{} 已下载并通过 SHA-256 校验", remote.name)
+    } else {
+        format!(
+            "{} 已下载，云目录未提供 SHA-256，未执行完整性校验",
+            remote.name
+        )
+    }
+}
+
 fn authorize_cloud_request(
     mut request: reqwest::RequestBuilder,
+    url: &Url,
+    settings: &AppSettings,
     secrets: &RuntimeSecrets,
     access: CloudAccess,
 ) -> reqwest::RequestBuilder {
@@ -158,10 +254,16 @@ fn authorize_cloud_request(
         return request;
     }
     let token = secrets.cloud_auth_token.trim();
-    if !token.is_empty() {
+    if !token.is_empty() && should_attach_credentials(url, settings, access) {
         request = request.bearer_auth(token).header("X-Scum-Gate", token);
     }
     request
+}
+
+fn should_attach_credentials(url: &Url, settings: &AppSettings, access: CloudAccess) -> bool {
+    access == CloudAccess::Server
+        && allowed_cloud_transport(url)
+        && is_configured_cloud_origin(settings, url)
 }
 
 fn ordered_urls(settings: &AppSettings) -> Vec<String> {
@@ -330,7 +432,8 @@ fn number(value: Option<&Value>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        download_remote, ordered_urls, parse_catalog, remote_filename, AppSettings, CloudAccess,
+        allowed_cloud_transport, download_remote, download_source_allowed, ordered_urls,
+        parse_catalog, remote_filename, should_attach_credentials, AppSettings, CloudAccess,
         RuntimeSecrets,
     };
     use crate::models::RemoteMod;
@@ -548,12 +651,44 @@ mod tests {
             ))
             .unwrap();
 
-        assert!(result.contains("通过校验"));
+        assert!(result.contains("SHA-256 校验"));
         assert_eq!(
             fs::read(paths.local_mods.join("Demo.pak")).unwrap(),
             b"mock-pak-content"
         );
         assert_eq!(settings.cloud.active_base_url, server.base_url);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn does_not_claim_verification_when_the_catalog_has_no_sha256() {
+        let temp = TempRoot::new("cloud-download-unverified");
+        let paths = temp.paths();
+        let server = MockServer::new(String::new(), 200);
+        let mut settings = AppSettings {
+            cloud: crate::models::CloudSettings {
+                base_urls: vec![server.base_url.clone()],
+                active_base_url: String::new(),
+            },
+            ..AppSettings::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let result = runtime
+            .block_on(download_remote(
+                &paths,
+                &mut settings,
+                &RuntimeSecrets::default(),
+                CloudAccess::Server,
+                "demo",
+            ))
+            .unwrap();
+
+        assert!(result.contains("未执行完整性校验"));
+        assert!(!result.contains("通过 SHA-256 校验"));
         assert_eq!(server.finish().len(), 2);
     }
 
@@ -674,6 +809,79 @@ mod tests {
             assert!(!request.headers.contains_key("authorization"));
             assert!(!request.headers.contains_key("x-scum-gate"));
         }
+    }
+
+    #[test]
+    fn limits_cloud_credentials_to_secure_configured_origins() {
+        let settings = AppSettings {
+            cloud: crate::models::CloudSettings {
+                base_urls: vec!["https://mods.example.test".to_string()],
+                active_base_url: String::new(),
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(should_attach_credentials(
+            &url::Url::parse("https://mods.example.test/mods").unwrap(),
+            &settings,
+            CloudAccess::Server
+        ));
+        assert!(!should_attach_credentials(
+            &url::Url::parse("https://cdn.example.test/file.pak").unwrap(),
+            &settings,
+            CloudAccess::Server
+        ));
+        assert!(!should_attach_credentials(
+            &url::Url::parse("http://mods.example.test/mods").unwrap(),
+            &settings,
+            CloudAccess::Server
+        ));
+        assert!(!should_attach_credentials(
+            &url::Url::parse("https://mods.example.test/mods").unwrap(),
+            &settings,
+            CloudAccess::Public
+        ));
+    }
+
+    #[test]
+    fn accepts_https_and_loopback_http_only() {
+        for allowed in [
+            "https://mods.example.test/mods",
+            "http://localhost:1420/mods",
+            "http://127.0.0.1:8080/mods",
+            "http://[::1]:8080/mods",
+        ] {
+            assert!(
+                allowed_cloud_transport(&url::Url::parse(allowed).unwrap()),
+                "{allowed} should be accepted"
+            );
+        }
+        for rejected in [
+            "http://mods.example.test/mods",
+            "ftp://mods.example.test/file.pak",
+        ] {
+            assert!(
+                !allowed_cloud_transport(&url::Url::parse(rejected).unwrap()),
+                "{rejected} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_sha256_for_cross_origin_downloads() {
+        let settings = AppSettings {
+            cloud: crate::models::CloudSettings {
+                base_urls: vec!["https://mods.example.test".to_string()],
+                active_base_url: String::new(),
+            },
+            ..AppSettings::default()
+        };
+        let configured = url::Url::parse("https://mods.example.test/files/demo.pak").unwrap();
+        let cross_origin = url::Url::parse("https://cdn.example.test/files/demo.pak").unwrap();
+
+        assert!(download_source_allowed(&settings, &configured, false));
+        assert!(!download_source_allowed(&settings, &cross_origin, false));
+        assert!(download_source_allowed(&settings, &cross_origin, true));
     }
 
     #[test]

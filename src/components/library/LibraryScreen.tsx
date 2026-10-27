@@ -27,7 +27,7 @@ interface LibraryScreenProps {
   onLaunch: () => void;
   onKill: () => void;
   onOpenFolder: (id: string) => void;
-  onSettingsChange: (settings: AppSettings) => void;
+  onLaunchOptionsChange: (options: AppSettings["launchOptions"]) => void;
   onNavigate: (section: NavSection) => void;
   gameStatus: GameStatus;
   selectedId: string | null;
@@ -47,7 +47,7 @@ export function LibraryScreen({
   onLaunch,
   onKill,
   onOpenFolder,
-  onSettingsChange,
+  onLaunchOptionsChange,
   onNavigate,
   gameStatus,
   selectedId,
@@ -109,9 +109,7 @@ export function LibraryScreen({
           launchOptions={snapshot.settings.launchOptions}
           onLaunch={onLaunch}
           onKill={onKill}
-          onOptionsChange={(launchOptions) =>
-            onSettingsChange({ ...snapshot.settings, launchOptions })
-          }
+          onOptionsChange={onLaunchOptionsChange}
           onOpenSettings={() => onNavigate("settings")}
         />
 

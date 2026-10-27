@@ -85,7 +85,7 @@ export function LaunchStrip({
           <div className="launch-options-popover" role="dialog" aria-label="启动选项">
             <div className="launch-options-head">
               <b>启动参数</b>
-              <span>保存后下次启动生效</span>
+              <span>更改会自动保存，下次启动生效</span>
             </div>
             <label className="launch-option-row">
               <span>

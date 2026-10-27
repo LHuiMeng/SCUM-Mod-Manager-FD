@@ -92,11 +92,14 @@ impl AppState {
         if !self.process_running() {
             if rescue {
                 let rescued = rescue_mods_from_game(&self.paths, &settings)?;
-                if rescued > 0 {
+                if rescued.rescued > 0 || rescued.skipped > 0 {
                     self.log(
                         "info",
                         "library",
-                        &format!("从游戏目录抢救 {rescued} 个 PAK 到本地模组库"),
+                        &format!(
+                            "从游戏目录抢救 {} 个 PAK 到本地模组库，跳过 {} 个同名文件",
+                            rescued.rescued, rescued.skipped
+                        ),
                     );
                 }
             }
@@ -354,7 +357,7 @@ fn suggested_pak_dir(install: &str) -> String {
     }
     let root = PathBuf::from(install.trim());
     crate::mods::deploy::find_pak_dir(&root)
-        .unwrap_or_else(|| root.join("SCUM").join("Content").join("Paks").join("~mod"))
+        .unwrap_or_else(|| root.join("SCUM").join("Content").join("Paks").join("~mods"))
         .to_string_lossy()
         .into_owned()
 }

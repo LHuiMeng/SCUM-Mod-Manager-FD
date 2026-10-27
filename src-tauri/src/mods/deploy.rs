@@ -1,6 +1,6 @@
 use super::extract_zip_file;
 use crate::models::{AppSettings, ModEntry};
-use crate::paths::{is_within, path_string, AppPaths};
+use crate::paths::{is_within, path_string, safe_file_component, AppPaths};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::Utc;
@@ -16,6 +16,15 @@ pub struct DeployedManifest {
     pub roots: Vec<String>,
     pub files: Vec<String>,
     pub directories: Vec<String>,
+    #[serde(default)]
+    pub backups: Vec<DeployedBackup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployedBackup {
+    pub target: String,
+    pub backup: String,
 }
 
 pub fn read_manifest(paths: &AppPaths) -> Option<DeployedManifest> {
@@ -29,8 +38,14 @@ pub fn deployed_file_names(paths: &AppPaths) -> HashSet<String> {
             manifest
                 .files
                 .iter()
-                .filter_map(|path| Path::new(path).file_name())
-                .map(|name| name.to_string_lossy().into_owned())
+                .chain(manifest.directories.iter())
+                .flat_map(|path| {
+                    let path = Path::new(path);
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                        .into_iter()
+                        .chain(Some(path.to_string_lossy().to_ascii_lowercase()))
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -42,30 +57,103 @@ pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
     };
     let roots: Vec<PathBuf> = manifest.roots.iter().map(PathBuf::from).collect();
     let mut removed = 0;
+    let mut failures = Vec::new();
+    let mut remaining_files = Vec::new();
     for file in manifest.files.iter().rev() {
         let file = PathBuf::from(file);
         if !roots.iter().any(|root| is_within(&file, root)) {
             continue;
         }
-        if file.is_file() && std::fs::remove_file(&file).is_ok() {
-            removed += 1;
+        if file.exists() {
+            match std::fs::remove_file(&file) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    failures.push(format!("无法删除 {}：{error}", file.display()));
+                    remaining_files.push(path_string(&file));
+                }
+            }
         }
     }
-    let mut directories = manifest.directories.clone();
-    directories.sort_by_key(|path| std::cmp::Reverse(path.len()));
-    for directory in directories {
-        let directory = PathBuf::from(directory);
-        if !roots.iter().any(|root| is_within(&directory, root)) {
+
+    let mut remaining_backups = Vec::new();
+    for backup in manifest.backups {
+        let target = PathBuf::from(&backup.target);
+        let backup_path = PathBuf::from(&backup.backup);
+        if !roots.iter().any(|root| is_within(&target, root))
+            || !is_within(&backup_path, &paths.backups_dir)
+        {
             continue;
         }
-        let _ = std::fs::remove_dir(&directory);
+        if target.exists() {
+            // A failed deployment-file removal must not overwrite the live game file.
+            remaining_backups.push(backup);
+            continue;
+        }
+        if !backup_path.is_file() {
+            failures.push(format!("备份文件不存在：{}", backup_path.display()));
+            remaining_backups.push(backup);
+            continue;
+        }
+        let restore = (|| -> Result<()> {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&backup_path, &target).with_context(|| {
+                format!(
+                    "无法恢复备份 {} 到 {}",
+                    backup_path.display(),
+                    target.display()
+                )
+            })?;
+            Ok(())
+        })();
+        match restore {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&backup_path);
+            }
+            Err(error) => {
+                failures.push(error.to_string());
+                remaining_backups.push(backup);
+            }
+        }
     }
-    let _ = std::fs::remove_file(&paths.deployment_manifest);
-    Ok(removed)
+
+    if failures.is_empty() {
+        let mut directories = manifest.directories;
+        directories.sort_by_key(|path| std::cmp::Reverse(path.len()));
+        for directory in directories {
+            let directory = PathBuf::from(directory);
+            if !roots.iter().any(|root| is_within(&directory, root)) {
+                continue;
+            }
+            let _ = std::fs::remove_dir(&directory);
+        }
+        let _ = std::fs::remove_file(&paths.deployment_manifest);
+        return Ok(removed);
+    }
+
+    let remaining = DeployedManifest {
+        deployed_at: manifest.deployed_at,
+        roots: manifest.roots,
+        files: remaining_files,
+        directories: manifest.directories,
+        backups: remaining_backups,
+    };
+    write_manifest(paths, &remaining)?;
+    bail!(
+        "部署文件回收未完成：{}。剩余清单已保留，可修复权限或关闭占用后重试。",
+        failures.join("；")
+    )
 }
 
-pub fn rescue_mods_from_game(paths: &AppPaths, settings: &AppSettings) -> Result<usize> {
-    let mut rescued = 0;
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RescueSummary {
+    pub rescued: usize,
+    pub skipped: usize,
+}
+
+pub fn rescue_mods_from_game(paths: &AppPaths, settings: &AppSettings) -> Result<RescueSummary> {
+    let mut summary = RescueSummary::default();
     for install in [&settings.scum_install_path, &settings.server_install_path] {
         if install.trim().is_empty() {
             continue;
@@ -81,12 +169,16 @@ pub fn rescue_mods_from_game(paths: &AppPaths, settings: &AppSettings) -> Result
             if source.is_file() && super::is_pak(&source) {
                 let destination = paths.local_mods.join(entry.file_name());
                 std::fs::create_dir_all(&paths.local_mods)?;
+                if destination.exists() {
+                    summary.skipped += 1;
+                    continue;
+                }
                 std::fs::copy(&source, destination)?;
-                rescued += 1;
+                summary.rescued += 1;
             }
         }
     }
-    Ok(rescued)
+    Ok(summary)
 }
 
 pub fn deploy_local_mods(
@@ -113,7 +205,7 @@ pub fn deploy_local_mods(
             .join("SCUM")
             .join("Content")
             .join("Paks")
-            .join("~mod")
+            .join("~mods")
     });
     std::fs::create_dir_all(&pak_dir)
         .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
@@ -128,41 +220,64 @@ pub fn deploy_local_mods(
         roots: vec![path_string(install), path_string(&pak_dir)],
         ..DeployedManifest::default()
     };
+    let backup_root = paths
+        .backups_dir
+        .join("deploy")
+        .join(uuid::Uuid::new_v4().to_string());
 
-    for item in enabled.iter().filter(|item| item.mod_type == "clientPak") {
-        let source = PathBuf::from(&item.file_path);
-        if !source.is_file() {
-            continue;
+    let deploy_result = (|| -> Result<()> {
+        for item in enabled.iter().filter(|item| item.mod_type == "clientPak") {
+            let source = PathBuf::from(&item.file_path);
+            if !source.is_file() {
+                continue;
+            }
+            let target = pak_dir.join(&item.file_name);
+            copy_file_record(&source, &target, &backup_root, &mut manifest)?;
         }
-        let target = pak_dir.join(&item.file_name);
-        copy_file_record(&source, &target, &mut manifest)?;
-    }
 
-    let ue4ss_enabled: Vec<&&ModEntry> = enabled
-        .iter()
-        .filter(|item| item.mod_type == "ue4ssMod")
-        .collect();
-    if !ue4ss_enabled.is_empty() {
-        if let Some(binaries) = find_binaries_dir(install) {
-            ensure_runtime_framework(paths)?;
-            sync_ue4ss_mods_txt(paths, mods)?;
-            deploy_framework(paths, &binaries, &mut manifest)?;
-            for item in ue4ss_enabled {
-                deploy_ue4ss_mod(item, &binaries, &mut manifest)?;
+        let ue4ss_enabled: Vec<&&ModEntry> = enabled
+            .iter()
+            .filter(|item| item.mod_type == "ue4ssMod")
+            .collect();
+        if !ue4ss_enabled.is_empty() {
+            if let Some(binaries) = find_binaries_dir(install) {
+                ensure_runtime_framework(paths)?;
+                sync_ue4ss_mods_txt(paths, mods)?;
+                deploy_framework(paths, &binaries, &backup_root, &mut manifest)?;
+                for item in ue4ss_enabled {
+                    deploy_ue4ss_mod(item, &binaries, &backup_root, &mut manifest)?;
+                }
             }
         }
+
+        if manifest.files.is_empty() {
+            bail!("没有可部署的模组文件，请检查本地 ~mods 目录");
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = deploy_result {
+        if !manifest.files.is_empty() || !manifest.backups.is_empty() {
+            if let Err(manifest_error) = write_manifest(paths, &manifest) {
+                return Err(anyhow::anyhow!(
+                    "{error:#}；同时无法保存回滚清单：{manifest_error:#}"
+                ));
+            }
+            if let Err(cleanup_error) = reclaim_mods(paths) {
+                return Err(anyhow::anyhow!(
+                    "{error:#}；部署失败后的自动回收也未完成：{cleanup_error:#}"
+                ));
+            }
+        }
+        return Err(error);
     }
 
-    if manifest.files.is_empty() {
-        bail!("没有可部署的模组文件，请检查本地 ~mods 目录");
-    }
-    let json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(&paths.deployment_manifest, format!("{json}\n"))?;
+    write_manifest(paths, &manifest)?;
     Ok(Some(manifest.deployed_at))
 }
 
 pub fn find_pak_dir(install: &Path) -> Option<PathBuf> {
-    candidate_paths(install, ["SCUM/Content/Paks/~mod", "Content/Paks/~mod"])
+    candidate_paths(install, ["SCUM/Content/Paks/~mods", "Content/Paks/~mods"])
         .into_iter()
         .find(|path| path.exists())
 }
@@ -205,11 +320,12 @@ fn ensure_runtime_framework(paths: &AppPaths) -> Result<()> {
 fn deploy_framework(
     paths: &AppPaths,
     binaries: &Path,
+    backup_root: &Path,
     manifest: &mut DeployedManifest,
 ) -> Result<()> {
     let dll = paths.ue4ss_runtime.join("dwmapi.dll");
     if dll.is_file() {
-        copy_file_record(&dll, &binaries.join("dwmapi.dll"), manifest)?;
+        copy_file_record(&dll, &binaries.join("dwmapi.dll"), backup_root, manifest)?;
     }
     let source_root = paths.ue4ss_runtime.join("ue4ss");
     let target_root = binaries.join("ue4ss");
@@ -227,13 +343,18 @@ fn deploy_framework(
             std::fs::create_dir_all(&target)?;
             manifest.directories.push(path_string(&target));
         } else if entry.file_type().is_file() {
-            copy_file_record(entry.path(), &target, manifest)?;
+            copy_file_record(entry.path(), &target, backup_root, manifest)?;
         }
     }
     for file_name in ["mods.json", "mods.txt"] {
         let source = source_root.join("Mods").join(file_name);
         if source.is_file() {
-            copy_file_record(&source, &target_root.join("Mods").join(file_name), manifest)?;
+            copy_file_record(
+                &source,
+                &target_root.join("Mods").join(file_name),
+                backup_root,
+                manifest,
+            )?;
         }
     }
     Ok(())
@@ -242,6 +363,7 @@ fn deploy_framework(
 fn deploy_ue4ss_mod(
     item: &ModEntry,
     binaries: &Path,
+    backup_root: &Path,
     manifest: &mut DeployedManifest,
 ) -> Result<()> {
     let source = PathBuf::from(&item.file_path);
@@ -259,21 +381,66 @@ fn deploy_ue4ss_mod(
             std::fs::create_dir_all(&destination)?;
             manifest.directories.push(path_string(&destination));
         } else if entry.file_type().is_file() {
-            copy_file_record(entry.path(), &destination, manifest)?;
+            copy_file_record(entry.path(), &destination, backup_root, manifest)?;
         }
     }
     Ok(())
 }
 
-fn copy_file_record(source: &Path, target: &Path, manifest: &mut DeployedManifest) -> Result<()> {
+fn copy_file_record(
+    source: &Path,
+    target: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+) -> Result<()> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
         manifest.directories.push(path_string(parent));
     }
+    if target.exists()
+        && !manifest
+            .backups
+            .iter()
+            .any(|backup| same_path(Path::new(&backup.target), target))
+    {
+        if !target.is_file() {
+            bail!("部署目标已存在且不是文件：{}", target.display());
+        }
+        std::fs::create_dir_all(backup_root)?;
+        let file_name = target
+            .file_name()
+            .map(|name| safe_file_component(&name.to_string_lossy()))
+            .unwrap_or_else(|| "file".to_string());
+        let backup = backup_root.join(format!("{:04}-{file_name}", manifest.backups.len()));
+        std::fs::copy(target, &backup)
+            .with_context(|| format!("无法备份原文件 {}", target.display()))?;
+        manifest.backups.push(DeployedBackup {
+            target: path_string(target),
+            backup: path_string(&backup),
+        });
+    }
+    if !manifest
+        .files
+        .iter()
+        .any(|path| same_path(Path::new(path), target))
+    {
+        manifest.files.push(path_string(target));
+    }
     std::fs::copy(source, target)
         .with_context(|| format!("无法复制 {} 到 {}", source.display(), target.display()))?;
-    manifest.files.push(path_string(target));
     Ok(())
+}
+
+fn write_manifest(paths: &AppPaths, manifest: &DeployedManifest) -> Result<()> {
+    let json = serde_json::to_string_pretty(manifest)?;
+    std::fs::write(&paths.deployment_manifest, format!("{json}\n"))
+        .with_context(|| format!("无法写入 {}", paths.deployment_manifest.display()))
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    path_string(left)
+        .replace('/', "\\")
+        .eq_ignore_ascii_case(&path_string(right).replace('/', "\\"))
 }
 
 fn sync_ue4ss_mods_txt(paths: &AppPaths, mods: &[ModEntry]) -> Result<()> {
@@ -331,7 +498,8 @@ pub fn sync_ue4ss_state(paths: &AppPaths, mods: &[ModEntry]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deploy_local_mods, read_manifest, reclaim_mods, sync_ue4ss_state, DeployedManifest,
+        deploy_local_mods, read_manifest, reclaim_mods, rescue_mods_from_game, sync_ue4ss_state,
+        DeployedManifest,
     };
     use crate::models::{AppSettings, ModEntry};
     use crate::paths::path_string;
@@ -408,7 +576,7 @@ mod tests {
             .join("SCUM")
             .join("Content")
             .join("Paks")
-            .join("~mod");
+            .join("~mods");
         fs::create_dir_all(&pak_dir).unwrap();
         let source = paths.local_mods.join("TestWeapon.pak");
         fs::write(&source, b"pak-content").unwrap();
@@ -540,6 +708,7 @@ mod tests {
             roots: vec![path_string(&install)],
             files: vec![path_string(&outside)],
             directories: Vec::new(),
+            backups: Vec::new(),
         };
         fs::write(
             &paths.deployment_manifest,
@@ -566,6 +735,7 @@ mod tests {
             roots: vec![path_string(&install)],
             files: vec![path_string(&escaping)],
             directories: Vec::new(),
+            backups: Vec::new(),
         };
         fs::write(
             &paths.deployment_manifest,
@@ -575,6 +745,133 @@ mod tests {
 
         assert_eq!(reclaim_mods(&paths).unwrap(), 0);
         assert!(outside.exists());
+    }
+
+    #[test]
+    fn restores_files_that_were_overwritten_by_framework_deployment() {
+        let temp = TempRoot::new("deploy-backup-restore");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&binaries).unwrap();
+        fs::write(binaries.join("dwmapi.dll"), b"original-proxy").unwrap();
+        let source = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(source.join("Scripts")).unwrap();
+        fs::write(source.join("Scripts").join("main.lua"), b"print('ok')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&source, true, "ue4ssMod")],
+            false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(binaries.join("dwmapi.dll")).unwrap(), b"proxy");
+        let manifest = read_manifest(&paths).unwrap();
+        assert_eq!(manifest.backups.len(), 1);
+        assert!(Path::new(&manifest.backups[0].backup).is_file());
+
+        reclaim_mods(&paths).unwrap();
+
+        assert_eq!(
+            fs::read(binaries.join("dwmapi.dll")).unwrap(),
+            b"original-proxy"
+        );
+        assert!(!Path::new(&manifest.backups[0].backup).exists());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn rolls_back_files_copied_before_a_later_deployment_error() {
+        let temp = TempRoot::new("deploy-partial-rollback");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let first = paths.local_mods.join("First.pak");
+        let second = paths.local_mods.join("Second.pak");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::create_dir_all(pak_dir.join("Second.pak")).unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let mods = vec![
+            mod_entry(&first, true, "clientPak"),
+            mod_entry(&second, true, "clientPak"),
+        ];
+
+        let error = deploy_local_mods(&paths, &settings, &mods, false).unwrap_err();
+
+        assert!(error.to_string().contains("不是文件"));
+        assert!(!pak_dir.join("First.pak").exists());
+        assert!(pak_dir.join("Second.pak").is_dir());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn reclaim_keeps_manifest_when_a_deployed_file_cannot_be_removed() {
+        let temp = TempRoot::new("reclaim-failure");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let undeletable = install.join("locked.pak");
+        fs::create_dir_all(&undeletable).unwrap();
+        let manifest = DeployedManifest {
+            deployed_at: "2026-01-01T00:00:00Z".to_string(),
+            roots: vec![path_string(&install)],
+            files: vec![path_string(&undeletable)],
+            directories: Vec::new(),
+            backups: Vec::new(),
+        };
+        fs::write(
+            &paths.deployment_manifest,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = reclaim_mods(&paths).unwrap_err().to_string();
+
+        assert!(error.contains("回收未完成"));
+        let remaining = read_manifest(&paths).expect("failed manifest must remain");
+        assert_eq!(remaining.files, vec![path_string(&undeletable)]);
+    }
+
+    #[test]
+    fn rescue_never_overwrites_an_existing_local_pak() {
+        let temp = TempRoot::new("rescue-no-overwrite");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::write(pak_dir.join("Shared.pak"), b"from-game").unwrap();
+        fs::write(paths.local_mods.join("Shared.pak"), b"local-copy").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        let result = rescue_mods_from_game(&paths, &settings).unwrap();
+
+        assert_eq!(result.rescued, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(
+            fs::read(paths.local_mods.join("Shared.pak")).unwrap(),
+            b"local-copy"
+        );
     }
 
     #[test]

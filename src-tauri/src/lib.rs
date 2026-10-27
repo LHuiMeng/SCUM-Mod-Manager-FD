@@ -56,6 +56,7 @@ pub fn run() {
             commands::download_remote_mod,
             commands::list_remote_files,
             commands::test_sftp_connection,
+            commands::trust_sftp_host,
             commands::save_sftp_account,
             commands::upload_server_mods,
             commands::window_minimize,

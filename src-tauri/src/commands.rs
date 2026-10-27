@@ -10,8 +10,38 @@ use crate::paths::path_string;
 use crate::sftp;
 use crate::state::AppState;
 use crate::steam;
+use std::collections::HashSet;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager, State, WebviewWindow};
+
+static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+struct DownloadGuard {
+    key: String,
+}
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        let downloads = ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut active = downloads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.remove(&self.key);
+    }
+}
+
+fn begin_download(id: &str) -> Result<DownloadGuard, String> {
+    let key = id.trim().to_ascii_lowercase();
+    let downloads = ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut active = downloads
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !active.insert(key.clone()) {
+        return Err("该模组正在下载，请等待当前任务完成".to_string());
+    }
+    Ok(DownloadGuard { key })
+}
 
 fn error_text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -235,6 +265,7 @@ pub async fn fetch_cloud_catalog(app: AppHandle) -> Result<Vec<RemoteMod>, Strin
 
 #[tauri::command]
 pub async fn download_remote_mod(app: AppHandle, id: String) -> Result<DownloadResult, String> {
+    let _download = begin_download(&id)?;
     let (paths, mut settings, secrets) = {
         let state = app.state::<AppState>();
         let snapshot = (
@@ -260,6 +291,24 @@ pub async fn download_remote_mod(app: AppHandle, id: String) -> Result<DownloadR
     state.refresh_files().map_err(error_text)?;
     state.log("info", "cloud", &message);
     Ok(DownloadResult { message })
+}
+
+#[tauri::command]
+pub async fn trust_sftp_host(
+    app: AppHandle,
+    account_id: String,
+    fingerprint: String,
+) -> Result<SftpConnectionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::trust_host(&state.paths, &settings, &account_id, &fingerprint)?;
+        state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
 }
 
 #[tauri::command]

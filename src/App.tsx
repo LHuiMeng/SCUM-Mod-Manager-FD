@@ -26,6 +26,12 @@ import { SettingsScreen } from "./components/settings/SettingsScreen";
 import { UpdateDialog } from "./components/settings/UpdateDialog";
 import { ToastStack } from "./components/ui/ToastStack";
 
+interface SftpTrustPrompt {
+  accountId: string;
+  fingerprint: string;
+  message: string;
+}
+
 function applyTheme(theme: ThemeMode) {
   document.documentElement.dataset.theme = theme;
   document.documentElement.style.colorScheme = theme;
@@ -48,9 +54,11 @@ export default function App() {
   const [cloudLoading, setCloudLoading] = useState(false);
   const [cloudError, setCloudError] = useState<string | null>(null);
   const [cloudLoaded, setCloudLoaded] = useState(false);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [logs, setLogs] = useState<RuntimeLog[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFile[]>([]);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [sftpTrustPrompt, setSftpTrustPrompt] = useState<SftpTrustPrompt | null>(null);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [updatePhase, setUpdatePhase] = useState<AppUpdatePhase>("idle");
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
@@ -61,6 +69,8 @@ export default function App() {
   const bootUpdateChecked = useRef(false);
   const importPathsRef = useRef<(paths: string[]) => Promise<void>>(async () => undefined);
   const sectionRef = useRef<NavSection>("library");
+  const launchSettingsRevision = useRef(0);
+  const launchSettingsQueue = useRef<Promise<void>>(Promise.resolve());
 
   const notify = useCallback(
     (title: string, detail?: string, tone: ToastMessage["tone"] = "default") => {
@@ -142,6 +152,41 @@ export default function App() {
         listen<AppUpdateProgress>("app-update-progress", (event) => {
           setUpdateProgress(event.payload);
           setUpdatePhase(event.payload.phase);
+        }),
+      )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<LibrarySnapshot["gameStatus"]>("game-status-changed", (event) => {
+          const status = event.payload;
+          setSnapshot((current) =>
+            current ? { ...current, gameStatus: status } : current,
+          );
+          if (status.running) return;
+          void api
+            .getSnapshot()
+            .then((next) => {
+              if (!disposed) {
+                setSnapshot((current) =>
+                  current ? { ...next, settings: current.settings } : next,
+                );
+              }
+            })
+            .catch(() => undefined);
         }),
       )
       .then((stop) => {
@@ -378,7 +423,9 @@ export default function App() {
     setBusy(true);
     try {
       const status = await api.launchGame("client");
-      setSnapshot({ ...snapshot, gameStatus: status });
+      setSnapshot((current) =>
+        current ? { ...current, gameStatus: status } : current,
+      );
       notify("游戏已启动", "启用模组已完成部署", "success");
     } catch (error) {
       notify("启动失败", String(error), "error");
@@ -411,6 +458,42 @@ export default function App() {
     } catch (error) {
       notify("设置保存失败", String(error), "error");
     }
+  }
+
+  function handleLaunchOptionsChange(launchOptions: AppSettings["launchOptions"]) {
+    if (!snapshot) return;
+    const revision = ++launchSettingsRevision.current;
+    const settings = { ...snapshot.settings, launchOptions };
+    setSnapshot((current) =>
+      current ? { ...current, settings } : current,
+    );
+    launchSettingsQueue.current = launchSettingsQueue.current
+      .catch(() => undefined)
+      .then(async () => {
+        const saved = await api.saveSettings(settings);
+        if (revision !== launchSettingsRevision.current) return;
+        setSnapshot((current) =>
+          current
+            ? {
+                ...current,
+                settings: {
+                  ...current.settings,
+                  launchOptions: saved.launchOptions,
+                },
+              }
+            : current,
+        );
+      })
+      .catch(async (error) => {
+        if (revision !== launchSettingsRevision.current) return;
+        notify("启动选项保存失败", String(error), "error");
+        try {
+          const next = await api.getSnapshot();
+          if (revision === launchSettingsRevision.current) setSnapshot(next);
+        } catch {
+          // Keep the current view usable; a later settings save can retry.
+        }
+      });
   }
 
   async function handleInstallUpdate() {
@@ -454,6 +537,8 @@ export default function App() {
   }
 
   async function handleDownloadRemoteMod(id: string) {
+    if (downloadingId) return;
+    setDownloadingId(id);
     try {
       const result = await api.downloadRemoteMod(id);
       notify("下载完成", result.message, "success");
@@ -463,6 +548,8 @@ export default function App() {
       setSnapshot(await api.getSnapshot());
     } catch (error) {
       notify("下载失败", String(error), "error");
+    } finally {
+      setDownloadingId(null);
     }
   }
 
@@ -473,6 +560,7 @@ export default function App() {
     try {
       const next = await api.saveSftpAccount(account, password);
       setSnapshot(next);
+      setSftpTrustPrompt(null);
       notify("SFTP 账户已安全保存", "密码已交由 Rust 后端加密存储", "success");
     } catch (error) {
       setServerError(String(error));
@@ -484,6 +572,16 @@ export default function App() {
     setServerError(null);
     try {
       const result = await api.testSftpConnection(accountId);
+      if (result.requiresTrust && result.hostKeyFingerprint) {
+        setSftpTrustPrompt({
+          accountId,
+          fingerprint: result.hostKeyFingerprint,
+          message: result.message,
+        });
+        notify("需要确认服务器主机指纹", "核对指纹后才能发送密码并建立连接。");
+        return;
+      }
+      setSftpTrustPrompt(null);
       if (!result.ok) throw new Error(result.message);
       notify("连接成功", result.message, "success");
       if (result.detectedModsPath) {
@@ -492,6 +590,21 @@ export default function App() {
     } catch (error) {
       setServerError(String(error));
       notify("SFTP 连接失败", String(error), "error");
+    }
+  }
+
+  async function handleTrustSftpHost() {
+    if (!sftpTrustPrompt) return;
+    setServerError(null);
+    try {
+      await api.trustSftpHost(sftpTrustPrompt.accountId, sftpTrustPrompt.fingerprint);
+      const accountId = sftpTrustPrompt.accountId;
+      setSftpTrustPrompt(null);
+      notify("主机密钥已信任", "正在重新验证账户与远端目录", "success");
+      await handleTestSftp(accountId);
+    } catch (error) {
+      setServerError(String(error));
+      notify("主机密钥保存失败", String(error), "error");
     }
   }
 
@@ -586,9 +699,7 @@ export default function App() {
               onLaunch={handleLaunch}
               onKill={handleKill}
               onOpenFolder={(id) => void api.openModFolder(id)}
-              onSettingsChange={(settings) =>
-                setSnapshot((current) => (current ? { ...current, settings } : current))
-              }
+              onLaunchOptionsChange={handleLaunchOptionsChange}
               onNavigate={setSection}
               gameStatus={snapshot.gameStatus}
               selectedId={selectedId}
@@ -600,6 +711,7 @@ export default function App() {
             <CloudScreen
               mods={cloudMods}
               loading={cloudLoading}
+              downloadingId={downloadingId}
               error={cloudError}
               configured={snapshot.settings.cloud.baseUrls.length > 0}
               edition={appInfo?.edition ?? "public"}
@@ -615,10 +727,13 @@ export default function App() {
               files={remoteFiles}
               loading={busy}
               error={serverError}
+              trustPrompt={sftpTrustPrompt}
               onSaveAccount={(account, password) =>
                 void handleSaveSftpAccount(account, password)
               }
               onTestAccount={(id) => void handleTestSftp(id)}
+              onTrustHost={() => void handleTrustSftpHost()}
+              onDismissTrust={() => setSftpTrustPrompt(null)}
               onLoadFiles={(_id, path) => void handleLoadRemoteFiles(path)}
               onUpload={(id, paths) => void handleUpload(id, paths)}
               onOpenSettings={() => setSection("settings")}

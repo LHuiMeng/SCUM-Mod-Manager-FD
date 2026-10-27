@@ -10,6 +10,7 @@ import { Tag } from "../ui/Tag";
 interface CloudScreenProps {
   mods: RemoteMod[];
   loading: boolean;
+  downloadingId: string | null;
   error: string | null;
   configured: boolean;
   edition: AppEdition;
@@ -21,6 +22,7 @@ interface CloudScreenProps {
 export function CloudScreen({
   mods,
   loading,
+  downloadingId,
   error,
   configured,
   edition,
@@ -41,11 +43,17 @@ export function CloudScreen({
       <header className="page-header">
         <div>
           <h1>云端目录</h1>
-          <p>从已配置的云源获取模组，下载后先在本地完成 SHA-256 校验。</p>
+          <p>
+            从已配置的云源获取模组。云目录提供 SHA-256 时会强制校验；缺少校验值时会明确提示未校验。
+          </p>
         </div>
         <div className="heading-tools">
           <SearchField value={search} onChange={setSearch} placeholder="搜索云端模组" />
-          <Button icon="refresh" onClick={onRefresh} disabled={loading}>
+          <Button
+            icon="refresh"
+            onClick={onRefresh}
+            disabled={loading || downloadingId !== null}
+          >
             {loading ? "正在获取" : "刷新目录"}
           </Button>
           <Button icon="settings" onClick={onOpenSettings}>
@@ -122,9 +130,13 @@ export function CloudScreen({
                   size="sm"
                   icon="download"
                   onClick={() => onDownload(mod.id)}
-                  disabled={!configured || loading}
+                  disabled={!configured || loading || downloadingId !== null}
                 >
-                  {mod.installed ? "重新下载" : "下载"}
+                  {downloadingId === mod.id
+                    ? "正在下载"
+                    : mod.installed
+                      ? "重新下载"
+                      : "下载"}
                 </Button>
               </footer>
             </article>
@@ -134,7 +146,9 @@ export function CloudScreen({
 
       <div className="page-footnote">
         <Icon name="lock" size={13} />
-        <span>云端请求与下载均由 Rust 后端完成，前端不读取共享密钥。</span>
+        <span>
+          云端请求与下载均由 Rust 后端完成，共享凭据只发送到已配置云源的同源请求。
+        </span>
       </div>
     </section>
   );
