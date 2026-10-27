@@ -1,0 +1,21 @@
+# Copy this file to the ignored secrets directory and replace placeholders
+# before deploying:
+#   secrets/cloudflare-scum-mods-gate.wrangler.toml
+#
+# From the repository root:
+#   wrangler deploy --config secrets/cloudflare-scum-mods-gate.wrangler.toml
+#   wrangler secret put GATE_TOKEN --config secrets/cloudflare-scum-mods-gate.wrangler.toml
+#
+# Keep real account IDs, tokens, hostnames, and DNS identifiers out of Git.
+
+name = "scum-mods-gate"
+main = "../cloudflare/scum-mods-gate/worker.js"
+compatibility_date = "2026-01-20"
+
+[[r2_buckets]]
+binding = "MODS"
+bucket_name = "<r2_bucket_name>"
+
+routes = [
+  { pattern = "<gate_domain>", custom_domain = true }
+]

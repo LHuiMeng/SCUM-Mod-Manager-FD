@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SCUM Mod Desk",
+  "version": "3.0.0",
+  "identifier": "com.scummod.manager",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "appDirectoriesOverride": "./app-data",
+    "windows": [
+      {
+        "label": "main",
+        "title": "SCUM Mod Desk",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 980,
+        "minHeight": 640,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost https: http:"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "requireSignedVersion": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "resources": [
+      "resources/repak.exe",
+      "resources/ue4ss_framework.zip"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false
+      }
+    }
+  }
+}

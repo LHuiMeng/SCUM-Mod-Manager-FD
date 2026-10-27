@@ -1,0 +1,40 @@
+{
+  "name": "scum-mod-manager",
+  "private": true,
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.node.json",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:ui": "npm run build && node scripts/ui-regression.mjs",
+    "test:native": "node scripts/native-regression.mjs",
+    "tauri": "tauri",
+    "build:editions": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-editions.ps1",
+    "package:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1",
+    "migrate:data": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/migrate-runtime-data.ps1",
+    "secrets:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-secrets.ps1"
+  },
+  "dependencies": {
+    "@fontsource/archivo": "^5.2.7",
+    "@fontsource/spline-sans-mono": "^5.2.8",
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
+    "@tauri-apps/plugin-opener": "^2.5.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.5",
+    "vitest": "^4.1.0",
+    "ws": "^8.22.0"
+  }
+}

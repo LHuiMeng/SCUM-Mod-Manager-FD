@@ -1,0 +1,57 @@
+# Rust / Tauri
+target/
+src-tauri/target/
+gen/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+/vite.config.js
+/vite.config.d.ts
+
+# Build output
+build/
+/data/
+/app-data/
+release-output/
+test-artifacts/
+*.zip
+*.exe
+*.msi
+!src-tauri/resources/repak.exe
+!src-tauri/resources/ue4ss_framework.zip
+
+# Secrets: only documentation and the safe example are tracked.
+secrets/*
+!secrets/README.md
+!secrets/example.toml
+runtime-secrets/
+/cloudflare/scum-mods-gate/wrangler.toml
+
+# Runtime user data
+/config.json
+/mods_meta.json
+/logs/
+/~mods/
+/~merged/
+/ue4ss_runtime/
+/server_mods.db
+/update_secret.json
+.env
+*.env.local
+*_token*
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Hermes
+.hermes/
+.worktrees/
+*.bak
