@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub const MIN_CLOUD_DOWNLOAD_SEGMENTS: usize = 8;
+pub const DEFAULT_CLOUD_DOWNLOAD_SEGMENTS: usize = 16;
+pub const MAX_CLOUD_DOWNLOAD_SEGMENTS: usize = 128;
+
 fn default_theme() -> String {
     "light".to_string()
 }
@@ -48,13 +52,25 @@ impl LaunchOptions {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CloudSettings {
     #[serde(alias = "baseUrls", alias = "base_urls")]
     pub base_urls: Vec<String>,
     #[serde(alias = "activeBaseUrl", alias = "active_base_url")]
     pub active_base_url: String,
+    #[serde(alias = "max_download_segments")]
+    pub max_download_segments: usize,
+}
+
+impl Default for CloudSettings {
+    fn default() -> Self {
+        Self {
+            base_urls: Vec::new(),
+            active_base_url: String::new(),
+            max_download_segments: DEFAULT_CLOUD_DOWNLOAD_SEGMENTS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +218,18 @@ pub struct RemoteMod {
     #[serde(rename = "type")]
     pub mod_type: String,
     pub installed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudDownloadProgress {
+    pub id: String,
+    pub phase: String,
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub segments: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

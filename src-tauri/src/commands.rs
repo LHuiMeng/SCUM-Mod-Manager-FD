@@ -2,9 +2,9 @@ use crate::app_update;
 use crate::cloud;
 use crate::launcher;
 use crate::models::{
-    AppInfo, AppSettings, AppUpdateInfo, DetectPathsResult, DownloadResult, GameStatus,
-    ImportResult, InstallUpdateResult, LibrarySnapshot, RemoteFile, RemoteMod, RuntimeLog,
-    SftpAccountInput, SftpConnectionResult, UploadResult,
+    AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, DetectPathsResult, DownloadResult,
+    GameStatus, ImportResult, InstallUpdateResult, LibrarySnapshot, RemoteFile, RemoteMod,
+    RuntimeLog, SftpAccountInput, SftpConnectionResult, UploadResult,
 };
 use crate::paths::path_string;
 use crate::sftp;
@@ -12,8 +12,8 @@ use crate::state::AppState;
 use crate::steam;
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
-use tauri::{AppHandle, Manager, State, WebviewWindow};
+use std::sync::{Arc, Mutex, OnceLock};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 
 static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -265,7 +265,33 @@ pub async fn fetch_cloud_catalog(app: AppHandle) -> Result<Vec<RemoteMod>, Strin
 
 #[tauri::command]
 pub async fn download_remote_mod(app: AppHandle, id: String) -> Result<DownloadResult, String> {
-    let _download = begin_download(&id)?;
+    let progress_app = app.clone();
+    let progress_id = id.clone();
+    let progress: cloud::CloudDownloadProgressCallback = Arc::new(move |payload| {
+        let _ = progress_app.emit("cloud-download-progress", payload);
+    });
+    let _download = match begin_download(&id) {
+        Ok(guard) => guard,
+        Err(error) => {
+            progress(CloudDownloadProgress {
+                id: progress_id.clone(),
+                phase: "error".to_string(),
+                downloaded: 0,
+                total: None,
+                segments: 0,
+                message: Some(error.clone()),
+            });
+            return Err(error);
+        }
+    };
+    progress(CloudDownloadProgress {
+        id: progress_id.clone(),
+        phase: "queued".to_string(),
+        downloaded: 0,
+        total: None,
+        segments: 0,
+        message: None,
+    });
     let (paths, mut settings, secrets) = {
         let state = app.state::<AppState>();
         let snapshot = (
@@ -275,20 +301,43 @@ pub async fn download_remote_mod(app: AppHandle, id: String) -> Result<DownloadR
         );
         snapshot
     };
-    let message = cloud::download_remote(
+    let message = match cloud::download_remote(
         &paths,
         &mut settings,
         &secrets,
         cloud::CloudAccess::current(),
         &id,
+        progress.clone(),
     )
     .await
-    .map_err(error_text)?;
+    {
+        Ok(message) => message,
+        Err(error) => {
+            let message = error_text(error);
+            progress(CloudDownloadProgress {
+                id: progress_id.clone(),
+                phase: "error".to_string(),
+                downloaded: 0,
+                total: None,
+                segments: 0,
+                message: Some(message.clone()),
+            });
+            app.state::<AppState>()
+                .log("error", "cloud", &format!("云端下载失败：{message}"));
+            return Err(message);
+        }
+    };
     let state = app.state::<AppState>();
     if let Err(error) = state.set_cloud_settings(&settings) {
         state.log("warn", "cloud", &format!("保存云源状态失败：{error:#}"));
     }
-    state.refresh_files().map_err(error_text)?;
+    if let Err(error) = state.refresh_files() {
+        state.log(
+            "warn",
+            "cloud",
+            &format!("下载完成，但刷新模组库失败：{}", error_text(error)),
+        );
+    }
     state.log("info", "cloud", &message);
     Ok(DownloadResult { message })
 }
@@ -404,4 +453,22 @@ pub fn window_toggle_maximize(window: WebviewWindow) -> Result<(), String> {
 pub fn window_close(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     app.state::<AppState>().shutdown_cleanup();
     window.close().map_err(error_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::begin_download;
+
+    #[test]
+    fn allows_parallel_mods_but_blocks_the_same_download_twice() {
+        let first = begin_download("parallel-download-a").unwrap();
+        let second = begin_download("parallel-download-b").unwrap();
+
+        assert!(begin_download(" PARALLEL-DOWNLOAD-A ").is_err());
+
+        drop(first);
+        let retried = begin_download("parallel-download-a").unwrap();
+        drop(retried);
+        drop(second);
+    }
 }

@@ -499,6 +499,49 @@ async function connect(url, appUrl) {
   await test("云端目录加载、搜索与下载反馈", async () => {
     await navigate("云端");
     await waitFor("document.querySelectorAll('.remote-card').length === 3", 10000);
+    const cardLayout = await evaluate(`(() => {
+      const cards = [...document.querySelectorAll(".remote-card")];
+      const card = cards[0];
+      const name = card.querySelector(".remote-name-scroll b");
+      const author = card.querySelector(".remote-author-scroll span");
+      const description = card.querySelector(".remote-description p");
+      const tags = card.querySelector(".remote-tag-scroll .tag-row");
+      name.textContent = "Very Long Mod Name ".repeat(24);
+      author.textContent = "VeryLongAuthorName".repeat(24);
+      description.textContent = "这是一段用于验证固定卡片高度的超长模组描述。".repeat(120);
+      tags.replaceChildren(
+        ...Array.from({ length: 48 }, (_, index) => {
+          const tag = document.createElement("span");
+          tag.className = "tag";
+          tag.textContent = "长标签" + index;
+          return tag;
+        }),
+      );
+      const nameField = card.querySelector(".remote-name-scroll");
+      const authorField = card.querySelector(".remote-author-scroll");
+      const descriptionField = card.querySelector(".remote-description");
+      const tagField = card.querySelector(".remote-tag-scroll");
+      return {
+        heights: cards.map(item => Math.round(item.getBoundingClientRect().height)),
+        nameScrollable: nameField.scrollHeight > nameField.clientHeight,
+        authorScrollable: authorField.scrollWidth > authorField.clientWidth,
+        descriptionScrollable:
+          descriptionField.scrollHeight > descriptionField.clientHeight,
+        tagsScrollable: tagField.scrollHeight > tagField.clientHeight,
+      };
+    })()`);
+    if (new Set(cardLayout.heights).size !== 1 || cardLayout.heights[0] !== 344) {
+      throw new Error(`云端卡片高度不统一：${JSON.stringify(cardLayout.heights)}`);
+    }
+    for (const field of [
+      "nameScrollable",
+      "authorScrollable",
+      "descriptionScrollable",
+      "tagsScrollable",
+    ]) {
+      if (!cardLayout[field]) throw new Error(`长内容无法滚动：${field}`);
+    }
+    screenshots.push(await screenshot("1440-light-cloud-long-content"));
     const cloudCopy = await evaluate(
       "document.querySelector('.page-cloud')?.innerText ?? ''",
     );

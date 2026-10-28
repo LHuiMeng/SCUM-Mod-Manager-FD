@@ -1,4 +1,6 @@
-use crate::models::{AppSettings, SftpAccount};
+use crate::models::{
+    AppSettings, SftpAccount, MAX_CLOUD_DOWNLOAD_SEGMENTS, MIN_CLOUD_DOWNLOAD_SEGMENTS,
+};
 use crate::paths::{path_string, AppPaths};
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -87,6 +89,10 @@ fn normalize_settings(paths: &AppPaths, settings: &mut AppSettings, raw: Option<
             .cloned()
             .unwrap_or_default();
     }
+    settings.cloud.max_download_segments = settings
+        .cloud
+        .max_download_segments
+        .clamp(MIN_CLOUD_DOWNLOAD_SEGMENTS, MAX_CLOUD_DOWNLOAD_SEGMENTS);
 
     let raw_accounts = raw
         .and_then(|value| {
@@ -273,7 +279,8 @@ mod tests {
                         "http://backup.example/",
                         "http://127.0.0.1:8080/"
                     ],
-                    "activeBaseUrl": "javascript:alert(1)"
+                    "activeBaseUrl": "javascript:alert(1)",
+                    "maxDownloadSegments": 999
                 }
             }))
             .unwrap(),
@@ -288,6 +295,27 @@ mod tests {
             vec!["https://Mods.Example", "http://127.0.0.1:8080"]
         );
         assert_eq!(settings.cloud.active_base_url, "https://Mods.Example");
+        assert_eq!(settings.cloud.max_download_segments, 128);
+    }
+
+    #[test]
+    fn clamps_cloud_download_segments_to_the_supported_range() {
+        let temp = TempRoot::new("config-cloud-segments");
+        let paths = temp.paths();
+        fs::write(
+            &paths.config_file,
+            serde_json::to_vec_pretty(&json!({
+                "cloud": {
+                    "maxDownloadSegments": 1
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let settings = load_settings(&paths).unwrap();
+
+        assert_eq!(settings.cloud.max_download_segments, 8);
     }
 
     #[test]

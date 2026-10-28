@@ -6,6 +6,7 @@ import type {
   AppUpdateInfo,
   AppUpdatePhase,
   AppUpdateProgress,
+  CloudDownloadProgress,
   LibrarySnapshot,
   NavSection,
   RemoteFile,
@@ -17,6 +18,7 @@ import type {
 } from "./types";
 import { formatClock, formatBytes } from "./lib/format";
 import { resolveFileDrop } from "./lib/fileDrop";
+import { cloudDownloadIsActive } from "./lib/cloudDownload";
 import { AppShell } from "./components/shell/AppShell";
 import { LibraryScreen } from "./components/library/LibraryScreen";
 import { CloudScreen } from "./components/cloud/CloudScreen";
@@ -54,7 +56,9 @@ export default function App() {
   const [cloudLoading, setCloudLoading] = useState(false);
   const [cloudError, setCloudError] = useState<string | null>(null);
   const [cloudLoaded, setCloudLoaded] = useState(false);
-  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [cloudDownloads, setCloudDownloads] = useState<
+    Record<string, CloudDownloadProgress>
+  >({});
   const [logs, setLogs] = useState<RuntimeLog[]>([]);
   const [remoteFiles, setRemoteFiles] = useState<RemoteFile[]>([]);
   const [serverError, setServerError] = useState<string | null>(null);
@@ -71,6 +75,7 @@ export default function App() {
   const sectionRef = useRef<NavSection>("library");
   const launchSettingsRevision = useRef(0);
   const launchSettingsQueue = useRef<Promise<void>>(Promise.resolve());
+  const activeCloudDownloads = useRef(new Set<string>());
 
   const notify = useCallback(
     (title: string, detail?: string, tone: ToastMessage["tone"] = "default") => {
@@ -152,6 +157,46 @@ export default function App() {
         listen<AppUpdateProgress>("app-update-progress", (event) => {
           setUpdateProgress(event.payload);
           setUpdatePhase(event.payload.phase);
+        }),
+      )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<CloudDownloadProgress>("cloud-download-progress", (event) => {
+          const progress = event.payload;
+          setCloudDownloads((current) => {
+            const previous = current[progress.id];
+            const total = progress.total ?? previous?.total ?? null;
+            // 失败事件里的 downloaded 是 0，不能让它把已下载的量抹掉。
+            const keepsProgress =
+              progress.phase === "downloading" || progress.phase === "error";
+            const downloaded =
+              keepsProgress && previous
+                ? Math.max(progress.downloaded, previous.downloaded)
+                : progress.downloaded;
+            return {
+              ...current,
+              [progress.id]: {
+                ...progress,
+                downloaded,
+                total,
+              },
+            };
+          });
         }),
       )
       .then((stop) => {
@@ -537,19 +582,70 @@ export default function App() {
   }
 
   async function handleDownloadRemoteMod(id: string) {
-    if (downloadingId) return;
-    setDownloadingId(id);
+    const current = cloudDownloads[id];
+    if (
+      activeCloudDownloads.current.has(id) ||
+      (current && cloudDownloadIsActive(current))
+    ) {
+      return;
+    }
+    const remote = cloudMods.find((mod) => mod.id === id);
+    const total = remote?.fileSize || null;
+    activeCloudDownloads.current.add(id);
+    setCloudDownloads((downloads) => ({
+      ...downloads,
+      [id]: {
+        id,
+        phase: "queued",
+        downloaded: 0,
+        total,
+        segments: 0,
+      },
+    }));
     try {
       const result = await api.downloadRemoteMod(id);
       notify("下载完成", result.message, "success");
+      setCloudDownloads((downloads) => {
+        const latest = downloads[id];
+        const completedTotal = latest?.total ?? total;
+        return {
+          ...downloads,
+          [id]: {
+            id,
+            phase: "completed",
+            downloaded: completedTotal ?? latest?.downloaded ?? 0,
+            total: completedTotal,
+            segments: 0,
+          },
+        };
+      });
       setCloudMods((current) =>
         current.map((mod) => (mod.id === id ? { ...mod, installed: true } : mod)),
       );
-      setSnapshot(await api.getSnapshot());
+      try {
+        setSnapshot(await api.getSnapshot());
+      } catch (error) {
+        notify("模组库刷新失败", String(error), "error");
+      }
     } catch (error) {
-      notify("下载失败", String(error), "error");
+      const message = String(error);
+      notify("下载失败", message, "error");
+      setCloudDownloads((downloads) => {
+        const latest = downloads[id];
+        return {
+          ...downloads,
+          [id]: {
+            id,
+            phase: "error",
+            downloaded: latest?.downloaded ?? 0,
+            total: latest?.total ?? total,
+            segments: latest?.segments ?? 0,
+            message,
+          },
+        };
+      });
     } finally {
-      setDownloadingId(null);
+      activeCloudDownloads.current.delete(id);
     }
   }
 
@@ -711,10 +807,11 @@ export default function App() {
             <CloudScreen
               mods={cloudMods}
               loading={cloudLoading}
-              downloadingId={downloadingId}
+              downloads={cloudDownloads}
               error={cloudError}
               configured={snapshot.settings.cloud.baseUrls.length > 0}
               edition={appInfo?.edition ?? "public"}
+              maxSegments={snapshot.settings.cloud.maxDownloadSegments}
               onRefresh={() => void refreshCloud(true)}
               onDownload={(id) => void handleDownloadRemoteMod(id)}
               onOpenSettings={() => setSection("settings")}

@@ -1,6 +1,6 @@
 use crate::metadata::MetadataFile;
 use crate::models::{ImportResult, ModEntry};
-use crate::paths::{path_string, AppPaths};
+use crate::paths::{path_string, safe_disk_name, AppPaths};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -258,37 +258,95 @@ pub fn import_paths(paths: &AppPaths, sources: &[String]) -> Result<ImportResult
 }
 
 fn import_zip(paths: &AppPaths, source: &Path) -> Result<(usize, usize)> {
+    install_ue4ss_zip(paths, source, None, false)
+}
+
+/// 安装一个 ZIP 形态的模组包：含 `.pak` 的包只提取 PAK 到本地模组库，
+/// 否则按 UE4SS 模组装进运行时目录。
+///
+/// 云端下载与本地拖入共用这一条路径，保证 wrapper 目录剥离、目标名清洗、
+/// 已存在跳过/替换的语义完全一致。`replace` 为真时先解到以点开头的暂存目录，
+/// 成功后再原子替换，解压失败不会清空用户已有的安装。
+pub fn install_ue4ss_zip(
+    paths: &AppPaths,
+    source: &Path,
+    preferred_name: Option<&str>,
+    replace: bool,
+) -> Result<(usize, usize)> {
     let file = File::open(source)?;
     let mut archive = ZipArchive::new(file)?;
     let mut contains_pak = false;
     for index in 0..archive.len() {
-        let file = archive.by_index(index)?;
-        if file.name().to_ascii_lowercase().ends_with(".pak") {
+        let entry = archive.by_index(index)?;
+        if entry.name().to_ascii_lowercase().ends_with(".pak") {
             contains_pak = true;
             break;
         }
     }
     if contains_pak {
-        extract_zip_matching(paths, archive, &paths.local_mods, |name| {
+        return extract_zip_matching(paths, archive, &paths.local_mods, replace, |name| {
             name.to_ascii_lowercase().ends_with(".pak")
-        })
-    } else {
-        let wrapper = zip_wrapper_directory(&mut archive)?;
-        let folder_name = wrapper.clone().unwrap_or_else(|| {
+        });
+    }
+
+    let wrapper = zip_wrapper_directory(&mut archive)?;
+    let raw_name = wrapper
+        .clone()
+        .or_else(|| preferred_name.map(str::to_string))
+        .unwrap_or_else(|| {
             source
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned()
         });
-        let destination = paths.ue4ss_mods.join(folder_name);
-        if destination.exists() {
-            return Ok((0, 1));
-        }
-        std::fs::create_dir_all(&destination)?;
-        extract_zip_all_with_wrapper(archive, &destination, wrapper.as_deref())?;
-        Ok((1, 0))
+    let folder_name = safe_disk_name(&raw_name, "mod");
+    let destination = paths.ue4ss_mods.join(&folder_name);
+    if destination.exists() && !replace {
+        return Ok((0, 1));
     }
+
+    let staging = paths
+        .ue4ss_mods
+        .join(format!(".staging-{}-{}", std::process::id(), folder_name));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    let extracted = match extract_zip_all_with_wrapper(archive, &staging, wrapper.as_deref()) {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    if extracted == 0 {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Ok((0, 1));
+    }
+
+    let mut retired = None;
+    if destination.exists() {
+        let trash =
+            paths
+                .ue4ss_mods
+                .join(format!(".retired-{}-{}", std::process::id(), folder_name));
+        let _ = std::fs::remove_dir_all(&trash);
+        std::fs::rename(&destination, &trash).with_context(|| {
+            format!("无法替换已存在的 UE4SS 模组目录 {}", destination.display())
+        })?;
+        retired = Some(trash);
+    }
+    if let Err(error) = std::fs::rename(&staging, &destination) {
+        if let Some(trash) = retired {
+            let _ = std::fs::rename(&trash, &destination);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error)
+            .with_context(|| format!("无法写入 UE4SS 模组目录 {}", destination.display()));
+    }
+    if let Some(trash) = retired {
+        let _ = std::fs::remove_dir_all(&trash);
+    }
+    Ok((1, 0))
 }
 
 fn zip_wrapper_directory(archive: &mut ZipArchive<File>) -> Result<Option<String>> {
@@ -335,9 +393,10 @@ pub fn extract_zip_file(zip_path: &Path, destination: &Path) -> Result<usize> {
 }
 
 fn extract_zip_matching<F>(
-    _paths: &AppPaths,
+    paths: &AppPaths,
     mut archive: ZipArchive<File>,
     destination: &Path,
+    replace: bool,
     predicate: F,
 ) -> Result<(usize, usize)>
 where
@@ -358,8 +417,19 @@ where
         let filename = relative.file_name().context("压缩包内 PAK 缺少文件名")?;
         let output = destination.join(filename);
         if output.exists() {
-            skipped += 1;
-            continue;
+            if !replace {
+                skipped += 1;
+                continue;
+            }
+            // 与直接落盘的 PAK 一致：覆盖前留一份可回收的备份。
+            std::fs::create_dir_all(&paths.backups_dir)?;
+            let backup = paths.backups_dir.join(format!(
+                "{}.bak",
+                output.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let _ = std::fs::remove_file(&backup);
+            std::fs::rename(&output, &backup)
+                .with_context(|| format!("无法备份已存在的模组文件 {}", output.display()))?;
         }
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
@@ -485,7 +555,7 @@ fn epoch_millis(time: SystemTime) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_zip_file, import_paths};
+    use super::{extract_zip_file, import_paths, install_ue4ss_zip};
     use crate::paths::AppPaths;
     use std::fs::{self, File};
     use std::io::Write;
@@ -718,5 +788,157 @@ mod tests {
         assert_eq!(result.imported, 0);
         assert_eq!(result.skipped, 1);
         assert_eq!(fs::read(existing).unwrap(), b"original");
+    }
+
+    fn write_zip(archive: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(archive).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, body) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(body).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn keeps_chinese_ue4ss_names_distinct_on_disk() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        let first = temp.path().join("武器增强.zip");
+        write_zip(&first, &[("武器增强/Scripts/main.lua", b"print('a')")]);
+        let second = temp.path().join("高清材质包.zip");
+        write_zip(&second, &[("高清材质包/Scripts/main.lua", b"print('b')")]);
+
+        assert_eq!(
+            install_ue4ss_zip(&paths, &first, None, false).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            install_ue4ss_zip(&paths, &second, None, false).unwrap(),
+            (1, 0)
+        );
+
+        assert_eq!(
+            fs::read(
+                paths
+                    .ue4ss_mods
+                    .join("武器增强")
+                    .join("Scripts")
+                    .join("main.lua")
+            )
+            .unwrap(),
+            b"print('a')"
+        );
+        assert_eq!(
+            fs::read(
+                paths
+                    .ue4ss_mods
+                    .join("高清材质包")
+                    .join("Scripts")
+                    .join("main.lua")
+            )
+            .unwrap(),
+            b"print('b')"
+        );
+    }
+
+    #[test]
+    fn strips_wrapper_and_replaces_only_when_requested() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        let archive = temp.path().join("BetterAI.zip");
+        write_zip(&archive, &[("BetterAI/Scripts/main.lua", b"v1")]);
+
+        assert_eq!(
+            install_ue4ss_zip(&paths, &archive, None, false).unwrap(),
+            (1, 0)
+        );
+        assert!(paths
+            .ue4ss_mods
+            .join("BetterAI")
+            .join("Scripts")
+            .join("main.lua")
+            .exists());
+        assert!(!paths.ue4ss_mods.join("BetterAI").join("BetterAI").exists());
+
+        let update = temp.path().join("BetterAI-v2.zip");
+        write_zip(&update, &[("BetterAI/Scripts/main.lua", b"v2")]);
+        assert_eq!(
+            install_ue4ss_zip(&paths, &update, None, false).unwrap(),
+            (0, 1)
+        );
+        assert_eq!(
+            fs::read(
+                paths
+                    .ue4ss_mods
+                    .join("BetterAI")
+                    .join("Scripts")
+                    .join("main.lua")
+            )
+            .unwrap(),
+            b"v1"
+        );
+        assert_eq!(
+            install_ue4ss_zip(&paths, &update, None, true).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            fs::read(
+                paths
+                    .ue4ss_mods
+                    .join("BetterAI")
+                    .join("Scripts")
+                    .join("main.lua")
+            )
+            .unwrap(),
+            b"v2"
+        );
+        assert!(!paths.ue4ss_mods.join(".staging").exists());
+    }
+
+    #[test]
+    fn uses_remote_name_when_the_zip_has_no_wrapper() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        let archive = temp.path().join("payload.zip");
+        write_zip(&archive, &[("Scripts/main.lua", b"flat")]);
+
+        assert_eq!(
+            install_ue4ss_zip(&paths, &archive, Some("武器增强"), true).unwrap(),
+            (1, 0)
+        );
+        assert!(paths
+            .ue4ss_mods
+            .join("武器增强")
+            .join("Scripts")
+            .join("main.lua")
+            .exists());
+    }
+
+    #[test]
+    fn replaces_existing_pak_from_zip_only_when_requested() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        let existing = paths.local_mods.join("Weapon.pak");
+        fs::write(&existing, b"old").unwrap();
+        let archive = temp.path().join("WeaponPack.zip");
+        write_zip(&archive, &[("nested/Weapon.pak", b"new")]);
+
+        assert_eq!(
+            install_ue4ss_zip(&paths, &archive, None, false).unwrap(),
+            (0, 1)
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"old");
+
+        assert_eq!(
+            install_ue4ss_zip(&paths, &archive, None, true).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"new");
+        assert_eq!(
+            fs::read(paths.backups_dir.join("Weapon.pak.bak")).unwrap(),
+            b"old"
+        );
     }
 }

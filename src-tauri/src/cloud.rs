@@ -1,7 +1,10 @@
 use crate::edition;
-use crate::models::{AppSettings, RemoteMod};
-use crate::mods::extract_zip_file;
-use crate::paths::{safe_file_component, AppPaths};
+use crate::models::{
+    AppSettings, CloudDownloadProgress, RemoteMod, MAX_CLOUD_DOWNLOAD_SEGMENTS,
+    MIN_CLOUD_DOWNLOAD_SEGMENTS,
+};
+use crate::mods::install_ue4ss_zip;
+use crate::paths::{safe_disk_name, AppPaths};
 use crate::secrets::RuntimeSecrets;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -11,12 +14,81 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::AsyncWriteExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use url::Url;
 
 static DOWNLOAD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static DOWNLOAD_CONNECTIONS: OnceLock<Semaphore> = OnceLock::new();
+
+/// 全局下载连接上限。单模组上限（MAX_CLOUD_DOWNLOAD_SEGMENTS）必须小于它，
+/// 否则一个模组就能占满全部槽位，其它模组的下载只能等它让出。
+const MAX_CLOUD_CONNECTIONS: usize = 256;
+const CONNECTION_RAMP_BYTES: u64 = 4 * 1024 * 1024;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
+
+pub(crate) type CloudDownloadProgressCallback = Arc<dyn Fn(CloudDownloadProgress) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentPlan {
+    workers: usize,
+    chunk_size: u64,
+    total_chunks: usize,
+}
+
+struct SegmentedDownloadState {
+    client: reqwest::Client,
+    source: Url,
+    settings: AppSettings,
+    secrets: RuntimeSecrets,
+    access: CloudAccess,
+    id: String,
+    total: u64,
+    plan: SegmentPlan,
+    directory: PathBuf,
+    downloaded: AtomicU64,
+    next_chunk: AtomicUsize,
+    cancelled: AtomicBool,
+    progress_gate: Mutex<ProgressGate>,
+    on_progress: CloudDownloadProgressCallback,
+}
+
+struct ProgressGate {
+    last_emit: Instant,
+    last_value: u64,
+}
+
+impl SegmentedDownloadState {
+    fn report_downloading(&self, force: bool) {
+        let current = self.downloaded.load(Ordering::Relaxed);
+        let mut gate = self
+            .progress_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !force && gate.last_emit.elapsed() < PROGRESS_INTERVAL {
+            return;
+        }
+        if current < gate.last_value {
+            return;
+        }
+        gate.last_emit = Instant::now();
+        gate.last_value = current;
+        notify_download_progress(
+            &self.on_progress,
+            &self.id,
+            "downloading",
+            current,
+            Some(self.total),
+            self.plan.workers,
+            None,
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudAccess {
@@ -91,102 +163,553 @@ pub async fn download_remote(
     secrets: &RuntimeSecrets,
     access: CloudAccess,
     id: &str,
+    on_progress: CloudDownloadProgressCallback,
 ) -> Result<String> {
     let catalog = fetch_catalog(paths, settings, secrets, access).await?;
     let remote = catalog
         .iter()
         .find(|item| item.id == id)
         .with_context(|| format!("云端目录中不存在模组 {id}"))?;
-    let filename = remote_filename(remote);
     let sequence = DOWNLOAD_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp = paths.root.join("downloads").join(format!(
-        "{}.{}.{}.part",
-        safe_file_component(id),
+    let work_dir = paths.root.join("downloads").join(format!(
+        "{}.{}.{}.parts",
+        safe_disk_name(id, "mod"),
         std::process::id(),
         sequence
     ));
-    if let Some(parent) = temp.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let client = cloud_client(std::time::Duration::from_secs(600))?;
+    tokio::fs::create_dir_all(&work_dir).await?;
+    let result = download_remote_into(
+        paths,
+        settings,
+        secrets,
+        access,
+        remote,
+        &work_dir,
+        on_progress,
+    )
+    .await;
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    result
+}
+
+async fn download_remote_into(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    secrets: &RuntimeSecrets,
+    access: CloudAccess,
+    remote: &RemoteMod,
+    work_dir: &Path,
+    on_progress: CloudDownloadProgressCallback,
+) -> Result<String> {
+    let client = cloud_client(Duration::from_secs(600))?;
     let mut candidates = download_candidates(settings, remote);
     candidates.dedup();
     let mut errors = Vec::new();
-    for url in candidates {
+    for (index, url) in candidates.into_iter().enumerate() {
         let parsed = match Url::parse(&url) {
             Ok(parsed) if allowed_cloud_transport(&parsed) => parsed,
             Ok(_) => {
-                errors.push(format!("{url}: 仅允许 HTTPS 下载地址（本机回环除外）"));
+                errors.push(format!(
+                    "{}: 仅允许 HTTPS 下载地址（本机回环除外）",
+                    download_endpoint_label(&url)
+                ));
                 continue;
             }
             Err(error) => {
-                errors.push(format!("{url}: {error}"));
+                errors.push(format!("{}: {error}", download_endpoint_label(&url)));
                 continue;
             }
         };
         let has_declared_hash = !remote.sha256.trim().is_empty();
         if !download_source_allowed(settings, &parsed, has_declared_hash) {
-            errors.push(format!("{url}: 跨源下载缺少 SHA-256，已跳过"));
+            errors.push(format!(
+                "{}: 跨源下载缺少 SHA-256，已跳过",
+                download_endpoint_label(&url)
+            ));
             continue;
         }
-        let request = authorize_cloud_request(
-            client.get(parsed.clone()),
+        let candidate_dir = work_dir.join(format!("candidate-{index}"));
+        tokio::fs::create_dir_all(&candidate_dir).await?;
+        let result = download_candidate(
+            paths,
+            &client,
             &parsed,
             settings,
             secrets,
             access,
-        );
-        let response = match request.send().await {
-            Ok(response) if response.status().is_success() => response,
-            Ok(response) => {
-                errors.push(format!("{url}: HTTP {}", response.status()));
-                continue;
+            remote,
+            &candidate_dir,
+            on_progress.clone(),
+        )
+        .await;
+        let _ = tokio::fs::remove_dir_all(&candidate_dir).await;
+        match result {
+            Ok(message) => return Ok(message),
+            Err(error) => errors.push(format!("{}: {error:#}", download_endpoint_label(&url))),
+        }
+    }
+    bail!("下载失败：{}", errors.join("；"))
+}
+
+async fn download_candidate(
+    paths: &AppPaths,
+    client: &reqwest::Client,
+    source: &Url,
+    settings: &AppSettings,
+    secrets: &RuntimeSecrets,
+    access: CloudAccess,
+    remote: &RemoteMod,
+    directory: &Path,
+    on_progress: CloudDownloadProgressCallback,
+) -> Result<String> {
+    notify_download_progress(
+        &on_progress,
+        &remote.id,
+        "preparing",
+        0,
+        (remote.file_size > 0).then_some(remote.file_size),
+        0,
+        Some("正在探测 Range 支持并规划动态分片".to_string()),
+    );
+    let total = probe_range(client, source, settings, secrets, access).await?;
+    let plan = segment_plan(total, settings.cloud.max_download_segments);
+    if plan.workers == 0 || plan.total_chunks == 0 {
+        bail!("服务器返回的文件大小为 0，无法分片下载");
+    }
+    notify_download_progress(
+        &on_progress,
+        &remote.id,
+        "preparing",
+        0,
+        Some(total),
+        0,
+        Some(format!(
+            "已规划 {} 个分片，启用 {} 路并发",
+            plan.total_chunks, plan.workers
+        )),
+    );
+
+    let state = Arc::new(SegmentedDownloadState {
+        client: client.clone(),
+        source: source.clone(),
+        settings: settings.clone(),
+        secrets: secrets.clone(),
+        access,
+        id: remote.id.clone(),
+        total,
+        plan,
+        directory: directory.to_path_buf(),
+        downloaded: AtomicU64::new(0),
+        next_chunk: AtomicUsize::new(0),
+        cancelled: AtomicBool::new(false),
+        progress_gate: Mutex::new(ProgressGate {
+            last_emit: Instant::now(),
+            last_value: 0,
+        }),
+        on_progress: on_progress.clone(),
+    });
+    notify_download_progress(
+        &on_progress,
+        &remote.id,
+        "downloading",
+        0,
+        Some(total),
+        plan.workers,
+        None,
+    );
+
+    let mut tasks = JoinSet::new();
+    for _ in 0..plan.workers {
+        let state = state.clone();
+        tasks.spawn(async move { download_worker(state).await });
+    }
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+                tasks.abort_all();
             }
             Err(error) => {
-                errors.push(format!("{url}: {error}"));
-                continue;
+                first_error.get_or_insert_with(|| anyhow::anyhow!("下载任务异常：{error}"));
             }
-        };
-        let mut file = tokio::fs::File::create(&temp).await?;
-        let mut stream = response.bytes_stream();
-        let mut hasher = Sha256::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
         }
-        file.flush().await?;
-        let digest = hex::encode(hasher.finalize());
-        if has_declared_hash && !digest.eq_ignore_ascii_case(remote.sha256.trim()) {
-            let _ = tokio::fs::remove_file(&temp).await;
-            errors.push(format!("{url}: SHA-256 校验失败"));
-            continue;
-        }
-
-        if remote.mod_type == "ue4ssMod" {
-            let destination = paths.ue4ss_mods.join(safe_file_component(&remote.name));
-            tokio::fs::create_dir_all(&destination).await?;
-            tokio::task::spawn_blocking({
-                let temp = temp.clone();
-                let destination = destination.clone();
-                move || extract_zip_file(&temp, &destination)
-            })
-            .await
-            .context("解压任务异常")??;
-            let _ = tokio::fs::remove_file(&temp).await;
-            return Ok(download_message(remote, has_declared_hash));
-        }
-
-        tokio::fs::create_dir_all(&paths.local_mods).await?;
-        let destination = paths.local_mods.join(filename);
-        if tokio::fs::try_exists(&destination).await.unwrap_or(false) {
-            let _ = tokio::fs::remove_file(&destination).await;
-        }
-        tokio::fs::rename(&temp, &destination).await?;
-        return Ok(download_message(remote, has_declared_hash));
     }
-    let _ = tokio::fs::remove_file(&temp).await;
-    bail!("下载失败：{}", errors.join("；"))
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    notify_download_progress(
+        &on_progress,
+        &remote.id,
+        "verifying",
+        total,
+        Some(total),
+        0,
+        Some("正在按分片顺序合并并校验 SHA-256".to_string()),
+    );
+    let payload = directory.join("payload.part");
+    let digest = merge_parts(&state, &payload).await?;
+    let has_declared_hash = !remote.sha256.trim().is_empty();
+    if has_declared_hash && !digest.eq_ignore_ascii_case(remote.sha256.trim()) {
+        bail!("SHA-256 校验失败");
+    }
+
+    notify_download_progress(
+        &on_progress,
+        &remote.id,
+        "installing",
+        total,
+        Some(total),
+        0,
+        Some("正在写入本地模组库".to_string()),
+    );
+    install_downloaded(paths, &payload, remote).await?;
+    notify_download_progress(
+        &on_progress,
+        &remote.id,
+        "completed",
+        total,
+        Some(total),
+        0,
+        None,
+    );
+    Ok(download_message(remote, has_declared_hash))
+}
+
+fn segment_plan(size: u64, configured_max: usize) -> SegmentPlan {
+    if size == 0 {
+        return SegmentPlan {
+            workers: 0,
+            chunk_size: 0,
+            total_chunks: 0,
+        };
+    }
+    let configured = configured_max.clamp(MIN_CLOUD_DOWNLOAD_SEGMENTS, MAX_CLOUD_DOWNLOAD_SEGMENTS);
+    let byte_ceiling = usize::try_from(size).unwrap_or(usize::MAX);
+    let worker_ceiling = configured
+        .min(byte_ceiling)
+        .max(MIN_CLOUD_DOWNLOAD_SEGMENTS.min(byte_ceiling));
+    let ramp_ceiling = usize::try_from(size.div_ceil(CONNECTION_RAMP_BYTES))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let workers = worker_ceiling
+        .min(ramp_ceiling)
+        .max(MIN_CLOUD_DOWNLOAD_SEGMENTS.min(worker_ceiling));
+    let target_chunks = (workers as u64).saturating_mul(2);
+    let chunk_size = size.div_ceil(target_chunks).max(1);
+    let total_chunks = usize::try_from(size.div_ceil(chunk_size)).unwrap_or(usize::MAX);
+    SegmentPlan {
+        workers: workers.min(total_chunks),
+        chunk_size,
+        total_chunks,
+    }
+}
+
+async fn probe_range(
+    client: &reqwest::Client,
+    source: &Url,
+    settings: &AppSettings,
+    secrets: &RuntimeSecrets,
+    access: CloudAccess,
+) -> Result<u64> {
+    let _permit = download_connections()
+        .acquire()
+        .await
+        .context("等待下载连接槽位失败")?;
+    let request = authorize_cloud_request(
+        client
+            .get(source.clone())
+            .header(reqwest::header::RANGE, "bytes=0-0"),
+        source,
+        settings,
+        secrets,
+        access,
+    );
+    let response = request.send().await.context("Range 探测请求失败")?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        bail!(
+            "服务器不支持 HTTP Range（探测返回 HTTP {}），无法分片下载",
+            response.status()
+        );
+    }
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .context("Range 探测响应缺少 Content-Range")?;
+    let (start, end, total) = parse_content_range(content_range)?;
+    if start != 0 || end != 0 {
+        bail!("Range 探测返回了意外区间：{content_range}");
+    }
+    if total == 0 {
+        bail!("服务器返回的文件大小为 0，无法分片下载");
+    }
+    let bytes = response.bytes().await.context("Range 探测响应读取失败")?;
+    if bytes.len() != 1 {
+        bail!("Range 探测响应应为 1 字节，实际为 {} 字节", bytes.len());
+    }
+    Ok(total)
+}
+
+async fn download_worker(state: Arc<SegmentedDownloadState>) -> Result<()> {
+    loop {
+        if state.cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let permit = download_connections()
+            .acquire()
+            .await
+            .context("等待下载连接槽位失败")?;
+        if state.cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let index = state.next_chunk.fetch_add(1, Ordering::Relaxed);
+        if index >= state.plan.total_chunks {
+            return Ok(());
+        }
+        let result = download_chunk(&state, index).await;
+        drop(permit);
+        if let Err(error) = result {
+            state.cancelled.store(true, Ordering::Relaxed);
+            return Err(error).with_context(|| format!("分片 {} 下载失败", index + 1));
+        }
+    }
+}
+
+async fn download_chunk(state: &SegmentedDownloadState, index: usize) -> Result<()> {
+    let start = (index as u64)
+        .checked_mul(state.plan.chunk_size)
+        .context("分片起点溢出")?;
+    let end_exclusive = ((index as u64) + 1)
+        .checked_mul(state.plan.chunk_size)
+        .context("分片终点溢出")?
+        .min(state.total);
+    let end = end_exclusive.checked_sub(1).context("分片终点无效")?;
+    let expected = end_exclusive - start;
+    let request = authorize_cloud_request(
+        state
+            .client
+            .get(state.source.clone())
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}")),
+        &state.source,
+        &state.settings,
+        &state.secrets,
+        state.access,
+    );
+    let response = request.send().await.context("分片请求失败")?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        bail!(
+            "分片请求返回 HTTP {}，服务器可能忽略了 Range",
+            response.status()
+        );
+    }
+    let content_range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .context("分片响应缺少 Content-Range")?;
+    let (actual_start, actual_end, actual_total) = parse_content_range(content_range)?;
+    if actual_start != start || actual_end != end || actual_total != state.total {
+        bail!(
+            "分片响应区间不匹配：请求 {start}-{end}/{}, 返回 {actual_start}-{actual_end}/{actual_total}",
+            state.total
+        );
+    }
+    if let Some(content_length) = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if content_length != expected {
+            bail!("分片 Content-Length 不匹配：期望 {expected}，实际 {content_length}");
+        }
+    }
+
+    let part_path = state.directory.join(format!("{index:08}.part"));
+    let mut file = tokio::fs::File::create(&part_path)
+        .await
+        .with_context(|| format!("无法创建分片文件 {}", part_path.display()))?;
+    let mut stream = response.bytes_stream();
+    let mut received = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("分片数据流中断")?;
+        file.write_all(&chunk).await?;
+        received += chunk.len() as u64;
+        state
+            .downloaded
+            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        state.report_downloading(false);
+    }
+    file.flush().await?;
+    if received != expected {
+        bail!("分片字节数不匹配：期望 {expected}，实际 {received}");
+    }
+    state.report_downloading(true);
+    Ok(())
+}
+
+async fn merge_parts(state: &SegmentedDownloadState, payload: &Path) -> Result<String> {
+    let mut output = tokio::fs::File::create(payload)
+        .await
+        .with_context(|| format!("无法创建合并文件 {}", payload.display()))?;
+    let mut hasher = Sha256::new();
+    let mut merged = 0_u64;
+    let mut buffer = vec![0_u8; 256 * 1024];
+    for index in 0..state.plan.total_chunks {
+        let part_path = state.directory.join(format!("{index:08}.part"));
+        let mut part = tokio::fs::File::open(&part_path)
+            .await
+            .with_context(|| format!("无法打开分片文件 {}", part_path.display()))?;
+        loop {
+            let read = part
+                .read(&mut buffer)
+                .await
+                .with_context(|| format!("无法读取分片文件 {}", part_path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            output.write_all(&buffer[..read]).await?;
+            merged += read as u64;
+        }
+        let _ = tokio::fs::remove_file(&part_path).await;
+    }
+    output.flush().await?;
+    if merged != state.total {
+        bail!("合并后文件大小不匹配：期望 {}，实际 {merged}", state.total);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
+
+fn normalize_mod_type(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn declared_ue4ss(mod_type: &str) -> bool {
+    matches!(
+        normalize_mod_type(mod_type).as_str(),
+        "ue4ss" | "ue4ssmod" | "luamod"
+    )
+}
+
+async fn read_payload_head(payload: &Path) -> Result<Vec<u8>> {
+    let mut file = tokio::fs::File::open(payload)
+        .await
+        .with_context(|| format!("无法读取下载文件 {}", payload.display()))?;
+    let mut buffer = vec![0_u8; ZIP_MAGIC.len()];
+    let read = file.read(&mut buffer).await?;
+    buffer.truncate(read);
+    Ok(buffer)
+}
+
+async fn install_downloaded(paths: &AppPaths, payload: &Path, remote: &RemoteMod) -> Result<()> {
+    let head = read_payload_head(payload).await?;
+    if head.starts_with(&ZIP_MAGIC) {
+        // 内容优先于云端声明：ZIP 一律走与本地拖入完全相同的安装路径，
+        // 由它决定剥离 wrapper 后是 PAK 还是 UE4SS 模组。
+        let paths = paths.clone();
+        let payload = payload.to_path_buf();
+        let preferred = remote.name.clone();
+        let (imported, skipped) = tokio::task::spawn_blocking(move || {
+            install_ue4ss_zip(&paths, &payload, Some(&preferred), true)
+        })
+        .await
+        .context("解压任务异常")??;
+        if imported == 0 {
+            bail!("压缩包内没有可安装的内容（跳过 {skipped} 项）");
+        }
+        return Ok(());
+    }
+    if declared_ue4ss(&remote.mod_type) {
+        bail!("云端把该模组标记为 UE4SS 模组，但下载到的文件不是 ZIP，已拒绝安装");
+    }
+
+    tokio::fs::create_dir_all(&paths.local_mods).await?;
+    let destination = paths.local_mods.join(remote_filename(remote));
+    if tokio::fs::try_exists(&destination).await.unwrap_or(false) {
+        // 覆盖前留一份可回收的备份，避免用户改过的同名 PAK 被静默冲掉。
+        tokio::fs::create_dir_all(&paths.backups_dir).await?;
+        let file_name = destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "mod.pak".to_string());
+        let backup = paths.backups_dir.join(format!("{file_name}.bak"));
+        let _ = tokio::fs::remove_file(&backup).await;
+        tokio::fs::rename(&destination, &backup)
+            .await
+            .with_context(|| format!("无法备份已存在的模组文件 {}", destination.display()))?;
+    }
+    tokio::fs::rename(payload, &destination)
+        .await
+        .with_context(|| format!("无法写入模组文件 {}", destination.display()))?;
+    Ok(())
+}
+
+fn parse_content_range(value: &str) -> Result<(u64, u64, u64)> {
+    let rest = value
+        .trim()
+        .strip_prefix("bytes ")
+        .context("Content-Range 格式无效")?;
+    let (range, total) = rest.split_once('/').context("Content-Range 缺少总大小")?;
+    let (start, end) = range.split_once('-').context("Content-Range 缺少区间")?;
+    let start = start
+        .trim()
+        .parse::<u64>()
+        .context("Content-Range 起点无效")?;
+    let end = end
+        .trim()
+        .parse::<u64>()
+        .context("Content-Range 终点无效")?;
+    let total = total
+        .trim()
+        .parse::<u64>()
+        .context("Content-Range 总大小无效")?;
+    if start > end || end >= total {
+        bail!("Content-Range 区间无效：{value}");
+    }
+    Ok((start, end, total))
+}
+
+fn download_connections() -> &'static Semaphore {
+    DOWNLOAD_CONNECTIONS.get_or_init(|| Semaphore::new(MAX_CLOUD_CONNECTIONS))
+}
+
+fn notify_download_progress(
+    callback: &CloudDownloadProgressCallback,
+    id: &str,
+    phase: &str,
+    downloaded: u64,
+    total: Option<u64>,
+    segments: usize,
+    message: Option<String>,
+) {
+    callback(CloudDownloadProgress {
+        id: id.to_string(),
+        phase: phase.to_string(),
+        downloaded,
+        total,
+        segments,
+        message,
+    });
+}
+
+fn download_endpoint_label(value: &str) -> String {
+    Url::parse(value)
+        .map(|mut url| {
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|_| value.split(['?', '#']).next().unwrap_or(value).to_string())
 }
 
 fn cloud_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
@@ -297,7 +820,7 @@ fn parse_catalog(paths: &AppPaths, base: &str, value: Value) -> Result<Vec<Remot
         let name = text(object.get("name")).unwrap_or_else(|| "未命名模组".to_string());
         let id = text(object.get("id"))
             .or_else(|| text(object.get("slug")))
-            .unwrap_or_else(|| safe_file_component(&name));
+            .unwrap_or_else(|| safe_disk_name(&name, "mod"));
         let mut download_url = text(object.get("download_url"))
             .or_else(|| text(object.get("downloadUrl")))
             .unwrap_or_default();
@@ -396,23 +919,23 @@ fn remote_filename(remote: &RemoteMod) -> String {
             }
         }
     }
-    let extension = if remote.mod_type == "ue4ssMod" {
+    let extension = if declared_ue4ss(&remote.mod_type) {
         "zip"
     } else {
         "pak"
     };
-    format!("{}.{}", safe_file_component(&remote.name), extension)
+    format!("{}.{}", safe_disk_name(&remote.name, "mod"), extension)
 }
 
 fn safe_download_filename(value: &str) -> Option<String> {
     let file_name = Path::new(value).file_name()?.to_string_lossy();
     let path = Path::new(file_name.as_ref());
     let stem = path.file_stem()?.to_string_lossy();
-    let safe_stem = safe_file_component(&stem);
+    let safe_stem = safe_disk_name(&stem, "mod");
     match path.extension() {
         Some(extension) if !extension.is_empty() => Some(format!(
             "{safe_stem}.{}",
-            safe_file_component(&extension.to_string_lossy()).to_ascii_lowercase()
+            safe_disk_name(&extension.to_string_lossy(), "bin").to_ascii_lowercase()
         )),
         _ => Some(safe_stem),
     }
@@ -447,12 +970,13 @@ fn timestamp(value: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_cloud_transport, download_remote, download_source_allowed, fetch_catalog,
-        ordered_urls, parse_catalog, remote_filename, should_attach_credentials, AppSettings,
-        CloudAccess, RuntimeSecrets,
+        allowed_cloud_transport, declared_ue4ss, download_remote, download_source_allowed,
+        fetch_catalog, install_downloaded, ordered_urls, parse_catalog, remote_filename,
+        segment_plan, should_attach_credentials, AppSettings, CloudAccess,
+        CloudDownloadProgressCallback, RuntimeSecrets,
     };
     use crate::edition::Edition;
-    use crate::models::RemoteMod;
+    use crate::models::{CloudDownloadProgress, RemoteMod};
     use crate::secrets::load_runtime_secrets;
     use crate::test_support::TempRoot;
     use serde_json::json;
@@ -461,10 +985,13 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::thread;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct CapturedRequest {
         path: String,
         headers: HashMap<String, String>,
@@ -472,12 +999,19 @@ mod tests {
 
     struct MockServer {
         base_url: String,
-        handle: Option<thread::JoinHandle<Vec<CapturedRequest>>>,
+        stop: Arc<AtomicBool>,
+        captured: Arc<Mutex<Vec<CapturedRequest>>>,
+        handle: Option<JoinHandle<()>>,
     }
 
     impl MockServer {
         fn new(expected_sha256: String, download_status: u16) -> Self {
+            Self::with_range(expected_sha256, download_status, true)
+        }
+
+        fn with_range(expected_sha256: String, download_status: u16, supports_range: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
             let base_url = format!("http://{address}");
             let catalog = serde_json::to_vec(&json!({
@@ -489,77 +1023,209 @@ mod tests {
                 }]
             }))
             .unwrap();
-            let file_body = b"mock-pak-content".to_vec();
+            let file_body = mock_file_body();
+            let stop = Arc::new(AtomicBool::new(false));
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let thread_stop = stop.clone();
+            let thread_captured = captured.clone();
             let handle = thread::spawn(move || {
-                let mut captured = Vec::new();
-                for _ in 0..2 {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    let mut request = Vec::new();
-                    let mut buffer = [0_u8; 4096];
-                    loop {
-                        match stream.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(read) => {
-                                request.extend_from_slice(&buffer[..read]);
-                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+                while !thread_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve_connection(
+                            stream,
+                            &catalog,
+                            &file_body,
+                            download_status,
+                            supports_range,
+                            &thread_captured,
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
                         }
+                        Err(_) => break,
                     }
-                    let request_text = String::from_utf8_lossy(&request);
-                    let mut lines = request_text.lines();
-                    let path = lines
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or_default()
-                        .to_string();
-                    let headers = lines
-                        .take_while(|line| !line.trim().is_empty())
-                        .filter_map(|line| line.split_once(':'))
-                        .map(|(name, value)| {
-                            (name.trim().to_ascii_lowercase(), value.trim().to_string())
-                        })
-                        .collect::<HashMap<_, _>>();
-                    captured.push(CapturedRequest {
-                        path: path.clone(),
-                        headers,
-                    });
-
-                    let (status, content_type, body) = if path == "/mods" {
-                        (200_u16, "application/json", catalog.as_slice())
-                    } else if download_status == 200 {
-                        (200_u16, "application/octet-stream", file_body.as_slice())
-                    } else {
-                        (download_status, "text/plain", b"forbidden".as_slice())
-                    };
-                    let header = format!(
-                        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        if status == 200 { "OK" } else { "Forbidden" },
-                        body.len()
-                    );
-                    stream.write_all(header.as_bytes()).unwrap();
-                    stream.write_all(body).unwrap();
                 }
-                captured
             });
             Self {
                 base_url,
+                stop,
+                captured,
                 handle: Some(handle),
             }
         }
 
         fn finish(mut self) -> Vec<CapturedRequest> {
-            self.handle.take().unwrap().join().unwrap()
+            self.stop.store(true, Ordering::Relaxed);
+            self.handle.take().unwrap().join().unwrap();
+            self.captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
     fn file_sha256() -> String {
-        hex::encode(Sha256::digest(b"mock-pak-content"))
+        hex::encode(Sha256::digest(mock_file_body()))
+    }
+
+    fn mock_file_body() -> Vec<u8> {
+        (0..64 * 1024)
+            .map(|index| ((index * 31 + 17) % 251) as u8)
+            .collect()
+    }
+
+    fn serve_connection(
+        mut stream: std::net::TcpStream,
+        catalog: &[u8],
+        file_body: &[u8],
+        download_status: u16,
+        supports_range: bool,
+        captured: &Mutex<Vec<CapturedRequest>>,
+    ) {
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let request_text = String::from_utf8_lossy(&request);
+        let mut lines = request_text.lines();
+        let path = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        let headers = lines
+            .take_while(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect::<HashMap<_, _>>();
+        captured
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(CapturedRequest {
+                path: path.clone(),
+                headers: headers.clone(),
+            });
+
+        if path == "/mods" {
+            write_response(&mut stream, 200, "application/json", catalog, &[]);
+            return;
+        }
+        if download_status != 200 {
+            write_response(
+                &mut stream,
+                download_status,
+                "text/plain",
+                b"forbidden",
+                &[],
+            );
+            return;
+        }
+        if !supports_range {
+            write_response(&mut stream, 200, "application/octet-stream", file_body, &[]);
+            return;
+        }
+        let Some((start, end)) = headers
+            .get("range")
+            .and_then(|value| value.strip_prefix("bytes="))
+            .and_then(|value| value.split_once('-'))
+            .and_then(|(start, end)| {
+                Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+            })
+        else {
+            write_response(
+                &mut stream,
+                416,
+                "text/plain",
+                b"range required",
+                &[("Content-Range", format!("bytes */{}", file_body.len()))],
+            );
+            return;
+        };
+        if start >= file_body.len() || start > end {
+            write_response(
+                &mut stream,
+                416,
+                "text/plain",
+                b"range invalid",
+                &[("Content-Range", format!("bytes */{}", file_body.len()))],
+            );
+            return;
+        }
+        let end = end.min(file_body.len() - 1);
+        let body = &file_body[start..=end];
+        write_response(
+            &mut stream,
+            206,
+            "application/octet-stream",
+            body,
+            &[(
+                "Content-Range",
+                format!("bytes {start}-{end}/{}", file_body.len()),
+            )],
+        );
+    }
+
+    fn write_response(
+        stream: &mut std::net::TcpStream,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+        extra_headers: &[(&str, String)],
+    ) {
+        let reason = match status {
+            200 => "OK",
+            206 => "Partial Content",
+            403 => "Forbidden",
+            416 => "Range Not Satisfiable",
+            _ => "Error",
+        };
+        let extras = extra_headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        let header = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extras}Connection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+    }
+
+    fn no_progress() -> CloudDownloadProgressCallback {
+        Arc::new(|_| {})
+    }
+
+    fn collect_progress() -> (
+        CloudDownloadProgressCallback,
+        Arc<Mutex<Vec<CloudDownloadProgress>>>,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let callback: CloudDownloadProgressCallback = Arc::new(move |progress| {
+            output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(progress);
+        });
+        (callback, events)
+    }
+
+    fn expected_segmented_requests(max_segments: usize) -> usize {
+        2 + segment_plan(mock_file_body().len() as u64, max_segments).total_chunks
     }
 
     #[test]
@@ -614,6 +1280,7 @@ mod tests {
                     "https://primary.example/".to_string(),
                 ],
                 active_base_url: "https://primary.example".to_string(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -642,7 +1309,7 @@ mod tests {
             installed: false,
         };
 
-        assert_eq!(remote_filename(&remote), "Unsafe_Demo.pak");
+        assert_eq!(remote_filename(&remote), "Unsafe Demo.pak");
     }
 
     #[test]
@@ -650,10 +1317,12 @@ mod tests {
         let temp = TempRoot::new("cloud-download-success");
         let paths = temp.paths();
         let server = MockServer::new(file_sha256(), 200);
+        let (progress, events) = collect_progress();
         let mut settings = AppSettings {
             cloud: crate::models::CloudSettings {
                 base_urls: vec![server.base_url.clone()],
                 active_base_url: String::new(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -669,16 +1338,60 @@ mod tests {
                 &RuntimeSecrets::default(),
                 CloudAccess::Server,
                 "demo",
+                progress,
             ))
             .unwrap();
 
         assert!(result.contains("SHA-256 校验"));
         assert_eq!(
             fs::read(paths.local_mods.join("Demo.pak")).unwrap(),
-            b"mock-pak-content"
+            mock_file_body()
         );
         assert_eq!(settings.cloud.active_base_url, server.base_url);
-        assert_eq!(server.finish().len(), 2);
+        let requests = server.finish();
+        let plan = segment_plan(mock_file_body().len() as u64, 16);
+        assert_eq!(requests.len(), 2 + plan.total_chunks);
+        assert_eq!(requests[0].path, "/mods");
+        assert_eq!(requests[1].path, "/mods/demo/download");
+        assert_eq!(
+            requests[1].headers.get("range").map(String::as_str),
+            Some("bytes=0-0")
+        );
+        assert_eq!(
+            requests[2..]
+                .iter()
+                .filter(|request| request.headers.contains_key("range"))
+                .count(),
+            plan.total_chunks
+        );
+        assert_eq!(
+            fs::read_dir(paths.root.join("downloads")).unwrap().count(),
+            0
+        );
+
+        let events = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for phase in [
+            "preparing",
+            "downloading",
+            "verifying",
+            "installing",
+            "completed",
+        ] {
+            assert!(
+                events.iter().any(|event| event.phase == phase),
+                "missing {phase} progress event"
+            );
+        }
+        assert!(events
+            .iter()
+            .any(|event| { event.phase == "downloading" && event.segments == plan.workers }));
+        assert_eq!(
+            events.last().map(|event| event.phase.as_str()),
+            Some("completed")
+        );
     }
 
     #[test]
@@ -690,6 +1403,7 @@ mod tests {
             cloud: crate::models::CloudSettings {
                 base_urls: vec![server.base_url.clone()],
                 active_base_url: String::new(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -705,12 +1419,13 @@ mod tests {
                 &RuntimeSecrets::default(),
                 CloudAccess::Server,
                 "demo",
+                no_progress(),
             ))
             .unwrap();
 
         assert!(result.contains("未执行完整性校验"));
         assert!(!result.contains("通过 SHA-256 校验"));
-        assert_eq!(server.finish().len(), 2);
+        assert_eq!(server.finish().len(), expected_segmented_requests(16));
     }
 
     #[test]
@@ -722,6 +1437,7 @@ mod tests {
             cloud: crate::models::CloudSettings {
                 base_urls: vec![server.base_url.clone()],
                 active_base_url: String::new(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -737,6 +1453,7 @@ mod tests {
                 &RuntimeSecrets::default(),
                 CloudAccess::Server,
                 "demo",
+                no_progress(),
             ))
             .unwrap_err();
 
@@ -745,7 +1462,11 @@ mod tests {
             "unexpected download error: {error:#}"
         );
         assert!(!paths.local_mods.join("Demo.pak").exists());
-        assert_eq!(server.finish().len(), 2);
+        assert_eq!(server.finish().len(), expected_segmented_requests(16));
+        assert_eq!(
+            fs::read_dir(paths.root.join("downloads")).unwrap().count(),
+            0
+        );
     }
 
     #[test]
@@ -757,6 +1478,7 @@ mod tests {
             cloud: crate::models::CloudSettings {
                 base_urls: vec![server.base_url.clone()],
                 active_base_url: String::new(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -776,11 +1498,12 @@ mod tests {
                 &secrets,
                 CloudAccess::Server,
                 "demo",
+                no_progress(),
             ))
             .unwrap();
 
         let requests = server.finish();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), expected_segmented_requests(16));
         assert_eq!(requests[0].path, "/mods");
         assert!(requests[1].path.ends_with("/mods/demo/download"));
         for request in requests {
@@ -804,6 +1527,7 @@ mod tests {
             cloud: crate::models::CloudSettings {
                 base_urls: vec![server.base_url.clone()],
                 active_base_url: String::new(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -823,6 +1547,7 @@ mod tests {
                 &secrets,
                 CloudAccess::Public,
                 "demo",
+                no_progress(),
             ))
             .unwrap();
 
@@ -838,6 +1563,7 @@ mod tests {
             cloud: crate::models::CloudSettings {
                 base_urls: vec!["https://mods.example.test".to_string()],
                 active_base_url: String::new(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -889,11 +1615,42 @@ mod tests {
     }
 
     #[test]
+    fn segment_plan_uses_at_least_eight_workers_and_two_chunks_per_worker() {
+        let plan = segment_plan(128 * 1024 * 1024, 16);
+
+        assert_eq!(plan.workers, 16);
+        assert!(plan.total_chunks >= 32);
+        assert_eq!(plan.chunk_size, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn segment_plan_honors_the_manual_ceiling_up_to_128() {
+        let raised = segment_plan(128 * 1024 * 1024, 128);
+        assert_eq!(raised.workers, 32);
+        assert!(raised.total_chunks >= 64);
+        assert_eq!(raised.chunk_size, 2 * 1024 * 1024);
+
+        let clamped = segment_plan(1024 * 1024 * 1024, 999);
+        assert_eq!(clamped.workers, 128);
+        assert!(clamped.total_chunks >= 256);
+    }
+
+    #[test]
+    fn segment_plan_never_exceeds_the_available_bytes() {
+        let plan = segment_plan(4, 256);
+
+        assert_eq!(plan.workers, 4);
+        assert_eq!(plan.total_chunks, 4);
+        assert_eq!(plan.chunk_size, 1);
+    }
+
+    #[test]
     fn requires_sha256_for_cross_origin_downloads() {
         let settings = AppSettings {
             cloud: crate::models::CloudSettings {
                 base_urls: vec!["https://mods.example.test".to_string()],
                 active_base_url: String::new(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -914,6 +1671,7 @@ mod tests {
             cloud: crate::models::CloudSettings {
                 base_urls: vec![server.base_url.clone()],
                 active_base_url: String::new(),
+                max_download_segments: 16,
             },
             ..AppSettings::default()
         };
@@ -932,6 +1690,7 @@ mod tests {
                 },
                 CloudAccess::Server,
                 "demo",
+                no_progress(),
             ))
             .unwrap_err()
             .to_string();
@@ -940,6 +1699,48 @@ mod tests {
         assert!(!error.contains("SHA-256"), "unexpected error: {error}");
         assert!(!paths.local_mods.join("Demo.pak").exists());
         assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn rejects_a_server_that_ignores_range_instead_of_falling_back() {
+        let temp = TempRoot::new("cloud-download-no-range");
+        let paths = temp.paths();
+        let server = MockServer::with_range(file_sha256(), 200, false);
+        let mut settings = AppSettings {
+            cloud: crate::models::CloudSettings {
+                base_urls: vec![server.base_url.clone()],
+                active_base_url: String::new(),
+                max_download_segments: 16,
+            },
+            ..AppSettings::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let error = runtime
+            .block_on(download_remote(
+                &paths,
+                &mut settings,
+                &RuntimeSecrets::default(),
+                CloudAccess::Server,
+                "demo",
+                no_progress(),
+            ))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("HTTP Range") && error.contains("HTTP 200"),
+            "unexpected error: {error}"
+        );
+        assert!(!paths.local_mods.join("Demo.pak").exists());
+        assert_eq!(server.finish().len(), 2);
+        assert_eq!(
+            fs::read_dir(paths.root.join("downloads")).unwrap().count(),
+            0
+        );
     }
 
     #[test]
@@ -970,5 +1771,137 @@ mod tests {
 
         assert!(!mods.is_empty(), "live catalog returned no mods");
         assert!(mods.iter().any(|item| item.file_size > 0));
+    }
+
+    fn write_payload_zip(archive: &Path, entries: &[(&str, &[u8])]) {
+        let file = std::fs::File::create(archive).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(body).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn demo_remote(name: &str, mod_type: &str) -> RemoteMod {
+        RemoteMod {
+            id: "demo".to_string(),
+            name: name.to_string(),
+            author: String::new(),
+            version: String::new(),
+            description: String::new(),
+            file_size: 0,
+            download_url: "https://mods.example.test/files/Demo.pak".to_string(),
+            sha256: String::new(),
+            tags: Vec::new(),
+            updated_at: String::new(),
+            mod_type: mod_type.to_string(),
+            installed: false,
+        }
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn recognizes_ue4ss_declarations_case_insensitively() {
+        for declared in ["ue4ssMod", "UE4SS", "ue4ss_mod", "LuaMod"] {
+            assert!(
+                declared_ue4ss(declared),
+                "{declared} should be treated as UE4SS"
+            );
+        }
+        for declared in ["clientPak", "pak", "", "unknown"] {
+            assert!(
+                !declared_ue4ss(declared),
+                "{declared} should not be treated as UE4SS"
+            );
+        }
+    }
+
+    #[test]
+    fn installs_a_downloaded_zip_through_the_shared_ue4ss_path() {
+        let temp = TempRoot::new("cloud-install-ue4ss");
+        let paths = temp.paths();
+        let payload = temp.path().join("payload.part");
+        write_payload_zip(&payload, &[("武器增强/Scripts/main.lua", b"print('ok')")]);
+        let remote = demo_remote("武器增强", "ue4ssMod");
+
+        test_runtime()
+            .block_on(install_downloaded(&paths, &payload, &remote))
+            .unwrap();
+
+        assert_eq!(
+            fs::read(
+                paths
+                    .ue4ss_mods
+                    .join("武器增强")
+                    .join("Scripts")
+                    .join("main.lua")
+            )
+            .unwrap(),
+            b"print('ok')"
+        );
+        assert!(!paths.ue4ss_mods.join("武器增强").join("武器增强").exists());
+    }
+
+    #[test]
+    fn installs_a_downloaded_pak_pack_into_the_local_library() {
+        let temp = TempRoot::new("cloud-install-pak-zip");
+        let paths = temp.paths();
+        let payload = temp.path().join("payload.part");
+        write_payload_zip(&payload, &[("nested/Weapon.pak", b"pak-bytes")]);
+        let remote = demo_remote("武器增强", "clientPak");
+
+        test_runtime()
+            .block_on(install_downloaded(&paths, &payload, &remote))
+            .unwrap();
+
+        assert_eq!(
+            fs::read(paths.local_mods.join("Weapon.pak")).unwrap(),
+            b"pak-bytes"
+        );
+    }
+
+    #[test]
+    fn backs_up_an_existing_pak_before_replacing_it() {
+        let temp = TempRoot::new("cloud-install-pak-backup");
+        let paths = temp.paths();
+        let existing = paths.local_mods.join("Demo.pak");
+        fs::write(&existing, b"old").unwrap();
+        let payload = temp.path().join("payload.part");
+        fs::write(&payload, b"new").unwrap();
+        let remote = demo_remote("Demo", "clientPak");
+
+        test_runtime()
+            .block_on(install_downloaded(&paths, &payload, &remote))
+            .unwrap();
+
+        assert_eq!(fs::read(&existing).unwrap(), b"new");
+        assert_eq!(
+            fs::read(paths.backups_dir.join("Demo.pak.bak")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn rejects_a_ue4ss_declaration_whose_payload_is_not_a_zip() {
+        let temp = TempRoot::new("cloud-install-bad-ue4ss");
+        let paths = temp.paths();
+        let payload = temp.path().join("payload.part");
+        fs::write(&payload, b"not-a-zip").unwrap();
+        let remote = demo_remote("武器增强", "ue4ssMod");
+
+        let error = test_runtime()
+            .block_on(install_downloaded(&paths, &payload, &remote))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("不是 ZIP"));
     }
 }

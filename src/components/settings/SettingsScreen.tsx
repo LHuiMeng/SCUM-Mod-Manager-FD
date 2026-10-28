@@ -7,6 +7,7 @@ import type {
   AppUpdateProgress,
   ThemeMode,
 } from "../../types";
+import { clampCloudDownloadSegments } from "../../lib/cloudDownload";
 import { Button } from "../ui/Button";
 import { Toggle } from "../ui/Toggle";
 import { UpdateSettings } from "./UpdateSettings";
@@ -66,7 +67,20 @@ export function SettingsScreen({
           <Button icon="search" onClick={onDetectPaths}>
             自动检测路径
           </Button>
-          <Button variant="primary" onClick={() => onSave(draft)}>
+          <Button
+            variant="primary"
+            onClick={() =>
+              onSave({
+                ...draft,
+                cloud: {
+                  ...draft.cloud,
+                  maxDownloadSegments: clampCloudDownloadSegments(
+                    draft.cloud.maxDownloadSegments,
+                  ),
+                },
+              })
+            }
+          >
             保存设置
           </Button>
         </div>
@@ -237,26 +251,58 @@ export function SettingsScreen({
             <span>云源线路</span>
             <b>{edition === "server" ? "服务器版使用内置共享凭据" : "公开版仅访问公开目录"}</b>
           </div>
-          <label>
-            <span>候选地址</span>
-            <textarea
-              className="note-input settings-textarea"
-              rows={4}
-              value={draft.cloud.baseUrls.join("\n")}
-              placeholder="https://your-catalog.example"
-              onChange={(event) =>
-                update({
-                  cloud: {
-                    ...draft.cloud,
-                    baseUrls: event.target.value
-                      .split("\n")
-                      .map((line) => line.trim())
-                      .filter(Boolean),
-                  },
-                })
-              }
-            />
-          </label>
+          <div className="settings-cloud-fields">
+            <label>
+              <span>候选地址</span>
+              <textarea
+                className="note-input settings-textarea"
+                rows={4}
+                value={draft.cloud.baseUrls.join("\n")}
+                placeholder="https://your-catalog.example"
+                onChange={(event) =>
+                  update({
+                    cloud: {
+                      ...draft.cloud,
+                      baseUrls: event.target.value
+                        .split("\n")
+                        .map((line) => line.trim())
+                        .filter(Boolean),
+                    },
+                  })
+                }
+              />
+            </label>
+            <label className="settings-segment-field">
+              <span>并行分片上限</span>
+              <input
+                type="number"
+                min={8}
+                max={128}
+                step={1}
+                value={draft.cloud.maxDownloadSegments}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  update({
+                    cloud: {
+                      ...draft.cloud,
+                      maxDownloadSegments: Number.isFinite(value) ? value : 8,
+                    },
+                  });
+                }}
+                onBlur={() =>
+                  update({
+                    cloud: {
+                      ...draft.cloud,
+                      maxDownloadSegments: clampCloudDownloadSegments(
+                        draft.cloud.maxDownloadSegments,
+                      ),
+                    },
+                  })
+                }
+              />
+              <small>单文件默认 16 路；单个模组最多 128 路，多个模组共享全局 256 连接上限。</small>
+            </label>
+          </div>
           <div className="settings-note">
             {edition === "server"
               ? "共享密钥只由服务器安装包携带并交给 Rust 后端使用，前端不会读取密钥内容。"

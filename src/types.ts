@@ -39,6 +39,7 @@ export interface LaunchOptions {
 export interface CloudSettings {
   baseUrls: string[];
   activeBaseUrl: string;
+  maxDownloadSegments: number;
 }
 
 export interface SftpAccount {
@@ -99,6 +100,24 @@ export interface RemoteMod {
   updatedAt: string;
   type: ModType;
   installed: boolean;
+}
+
+export type CloudDownloadPhase =
+  | "queued"
+  | "preparing"
+  | "downloading"
+  | "verifying"
+  | "installing"
+  | "completed"
+  | "error";
+
+export interface CloudDownloadProgress {
+  id: string;
+  phase: CloudDownloadPhase;
+  downloaded: number;
+  total: number | null;
+  segments: number;
+  message?: string | null;
 }
 
 export interface RemoteFile {

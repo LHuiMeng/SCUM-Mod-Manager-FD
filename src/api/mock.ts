@@ -156,6 +156,7 @@ let settings: AppSettings = {
   cloud: {
     baseUrls: [],
     activeBaseUrl: "",
+    maxDownloadSegments: 16,
   },
   sftpAccounts: [],
   activeSftpAccountId: null,

@@ -153,6 +153,47 @@ pub fn safe_file_component(value: &str) -> String {
     }
 }
 
+const MAX_DISK_NAME_CHARS: usize = 80;
+const WINDOWS_RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// 生成可安全落盘的单个路径组件。
+///
+/// 与 `safe_file_component` 不同，这里保留 Unicode：中文模组名不再被压成下划线，
+/// 否则两个字数相同的中文模组会映射到同一个目录或文件名并互相覆盖。
+/// 只替换 Windows 非法字符与控制字符，去掉前导/尾随的点与空格以拒绝路径穿越，
+/// 并对设备保留名加前缀。
+pub fn safe_disk_name(value: &str, fallback: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ if ch.is_control() => '_',
+            _ => ch,
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(|ch: char| ch == '.' || ch == ' ');
+    let mut truncated: String = trimmed.chars().take(MAX_DISK_NAME_CHARS).collect();
+    while truncated.ends_with('.') || truncated.ends_with(' ') {
+        truncated.pop();
+    }
+    if truncated.is_empty() {
+        return fallback.to_string();
+    }
+    let stem = truncated
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+    if WINDOWS_RESERVED_NAMES.contains(&stem.as_str()) {
+        return format!("_{truncated}");
+    }
+    truncated
+}
+
 pub fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -174,7 +215,7 @@ fn normalize_for_compare(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_within, resolve_data_root, safe_file_component};
+    use super::{is_within, resolve_data_root, safe_disk_name, safe_file_component};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -222,5 +263,32 @@ mod tests {
             Path::new(r"W:\SCUM\..\Outside\mod.pak"),
             Path::new(r"W:\SCUM")
         ));
+    }
+
+    #[test]
+    fn disk_name_keeps_chinese_and_rejects_separators() {
+        assert_eq!(safe_disk_name("武器增强", "mod"), "武器增强");
+        assert_eq!(safe_disk_name("高清材质包", "mod"), "高清材质包");
+        assert_ne!(
+            safe_disk_name("武器增强", "mod"),
+            safe_disk_name("高清材质包", "mod")
+        );
+        assert_eq!(safe_disk_name("../evil", "mod"), "_evil");
+        assert_eq!(
+            safe_disk_name("a/b\\c:d*e?f\"g<h>i|j", "mod"),
+            "a_b_c_d_e_f_g_h_i_j"
+        );
+        assert_eq!(safe_disk_name("  ..  ", "mod"), "mod");
+        assert_eq!(safe_disk_name("CON", "mod"), "_CON");
+        assert_eq!(safe_disk_name("nul.pak", "mod"), "_nul.pak");
+        assert_eq!(safe_disk_name("SCUM_WeaponPack", "mod"), "SCUM_WeaponPack");
+    }
+
+    #[test]
+    fn disk_name_truncates_long_unicode_names() {
+        let long = "超长模组名称".repeat(30);
+        let name = safe_disk_name(&long, "mod");
+        assert_eq!(name.chars().count(), 80);
+        assert!(name.starts_with("超长模组名称"));
     }
 }

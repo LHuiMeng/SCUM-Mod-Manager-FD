@@ -1,5 +1,11 @@
 import { useMemo, useState } from "react";
-import type { AppEdition, RemoteMod } from "../../types";
+import type { AppEdition, CloudDownloadProgress, RemoteMod } from "../../types";
+import {
+  cloudDownloadDetail,
+  cloudDownloadIsActive,
+  cloudDownloadPercent,
+  cloudDownloadPhaseLabel,
+} from "../../lib/cloudDownload";
 import { formatBytes, formatDate, modTypeLabel } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
@@ -10,10 +16,11 @@ import { Tag } from "../ui/Tag";
 interface CloudScreenProps {
   mods: RemoteMod[];
   loading: boolean;
-  downloadingId: string | null;
+  downloads: Record<string, CloudDownloadProgress>;
   error: string | null;
   configured: boolean;
   edition: AppEdition;
+  maxSegments: number;
   onRefresh: () => void;
   onDownload: (id: string) => void;
   onOpenSettings: () => void;
@@ -22,10 +29,11 @@ interface CloudScreenProps {
 export function CloudScreen({
   mods,
   loading,
-  downloadingId,
+  downloads,
   error,
   configured,
   edition,
+  maxSegments,
   onRefresh,
   onDownload,
   onOpenSettings,
@@ -52,7 +60,7 @@ export function CloudScreen({
           <Button
             icon="refresh"
             onClick={onRefresh}
-            disabled={loading || downloadingId !== null}
+            disabled={loading}
           >
             {loading ? "正在获取" : "刷新目录"}
           </Button>
@@ -102,45 +110,104 @@ export function CloudScreen({
         />
       ) : (
         <div className="remote-grid">
-          {filtered.map((mod) => (
-            <article className="remote-card" key={mod.id}>
-              <header>
-                <span className="remote-mark">{mod.name.slice(0, 2).toUpperCase()}</span>
-                <div>
-                  <b>{mod.name}</b>
-                  <span>
-                    {mod.author} · v{mod.version}
+          {filtered.map((mod) => {
+            const progress = downloads[mod.id];
+            const active = progress ? cloudDownloadIsActive(progress) : false;
+            const percent = progress ? cloudDownloadPercent(progress) : 0;
+            const detail = progress ? cloudDownloadDetail(progress) : "";
+            const activeLabel = progress ? cloudDownloadPhaseLabel(progress.phase) : "";
+            return (
+              <article className="remote-card" key={mod.id}>
+                <header>
+                  <span className="remote-mark">{mod.name.slice(0, 2).toUpperCase()}</span>
+                  <div className="remote-identity">
+                    <div
+                      className="remote-scroll-field remote-name-scroll"
+                      tabIndex={0}
+                      title={mod.name}
+                    >
+                      <b>{mod.name}</b>
+                    </div>
+                    <div
+                      className="remote-scroll-field remote-author-scroll"
+                      tabIndex={0}
+                      title={`${mod.author} · v${mod.version}`}
+                    >
+                      <span>
+                        {mod.author} · v{mod.version}
+                      </span>
+                    </div>
+                  </div>
+                  <span className={`remote-state ${mod.installed ? "is-installed" : ""}`}>
+                    {mod.installed ? "已安装" : modTypeLabel(mod.type)}
                   </span>
+                </header>
+
+                <div className="remote-description" tabIndex={0}>
+                  <p>{mod.description || "暂无模组描述"}</p>
                 </div>
-                <span className={`remote-state ${mod.installed ? "is-installed" : ""}`}>
-                  {mod.installed ? "已安装" : modTypeLabel(mod.type)}
-                </span>
-              </header>
-              <p>{mod.description}</p>
-              <div className="tag-row">
-                {mod.tags.map((tag) => (
-                  <Tag key={tag}>{tag}</Tag>
-                ))}
-              </div>
-              <footer>
-                <span>
-                  {formatBytes(mod.fileSize)} · 更新于 {formatDate(mod.updatedAt)}
-                </span>
-                <Button
-                  size="sm"
-                  icon="download"
-                  onClick={() => onDownload(mod.id)}
-                  disabled={!configured || loading || downloadingId !== null}
-                >
-                  {downloadingId === mod.id
-                    ? "正在下载"
-                    : mod.installed
-                      ? "重新下载"
-                      : "下载"}
-                </Button>
-              </footer>
-            </article>
-          ))}
+
+                <div className="remote-tag-scroll" tabIndex={0}>
+                  {mod.tags.length > 0 ? (
+                    <div className="tag-row">
+                      {mod.tags.map((tag) => (
+                        <Tag key={tag}>{tag}</Tag>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="remote-empty-label">暂无标签</span>
+                  )}
+                </div>
+
+                <div className="remote-download-slot">
+                  {progress ? (
+                    <div className={`remote-download-progress is-${progress.phase}`}>
+                      <div className="remote-download-top">
+                        <span>{cloudDownloadPhaseLabel(progress.phase)}</span>
+                        <b>{percent}%</b>
+                      </div>
+                      <div
+                        className="remote-progress-track"
+                        role="progressbar"
+                        aria-label={`${mod.name} 下载进度`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={percent}
+                      >
+                        <i style={{ width: `${percent}%` }} />
+                      </div>
+                      <div className="remote-download-detail" title={detail}>
+                        {detail}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="remote-download-idle">
+                      <Icon name="download" size={13} />
+                      <span>Range 分片下载 · 当前上限 {maxSegments} 路</span>
+                    </div>
+                  )}
+                </div>
+
+                <footer>
+                  <span>
+                    {formatBytes(mod.fileSize)} · 更新于 {formatDate(mod.updatedAt)}
+                  </span>
+                  <Button
+                    size="sm"
+                    icon="download"
+                    onClick={() => onDownload(mod.id)}
+                    disabled={!configured || active}
+                  >
+                    {active
+                      ? `${activeLabel} ${percent}%`
+                      : mod.installed
+                        ? "重新下载"
+                        : "下载"}
+                  </Button>
+                </footer>
+              </article>
+            );
+          })}
         </div>
       )}
 
