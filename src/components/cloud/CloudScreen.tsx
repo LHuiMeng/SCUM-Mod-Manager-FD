@@ -6,7 +6,7 @@ import {
   cloudDownloadPercent,
   cloudDownloadPhaseLabel,
 } from "../../lib/cloudDownload";
-import { formatBytes, formatDate, modTypeLabel } from "../../lib/format";
+import { formatBytes, formatDate, modMonogram, modTypeLabel } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
 import { Icon } from "../ui/Icon";
@@ -51,9 +51,7 @@ export function CloudScreen({
       <header className="page-header">
         <div>
           <h1>云端目录</h1>
-          <p>
-            从已配置的云源获取模组。云目录提供 SHA-256 时会强制校验；缺少校验值时会明确提示未校验。
-          </p>
+          <p>从云源安装模组，下载完成后自动进入本地库。</p>
         </div>
         <div className="heading-tools">
           <SearchField value={search} onChange={setSearch} placeholder="搜索云端模组" />
@@ -78,8 +76,8 @@ export function CloudScreen({
           <b>{edition === "server" ? "服务器版目录" : "公开版目录"}</b>
           <span>
             {edition === "server"
-              ? "安装包内置共享凭据，可读取公开模组与仅限服务器玩家的模组。"
-              : "此安装包不包含私人凭据，只能读取公开模组。"}
+              ? "内置共享凭据，可读取公开模组与服务器版模组。"
+              : "此安装包不含私人凭据，只能读取公开模组。"}
           </span>
         </div>
       </section>
@@ -116,77 +114,70 @@ export function CloudScreen({
             const percent = progress ? cloudDownloadPercent(progress) : 0;
             const detail = progress ? cloudDownloadDetail(progress) : "";
             const activeLabel = progress ? cloudDownloadPhaseLabel(progress.phase) : "";
+            const done = progress?.phase === "completed";
             return (
               <article className="remote-card" key={mod.id}>
                 <header>
-                  <span className="remote-mark">{mod.name.slice(0, 2).toUpperCase()}</span>
+                  <span className="remote-mark">{modMonogram(mod.name)}</span>
                   <div className="remote-identity">
-                    <div
-                      className="remote-scroll-field remote-name-scroll"
-                      tabIndex={0}
-                      title={mod.name}
-                    >
-                      <b>{mod.name}</b>
-                    </div>
-                    <div
-                      className="remote-scroll-field remote-author-scroll"
-                      tabIndex={0}
-                      title={`${mod.author} · v${mod.version}`}
-                    >
-                      <span>
-                        {mod.author} · v{mod.version}
-                      </span>
-                    </div>
+                    <b className="remote-name" title={mod.name}>
+                      {mod.name}
+                    </b>
+                    <span className="remote-byline" title={`${mod.author} · v${mod.version}`}>
+                      {mod.author} · v{mod.version}
+                    </span>
                   </div>
-                  <span className={`remote-state ${mod.installed ? "is-installed" : ""}`}>
-                    {mod.installed ? "已安装" : modTypeLabel(mod.type)}
-                  </span>
+                  <div className="remote-badges">
+                    <span className="remote-state">{modTypeLabel(mod.type)}</span>
+                    {mod.installed ? <span className="remote-installed">已安装</span> : null}
+                  </div>
                 </header>
 
-                <div className="remote-description" tabIndex={0}>
-                  <p>{mod.description || "暂无模组描述"}</p>
-                </div>
+                <p className="remote-description" title={mod.description || undefined}>
+                  {mod.description || "暂无模组描述"}
+                </p>
 
-                <div className="remote-tag-scroll" tabIndex={0}>
+                <div className="remote-tags">
                   {mod.tags.length > 0 ? (
-                    <div className="tag-row">
-                      {mod.tags.map((tag) => (
-                        <Tag key={tag}>{tag}</Tag>
-                      ))}
-                    </div>
+                    mod.tags.slice(0, 4).map((tag) => <Tag key={tag}>{tag}</Tag>)
                   ) : (
                     <span className="remote-empty-label">暂无标签</span>
                   )}
+                  {mod.tags.length > 4 ? (
+                    <span className="remote-empty-label">+{mod.tags.length - 4}</span>
+                  ) : null}
                 </div>
 
-                <div className="remote-download-slot">
-                  {progress ? (
-                    <div className={`remote-download-progress is-${progress.phase}`}>
-                      <div className="remote-download-top">
-                        <span>{cloudDownloadPhaseLabel(progress.phase)}</span>
-                        <b>{percent}%</b>
+                {progress ? (
+                  <div className={`remote-download-progress is-${progress.phase}`}>
+                    {done ? (
+                      <div className="remote-download-done">
+                        <Icon name="check" size={13} />
+                        <span>已安装到本地库</span>
                       </div>
-                      <div
-                        className="remote-progress-track"
-                        role="progressbar"
-                        aria-label={`${mod.name} 下载进度`}
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={percent}
-                      >
-                        <i style={{ width: `${percent}%` }} />
-                      </div>
-                      <div className="remote-download-detail" title={detail}>
-                        {detail}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="remote-download-idle">
-                      <Icon name="download" size={13} />
-                      <span>Range 分片下载 · 当前上限 {maxSegments} 路</span>
-                    </div>
-                  )}
-                </div>
+                    ) : (
+                      <>
+                        <div className="remote-download-top">
+                          <span>{cloudDownloadPhaseLabel(progress.phase)}</span>
+                          <b>{percent}%</b>
+                        </div>
+                        <div
+                          className="remote-progress-track"
+                          role="progressbar"
+                          aria-label={`${mod.name} 下载进度`}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={percent}
+                        >
+                          <i style={{ width: `${percent}%` }} />
+                        </div>
+                        <div className="remote-download-detail" title={detail}>
+                          {detail}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                ) : null}
 
                 <footer>
                   <span>
@@ -214,7 +205,7 @@ export function CloudScreen({
       <div className="page-footnote">
         <Icon name="lock" size={13} />
         <span>
-          云端请求与下载均由 Rust 后端完成，共享凭据只发送到已配置云源的同源请求。
+          下载与校验都由 Rust 后端完成，单模组最多 {maxSegments} 路分片。
         </span>
       </div>
     </section>

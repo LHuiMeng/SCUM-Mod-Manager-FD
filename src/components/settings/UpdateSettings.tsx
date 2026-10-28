@@ -79,8 +79,7 @@ export function UpdateSettings({
       ) : null}
 
       <p className="settings-note update-note">
-        更新清单通过 HTTPS 获取。Rust 后端会在临时目录下载安装包、校验 Tauri
-        签名，再启动系统安装器；前端不接触私钥。
+        安装包会校验签名后再启动系统安装程序，安装期间请保持应用关闭。
       </p>
     </section>
   );

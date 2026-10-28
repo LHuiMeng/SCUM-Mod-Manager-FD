@@ -17,7 +17,11 @@ interface SettingsScreenProps {
   theme: ThemeMode;
   edition: AppEdition;
   onSave: (settings: AppSettings) => void;
-  onDetectPaths: () => void;
+  onDetectPaths: () => Promise<{
+    scumInstallPath: string;
+    serverInstallPath: string;
+  } | null>;
+  onLaunchOptionsChange: (options: AppSettings["launchOptions"]) => void;
   onThemePreview: (theme: ThemeMode) => void;
   onChooseDirectory: (kind: "client" | "server") => Promise<string | null>;
   updateInfo: AppUpdateInfo | null;
@@ -34,6 +38,7 @@ export function SettingsScreen({
   edition,
   onSave,
   onDetectPaths,
+  onLaunchOptionsChange,
   onThemePreview,
   onChooseDirectory,
   updateInfo,
@@ -44,8 +49,17 @@ export function SettingsScreen({
   onShowUpdate,
 }: SettingsScreenProps) {
   const [draft, setDraft] = useState(settings);
+  const [hint, setHint] = useState<string | null>(null);
 
-  useEffect(() => setDraft(settings), [settings]);
+  // 只跟随即时生效的字段（主题、启动参数），路径与云源的未保存草稿不能被外部刷新冲掉。
+  useEffect(() => {
+    setDraft((current) => ({
+      ...current,
+      theme: settings.theme,
+      launchOptions: settings.launchOptions,
+    }));
+  }, [settings.theme, settings.launchOptions]);
+
   useEffect(() => {
     setDraft((current) =>
       current.theme === theme ? current : { ...current, theme },
@@ -56,15 +70,34 @@ export function SettingsScreen({
     setDraft((current) => ({ ...current, ...patch }));
   }
 
+  function updateLaunchOptions(patch: Partial<AppSettings["launchOptions"]>) {
+    const next = { ...draft.launchOptions, ...patch };
+    update({ launchOptions: next });
+    onLaunchOptionsChange(next);
+  }
+
+  async function handleDetect() {
+    const paths = await onDetectPaths();
+    if (!paths) return;
+    update(paths);
+    const found = Boolean(paths.scumInstallPath.trim() || paths.serverInstallPath.trim());
+    setHint(
+      found
+        ? "已填入检测到的路径，保存后生效。"
+        : "没有从 Steam 库中找到 SCUM，请手动选择目录。",
+    );
+    window.setTimeout(() => setHint(null), 6000);
+  }
+
   return (
     <section className="page page-settings">
       <header className="page-header">
         <div>
           <h1>设置</h1>
-          <p>路径、启动参数、主题与云源。凭据统一交给后端密钥仓库处理。</p>
+          <p>游戏路径、启动参数、主题与云源。凭据由 Rust 后端保管，前端不接触。</p>
         </div>
         <div className="heading-tools">
-          <Button icon="search" onClick={onDetectPaths}>
+          <Button icon="search" onClick={() => void handleDetect()}>
             自动检测路径
           </Button>
           <Button
@@ -85,6 +118,12 @@ export function SettingsScreen({
           </Button>
         </div>
       </header>
+
+      {hint ? (
+        <p className="settings-hint" role="status">
+          {hint}
+        </p>
+      ) : null}
 
       <div className="settings-sheet">
         <section className="settings-group">
@@ -148,32 +187,28 @@ export function SettingsScreen({
         <section className="settings-group">
           <div className="section-title">
             <span>启动参数</span>
-            <b>存在 PAK 时自动附加反作弊兼容参数</b>
+            <b>改动立即生效</b>
           </div>
           <div className="setting-switches">
             <label>
               <span>
                 <b>启用日志</b>
-                <small>向游戏附加 `-log`</small>
+                <small>向游戏附加 -log</small>
               </span>
               <Toggle
                 checked={draft.launchOptions.log}
-                onChange={(log) =>
-                  update({ launchOptions: { ...draft.launchOptions, log } })
-                }
+                onChange={(log) => updateLaunchOptions({ log })}
                 label="启用日志"
               />
             </label>
             <label>
               <span>
                 <b>文件打开日志</b>
-                <small>向游戏附加 `-fileopenlog`</small>
+                <small>向游戏附加 -fileopenlog</small>
               </span>
               <Toggle
                 checked={draft.launchOptions.fileOpenLog}
-                onChange={(fileOpenLog) =>
-                  update({ launchOptions: { ...draft.launchOptions, fileOpenLog } })
-                }
+                onChange={(fileOpenLog) => updateLaunchOptions({ fileOpenLog })}
                 label="文件打开日志"
               />
             </label>
@@ -184,9 +219,7 @@ export function SettingsScreen({
               </span>
               <Toggle
                 checked={draft.launchOptions.noBattlEye}
-                onChange={(noBattlEye) =>
-                  update({ launchOptions: { ...draft.launchOptions, noBattlEye } })
-                }
+                onChange={(noBattlEye) => updateLaunchOptions({ noBattlEye })}
                 label="禁用 BattlEye"
               />
             </label>
@@ -202,6 +235,7 @@ export function SettingsScreen({
                 onChange={(event) =>
                   update({ launchOptions: { ...draft.launchOptions, port: event.target.value } })
                 }
+                onBlur={() => updateLaunchOptions({ port: draft.launchOptions.port })}
               />
             </label>
           </div>
@@ -226,7 +260,7 @@ export function SettingsScreen({
                 <i />
               </span>
               <b>暖纸亮色</b>
-              <small>#e9e5da / #f5f1e7</small>
+              <small>默认外观</small>
             </button>
             <button
               type="button"
@@ -241,7 +275,7 @@ export function SettingsScreen({
                 <i />
               </span>
               <b>中性炭黑</b>
-              <small>#151515 / #1c1c1c</small>
+              <small>夜间使用</small>
             </button>
           </div>
         </section>
@@ -300,7 +334,7 @@ export function SettingsScreen({
                   })
                 }
               />
-              <small>单文件默认 16 路；单个模组最多 128 路，多个模组共享全局 256 连接上限。</small>
+              <small>单个模组最多 128 路，多个模组共享 256 路总上限。</small>
             </label>
           </div>
           <div className="settings-note">

@@ -206,7 +206,7 @@ async function connect(url, appUrl) {
   }
 
   async function navigate(label) {
-    await clickAria(label);
+    await clickText(label, ".rail-button");
     const heading = {
       模组库: "模组库",
       云端: "云端目录",
@@ -445,7 +445,7 @@ async function connect(url, appUrl) {
   await wait(350);
 
   await test("亮暗主题切换、持久化与中性石墨色", async () => {
-    await clickAria("切换至暗色主题");
+    await clickAria("切换到暗色主题");
     await waitFor("document.documentElement.dataset.theme === 'dark'");
     const dark = await evaluate(`(() => {
       const style = getComputedStyle(document.documentElement);
@@ -474,7 +474,7 @@ async function connect(url, appUrl) {
       throw new Error(`暗色选中行对比度过渡异常：${JSON.stringify(dark)}`);
     }
     screenshots.push(await screenshot("1440-dark-library"));
-    await clickAria("切换至亮色主题");
+    await clickAria("切换到亮色主题");
     await waitFor("document.documentElement.dataset.theme === 'light'");
     return dark;
   });
@@ -482,7 +482,7 @@ async function connect(url, appUrl) {
   await test("设置页路径检测、云源保存与保存反馈", async () => {
     await navigate("设置");
     await clickText("自动检测路径");
-    await waitFor("document.body.innerText.includes('路径检测完成')");
+    await waitFor("document.body.innerText.includes('已填入检测到的路径')");
     await wait(400);
     await setInput("https://your-catalog.example", "https://catalog.example.test", "textarea");
     await waitFor(
@@ -502,48 +502,32 @@ async function connect(url, appUrl) {
     const cardLayout = await evaluate(`(() => {
       const cards = [...document.querySelectorAll(".remote-card")];
       const card = cards[0];
-      const name = card.querySelector(".remote-name-scroll b");
-      const author = card.querySelector(".remote-author-scroll span");
-      const description = card.querySelector(".remote-description p");
-      const tags = card.querySelector(".remote-tag-scroll .tag-row");
+      const name = card.querySelector(".remote-name");
+      const author = card.querySelector(".remote-byline");
+      const description = card.querySelector(".remote-description");
       name.textContent = "Very Long Mod Name ".repeat(24);
       author.textContent = "VeryLongAuthorName".repeat(24);
-      description.textContent = "这是一段用于验证固定卡片高度的超长模组描述。".repeat(120);
-      tags.replaceChildren(
-        ...Array.from({ length: 48 }, (_, index) => {
-          const tag = document.createElement("span");
-          tag.className = "tag";
-          tag.textContent = "长标签" + index;
-          return tag;
-        }),
-      );
-      const nameField = card.querySelector(".remote-name-scroll");
-      const authorField = card.querySelector(".remote-author-scroll");
-      const descriptionField = card.querySelector(".remote-description");
-      const tagField = card.querySelector(".remote-tag-scroll");
+      description.textContent = "这是一段用于验证长内容截断的超长模组描述。".repeat(120);
+      const clampOf = (el) => getComputedStyle(el).webkitLineClamp || getComputedStyle(el).lineClamp;
       return {
         heights: cards.map(item => Math.round(item.getBoundingClientRect().height)),
-        nameScrollable: nameField.scrollHeight > nameField.clientHeight,
-        authorScrollable: authorField.scrollWidth > authorField.clientWidth,
-        descriptionScrollable:
-          descriptionField.scrollHeight > descriptionField.clientHeight,
-        tagsScrollable: tagField.scrollHeight > tagField.clientHeight,
+        nameClamp: clampOf(name),
+        descriptionClamp: clampOf(description),
+        cardScroll: card.scrollHeight > card.clientHeight + 1,
+        bylineTruncated: author.scrollWidth > author.clientWidth + 1,
       };
     })()`);
-    const cardHeights = cardLayout.heights;
-    const sameHeight = new Set(cardHeights).size === 1;
-    if (!sameHeight || cardHeights[0] < 300 || cardHeights[0] > 420) {
-      throw new Error(
-        `云端卡片高度不一致或超出合理区间：${JSON.stringify(cardHeights)}`,
-      );
+    if (cardLayout.nameClamp !== "2") {
+      throw new Error(`模组名未限制为两行：${JSON.stringify(cardLayout)}`);
     }
-    for (const field of [
-      "nameScrollable",
-      "authorScrollable",
-      "descriptionScrollable",
-      "tagsScrollable",
-    ]) {
-      if (!cardLayout[field]) throw new Error(`长内容无法滚动：${field}`);
+    if (cardLayout.descriptionClamp !== "3") {
+      throw new Error(`描述未限制为三行：${JSON.stringify(cardLayout)}`);
+    }
+    if (cardLayout.cardScroll) {
+      throw new Error(`云端卡片内出现滚动容器：${JSON.stringify(cardLayout)}`);
+    }
+    if (!cardLayout.bylineTruncated) {
+      throw new Error(`作者行未做省略：${JSON.stringify(cardLayout)}`);
     }
     screenshots.push(await screenshot("1440-light-cloud-long-content"));
     const cloudCopy = await evaluate(
@@ -582,10 +566,11 @@ async function connect(url, appUrl) {
   await test("日志刷新、筛选与清空", async () => {
     await navigate("日志");
     await waitFor("document.querySelectorAll('.log-line').length > 0", 10000);
-    await clickText("INFO");
+    await clickText("信息");
     const filtered = await evaluate("document.querySelectorAll('.log-line').length");
     await clickText("全部");
     await clickText("清空");
+    await clickText("确认清空");
     await waitFor("document.body.innerText.includes('没有日志')");
     screenshots.push(await screenshot("1440-light-logs-empty"));
     return { filtered };
@@ -645,7 +630,7 @@ async function connect(url, appUrl) {
     return report;
   });
 
-  await test("窄窗 980x640 模组库容量信息不折行", async () => {
+  await test("窄窗 980x640 启动条不溢出", async () => {
     await send("Emulation.setDeviceMetricsOverride", {
       width: 980,
       height: 640,
@@ -653,27 +638,24 @@ async function connect(url, appUrl) {
       mobile: false,
     });
     await navigate("模组库");
-    await waitFor("document.querySelector('.usage-top') !== null");
-    const usage = await evaluate(`(() => {
-      const value = document.querySelector(".usage-top > span:last-child");
-      const label = document.querySelector(".usage-top > span:first-child");
-      const range = document.createRange();
-      range.selectNodeContents(value);
-      const lines = new Set(
-        [...range.getClientRects()]
-          .filter(rect => rect.width > 0 && rect.height > 0)
-          .map(rect => Math.round(rect.top))
-      ).size;
+    await waitFor("document.querySelector('.launch-strip') !== null");
+    const strip = await evaluate(`(() => {
+      const el = document.querySelector(".launch-strip");
+      const primary = document.querySelector(".launch-primary");
+      const state = document.querySelector(".strip-state b");
+      const rect = primary.getBoundingClientRect();
+      const stripRect = el.getBoundingClientRect();
       return {
-        lines,
-        labelVisible: getComputedStyle(label).display !== "none",
-        text: value.innerText,
+        overflow: el.scrollWidth > el.clientWidth + 1,
+        primaryInside: rect.right <= stripRect.right - 8,
+        primaryText: primary.innerText.trim(),
+        stateText: state.innerText.trim(),
       };
     })()`);
-    if (usage.lines !== 1) throw new Error(`容量信息折行：${JSON.stringify(usage)}`);
-    if (usage.labelVisible) throw new Error("窄窗仍显示重复的容量标签");
+    if (strip.overflow) throw new Error(`启动条溢出：${JSON.stringify(strip)}`);
+    if (!strip.primaryInside) throw new Error(`主按钮越界：${JSON.stringify(strip)}`);
     screenshots.push(await screenshot("980-library"));
-    return usage;
+    return strip;
   });
 
   await test("减弱动效偏好生效", async () => {

@@ -17,7 +17,7 @@ interface SidebarProps {
 export function Sidebar({ active, onChange, onSettings }: SidebarProps) {
   return (
     <aside className="sidebar" aria-label="主导航">
-      <div className="rail-logo" aria-label="SCUM Mod Manager">
+      <div className="rail-logo" aria-label="SCUM Mod Desk">
         SM
       </div>
       <nav className="rail-nav">
@@ -26,12 +26,12 @@ export function Sidebar({ active, onChange, onSettings }: SidebarProps) {
             type="button"
             key={item.id}
             className={`rail-button ${active === item.id ? "is-active" : ""}`}
-            aria-label={item.label}
             aria-current={active === item.id ? "page" : undefined}
             title={item.label}
             onClick={() => onChange(item.id)}
           >
-            <Icon name={item.icon} size={20} />
+            <Icon name={item.icon} size={19} />
+            <span>{item.label}</span>
           </button>
         ))}
       </nav>
@@ -39,15 +39,13 @@ export function Sidebar({ active, onChange, onSettings }: SidebarProps) {
         <button
           type="button"
           className={`rail-button ${active === "settings" ? "is-active" : ""}`}
-          aria-label="设置"
+          aria-current={active === "settings" ? "page" : undefined}
           title="设置"
           onClick={onSettings}
         >
-          <Icon name="settings" size={20} />
+          <Icon name="settings" size={19} />
+          <span>设置</span>
         </button>
-        <span className="user-mark" aria-hidden="true">
-          RD
-        </span>
       </div>
     </aside>
   );

@@ -7,6 +7,8 @@ interface AppShellProps {
   section: NavSection;
   theme: ThemeMode;
   gameStatus: GameStatus;
+  hasClientPath: boolean;
+  enabledCount: number;
   deployedSize: string;
   lastChecked: string;
   updateAvailable: boolean;
@@ -25,6 +27,8 @@ export function AppShell({
   section,
   theme,
   gameStatus,
+  hasClientPath,
+  enabledCount,
   deployedSize,
   lastChecked,
   updateAvailable,
@@ -50,6 +54,8 @@ export function AppShell({
           section={section}
           theme={theme}
           gameStatus={gameStatus}
+          hasClientPath={hasClientPath}
+          enabledCount={enabledCount}
           deployedSize={deployedSize}
           lastChecked={lastChecked}
           updateAvailable={updateAvailable}

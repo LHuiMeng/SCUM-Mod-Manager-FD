@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { ModEntry } from "../../types";
+import { formatClock } from "../../lib/format";
 import { EmptyState } from "../ui/EmptyState";
 import { ModRow } from "./ModRow";
 
@@ -11,10 +12,13 @@ interface ModTableProps {
   mods: ModEntry[];
   selectedId: string | null;
   search: string;
-  hasActiveFilter: boolean;
+  locked: boolean;
+  lastDeployedAt: string | null;
+  conflictCount: number;
   onSelect: (id: string) => void;
   onToggle: (id: string, enabled: boolean) => void;
   onReorder: (ids: string[]) => void;
+  onVisibleChange: (ids: string[]) => void;
 }
 
 /** 指针移动超过这个距离才算拖拽，否则当成点击选中。 */
@@ -24,10 +28,13 @@ export function ModTable({
   mods,
   selectedId,
   search,
-  hasActiveFilter,
+  locked,
+  lastDeployedAt,
+  conflictCount,
   onSelect,
   onToggle,
   onReorder,
+  onVisibleChange,
 }: ModTableProps) {
   const [filter, setFilter] = useState<FilterId>("all");
   const [sortMode, setSortMode] = useState<SortMode>("load");
@@ -70,6 +77,15 @@ export function ModTable({
       });
   }, [filter, mods, search, sortMode]);
 
+  // 把可见条目交回上层，检查器据此判断当前选中项是否还在列表里。
+  const visibleKeyRef = useRef<string>("");
+  useEffect(() => {
+    const key = filtered.map((mod) => mod.id).join("|");
+    if (visibleKeyRef.current === key) return;
+    visibleKeyRef.current = key;
+    onVisibleChange(filtered.map((mod) => mod.id));
+  }, [filtered, onVisibleChange]);
+
   const counts = useMemo(
     () => ({
       all: mods.length,
@@ -80,8 +96,14 @@ export function ModTable({
     [mods],
   );
 
-  const canDrag =
-    sortMode === "load" && filter === "all" && !search.trim() && !hasActiveFilter;
+  const canDrag = sortMode === "load" && filter === "all" && !search.trim();
+  const dragHint = canDrag
+    ? "拖拽行或 Alt+↑/↓ 调整加载顺序"
+    : sortMode !== "load"
+      ? "切回「按加载顺序」后可排序"
+      : search.trim()
+        ? "清空搜索后可排序"
+        : "切回「全部」筛选后可排序";
 
   const sortLabel = {
     load: "按加载顺序",
@@ -118,6 +140,19 @@ export function ModTable({
     ordered.splice(to, 0, sourceId);
     reorderRef.current(ordered);
   }
+
+  /** 键盘排序：Alt+↑/↓ 把当前行上移/下移一格。 */
+  const moveBy = useCallback((id: string, delta: number) => {
+    const ordered = [...modsRef.current]
+      .sort((a, b) => a.loadOrder - b.loadOrder)
+      .map((mod) => mod.id);
+    const from = ordered.indexOf(id);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= ordered.length) return;
+    ordered.splice(from, 1);
+    ordered.splice(to, 0, id);
+    reorderRef.current(ordered);
+  }, []);
 
   // HTML5 draggable 在 Tauri 的 WebView2 里会被窗口级文件拖放吃掉，
   // 所以排序走 pointer 事件，和文件拖入互不干扰。
@@ -208,20 +243,24 @@ export function ModTable({
           </button>
         </div>
       </div>
-      <div className="table-head">
-        <span />
+      <div className="table-head" aria-hidden="true">
         <span />
         <span>模组</span>
         <span>类型</span>
         <span>大小</span>
         <span>启用</span>
       </div>
-      <div className={`mod-rows ${dragId ? "is-sorting" : ""}`} ref={listRef}>
+      <div
+        className={`mod-rows ${dragId ? "is-sorting" : ""}`}
+        ref={listRef}
+        role="listbox"
+        aria-label="本地模组列表"
+      >
         {filtered.length === 0 ? (
           <EmptyState
             icon="box"
             title="没有符合条件的模组"
-            description="换一个关键词或筛选条件，或者导入新的 PAK 文件。"
+            description="换一个关键词或筛选条件，也可以把 .pak、.zip 或 UE4SS 文件夹拖进窗口导入。"
           />
         ) : (
           filtered.map((mod) => (
@@ -230,6 +269,8 @@ export function ModTable({
               mod={mod}
               selected={selectedId === mod.id}
               sortable={canDrag}
+              showLoadOrder={sortMode === "load"}
+              locked={locked}
               dragging={dragId === mod.id}
               dragOver={dragOverId === mod.id}
               onSelect={() => {
@@ -237,6 +278,7 @@ export function ModTable({
                 onSelect(mod.id);
               }}
               onToggle={(enabled) => onToggle(mod.id, enabled)}
+              onMove={(delta) => moveBy(mod.id, delta)}
               onPointerDown={(event) => handlePointerDown(event, mod.id)}
             />
           ))
@@ -244,10 +286,12 @@ export function ModTable({
       </div>
       <div className="table-foot">
         <span>
-          显示 {filtered.length} / {mods.length} ·{" "}
-          <b>{canDrag ? "拖拽可调整加载顺序" : "清除筛选后可排序"}</b>
+          显示 {filtered.length} / {mods.length} · <b>{dragHint}</b>
         </span>
-        <span>本地文件优先 · SHA-256 延迟校验</span>
+        <span>
+          上次部署 {formatClock(lastDeployedAt)}
+          {conflictCount > 0 ? ` · ${conflictCount} 个资源冲突` : " · 无资源冲突"}
+        </span>
       </div>
     </section>
   );

@@ -13,7 +13,9 @@ interface TitleBarProps {
   section: NavSection;
   theme: ThemeMode;
   gameStatus: GameStatus;
+  hasClientPath: boolean;
   deployedSize: string;
+  enabledCount: number;
   lastChecked: string;
   updateAvailable: boolean;
   updateVersion: string | null;
@@ -28,7 +30,9 @@ export function TitleBar({
   section,
   theme,
   gameStatus,
+  hasClientPath,
   deployedSize,
+  enabledCount,
   lastChecked,
   updateAvailable,
   updateVersion,
@@ -53,13 +57,17 @@ export function TitleBar({
           </button>
         ) : null}
         <span
-          className={`status-live ${gameStatus.running ? "is-running" : ""}`}
+          className={`status-live ${gameStatus.running ? "is-running" : hasClientPath ? "" : "is-warn"}`}
           data-tauri-drag-region
         >
-          {gameStatus.running ? "游戏运行中" : "客户端路径正常"}
+          {gameStatus.running
+            ? "游戏运行中"
+            : hasClientPath
+              ? "客户端已定位"
+              : "未设置客户端路径"}
         </span>
         <span className="title-deployed" data-tauri-drag-region>
-          {deployedSize} 已部署
+          {enabledCount} 个启用 · {deployedSize}
         </span>
         <span className="title-checked" data-tauri-drag-region>
           上次检查 {lastChecked}
@@ -68,11 +76,11 @@ export function TitleBar({
           type="button"
           className="theme-switch"
           onClick={onToggleTheme}
-          aria-label={theme === "dark" ? "切换至亮色主题" : "切换至暗色主题"}
-          title="切换亮色 / 暗色主题"
+          aria-label={theme === "dark" ? "切换到亮色主题" : "切换到暗色主题"}
+          title={theme === "dark" ? "切换到亮色主题" : "切换到暗色主题"}
         >
-          <Icon name={theme === "dark" ? "moon" : "sun"} size={13} />
-          <span>{theme === "dark" ? "暗色" : "亮色"}</span>
+          <Icon name={theme === "dark" ? "sun" : "moon"} size={13} />
+          <span>{theme === "dark" ? "亮色" : "暗色"}</span>
         </button>
       </div>
       <div className="window-actions">

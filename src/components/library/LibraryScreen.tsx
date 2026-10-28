@@ -6,7 +6,6 @@ import type {
   ModEntry,
   NavSection,
 } from "../../types";
-import { formatClock } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { SearchField } from "../ui/SearchField";
@@ -55,6 +54,7 @@ export function LibraryScreen({
   fileDragActive,
 }: LibraryScreenProps) {
   const [editing, setEditing] = useState<ModEntry | null>(null);
+  const [visibleIds, setVisibleIds] = useState<string[] | null>(null);
   const mods = snapshot.mods;
 
   useEffect(() => {
@@ -66,13 +66,15 @@ export function LibraryScreen({
   }, [mods, onSelect, selectedId]);
 
   const selected = mods.find((mod) => mod.id === selectedId) ?? null;
+  // 列表被搜索或筛选清空时，右侧不该继续展示一个已经不在结果里的模组。
+  const visibleSelected =
+    selected && (!visibleIds || visibleIds.includes(selected.id)) ? selected : null;
   const summary = useMemo(() => {
     const enabled = mods.filter((mod) => mod.enabled);
     const totalBytes = enabled.reduce((sum, mod) => sum + mod.fileSize, 0);
-    const capacityBytes = 8 * 1024 ** 3;
     const conflicts = mods.reduce((sum, mod) => sum + mod.conflictCount, 0);
     const updates = mods.filter((mod) => mod.updateVersion).length;
-    return { enabled, totalBytes, capacityBytes, conflicts, updates };
+    return { enabled, totalBytes, conflicts, updates };
   }, [mods]);
 
   return (
@@ -81,10 +83,7 @@ export function LibraryScreen({
         <div className="page-heading">
           <div>
             <h1>模组库</h1>
-            <p>
-              {mods.length} 个本地模组 · {summary.enabled.length} 个已启用 ·{" "}
-              {summary.updates > 0 ? `${summary.updates} 个等待更新` : "全部为最新版本"}
-            </p>
+            <p>拖入 .pak、.zip 或 UE4SS 文件夹即可导入，排序决定加载优先级。</p>
           </div>
           <div className="heading-tools">
             <SearchField
@@ -104,7 +103,6 @@ export function LibraryScreen({
         <LaunchStrip
           enabledCount={summary.enabled.length}
           totalBytes={summary.totalBytes}
-          capacityBytes={summary.capacityBytes}
           running={gameStatus.running}
           launchOptions={snapshot.settings.launchOptions}
           onLaunch={onLaunch}
@@ -117,17 +115,20 @@ export function LibraryScreen({
           mods={sortedMods(mods)}
           selectedId={selectedId}
           search={search}
-          hasActiveFilter={false}
+          locked={gameStatus.running}
+          lastDeployedAt={snapshot.lastDeployedAt}
+          conflictCount={summary.conflicts}
           onSelect={onSelect}
           onToggle={(id, enabled) => onToggle(id, enabled)}
           onReorder={onReorder}
+          onVisibleChange={setVisibleIds}
         />
       </section>
 
       <ModInspector
-        mod={selected}
-        onEdit={() => selected && setEditing(selected)}
-        onOpenFolder={() => selected && onOpenFolder(selected.id)}
+        mod={visibleSelected}
+        onEdit={() => visibleSelected && setEditing(visibleSelected)}
+        onOpenFolder={() => visibleSelected && onOpenFolder(visibleSelected.id)}
       />
 
       {editing ? (
@@ -137,10 +138,6 @@ export function LibraryScreen({
           onClose={() => setEditing(null)}
         />
       ) : null}
-
-      <span className="last-deploy-note">
-        上次部署 {formatClock(snapshot.lastDeployedAt)} · {summary.conflicts} 个资源冲突
-      </span>
 
       {fileDragActive ? (
         <div className="library-drop-overlay" role="status" aria-live="polite">

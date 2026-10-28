@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type { LaunchOptions } from "../../types";
+import { formatBytes } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { Toggle } from "../ui/Toggle";
 
 interface LaunchStripProps {
   enabledCount: number;
   totalBytes: number;
-  capacityBytes: number;
   running: boolean;
   launchOptions: LaunchOptions;
   onLaunch: () => void;
@@ -18,7 +18,6 @@ interface LaunchStripProps {
 export function LaunchStrip({
   enabledCount,
   totalBytes,
-  capacityBytes,
   running,
   launchOptions,
   onLaunch,
@@ -26,7 +25,6 @@ export function LaunchStrip({
   onOptionsChange,
   onOpenSettings,
 }: LaunchStripProps) {
-  const usage = capacityBytes > 0 ? Math.min(100, (totalBytes / capacityBytes) * 100) : 0;
   const [optionsOpen, setOptionsOpen] = useState(false);
   const optionsRef = useRef<HTMLDivElement>(null);
 
@@ -56,20 +54,18 @@ export function LaunchStrip({
       <div className="strip-state">
         <span className={`strip-dot ${running ? "is-running" : ""}`} />
         <div>
-          <b>{running ? "游戏正在运行" : "当前配置可以启动"}</b>
-          <span>{running ? "MOD DEPLOYED" : `CLIENT READY · ${enabledCount} MODS`}</span>
+          <b>{running ? "游戏正在运行" : "可以启动客户端"}</b>
+          <span>{running ? "退出后回收本次部署" : "启动时部署启用模组"}</span>
         </div>
       </div>
-      <div className="usage">
-        <div className="usage-top">
-          <span>已部署容量</span>
-          <span>
-            <b>{(totalBytes / 1024 ** 3).toFixed(2)} GB</b> / {(capacityBytes / 1024 ** 3).toFixed(2)} GB
-          </span>
-        </div>
-        <div className="usage-track">
-          <i style={{ width: `${usage}%` }} />
-        </div>
+      <div className="strip-facts">
+        <span>
+          已启用 <b>{enabledCount}</b>
+        </span>
+        <i />
+        <span>
+          总大小 <b>{formatBytes(totalBytes)}</b>
+        </span>
       </div>
       <div className="launch-options-wrap" ref={optionsRef}>
         <Button
@@ -85,7 +81,7 @@ export function LaunchStrip({
           <div className="launch-options-popover" role="dialog" aria-label="启动选项">
             <div className="launch-options-head">
               <b>启动参数</b>
-              <span>更改会自动保存，下次启动生效</span>
+              <span>改动立即保存，下次启动生效</span>
             </div>
             <label className="launch-option-row">
               <span>
@@ -123,7 +119,7 @@ export function LaunchStrip({
         ) : null}
       </div>
       <Button
-        variant="primary"
+        variant={running ? "danger" : "primary"}
         className="launch-primary"
         icon={running ? "serverOff" : "play"}
         onClick={running ? onKill : onLaunch}

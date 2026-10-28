@@ -564,20 +564,10 @@ export default function App() {
 
   async function handleDetectPaths() {
     try {
-      const paths = await api.detectPaths();
-      if (!snapshot) return;
-      const next = { ...snapshot.settings, ...paths };
-      const saved = await api.saveSettings(next);
-      setSnapshot({ ...snapshot, settings: saved });
-      notify(
-        "路径检测完成",
-        paths.scumInstallPath || paths.serverInstallPath
-          ? "已更新客户端与服务端路径"
-          : "未从 Steam 库中找到 SCUM",
-        "success",
-      );
+      return await api.detectPaths();
     } catch (error) {
       notify("路径检测失败", String(error), "error");
+      return null;
     }
   }
 
@@ -766,6 +756,8 @@ export default function App() {
         section={section}
         theme={theme}
         gameStatus={snapshot.gameStatus}
+        hasClientPath={Boolean(snapshot.settings.scumInstallPath.trim())}
+        enabledCount={enabled.length}
         deployedSize={formatBytes(deployedBytes)}
         lastChecked={formatClock(snapshot.lastScannedAt)}
         updateAvailable={updatePhase === "available"}
@@ -851,7 +843,8 @@ export default function App() {
               theme={theme}
               edition={appInfo?.edition ?? "public"}
               onSave={(settings) => void handleSaveSettings(settings)}
-              onDetectPaths={() => void handleDetectPaths()}
+              onDetectPaths={handleDetectPaths}
+              onLaunchOptionsChange={handleLaunchOptionsChange}
               onThemePreview={changeTheme}
               onChooseDirectory={handleChooseDirectory}
               updateInfo={updateInfo}

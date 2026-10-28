@@ -13,6 +13,7 @@ export function ToastStack({ messages, onDismiss }: ToastStackProps) {
           type="button"
           className={`toast toast-${message.tone}`}
           key={message.id}
+          title="点击关闭"
           onClick={() => onDismiss(message.id)}
         >
           <span className="toast-mark" />

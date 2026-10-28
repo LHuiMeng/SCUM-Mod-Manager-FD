@@ -23,22 +23,22 @@ export function ModInspector({ mod, onEdit, onOpenFolder }: ModInspectorProps) {
     );
   }
 
+  const hasHash = Boolean(mod.sha256);
+
   return (
     <aside className="inspector">
       <div className="inspector-preview">
         <span className="inspector-monogram">{modMonogram(mod.name)}</span>
-        <svg viewBox="0 0 300 220" aria-hidden="true">
-          <path d="M34 174c52-31 86-67 124-66 41 1 59 26 103 4" />
-          <path d="M27 194c55-31 93-68 132-67 46 1 67 28 115 5" />
-          <path d="M44 155c45-27 78-58 112-57 35 1 51 22 91 3" />
-          <path d="M58 136c36-22 66-48 96-47 29 1 43 18 77 2" />
-        </svg>
         <div className="preview-meta">
-          <span className="preview-badge">
+          <span className={`preview-badge ${mod.enabled ? "is-on" : "is-off"}`}>
             <i />
-            已选模组
+            {mod.enabled
+              ? `已启用 · 顺序 ${String(mod.loadOrder + 1).padStart(2, "0")}`
+              : "已停用"}
           </span>
-          <span className="preview-badge">{mod.updateVersion ? `可更新 ${mod.updateVersion}` : "本地版本"}</span>
+          <span className={`preview-badge ${mod.conflictCount > 0 ? "is-warn" : ""}`}>
+            {mod.conflictCount > 0 ? `${mod.conflictCount} 个冲突` : "无资源冲突"}
+          </span>
         </div>
       </div>
       <div className="inspector-body">
@@ -59,8 +59,8 @@ export function ModInspector({ mod, onEdit, onOpenFolder }: ModInspectorProps) {
         <section className="inspector-section">
           <div className="section-title">
             <span>模组概览</span>
-            <b className={mod.conflictCount > 0 ? "is-warn" : "is-good"}>
-              {mod.conflictCount > 0 ? `${mod.conflictCount} 个冲突` : "校验通过"}
+            <b className={mod.conflictCount > 0 ? "is-warn" : hasHash ? "is-good" : "is-muted"}>
+              {mod.conflictCount > 0 ? `${mod.conflictCount} 个冲突` : hasHash ? "哈希已记录" : "未校验"}
             </b>
           </div>
           <div className="detail-facts">
@@ -83,14 +83,25 @@ export function ModInspector({ mod, onEdit, onOpenFolder }: ModInspectorProps) {
           </div>
           <div className={`health-row ${mod.conflictCount > 0 ? "has-conflict" : ""}`}>
             <span className="health-icon">
-              <Icon name={mod.conflictCount > 0 ? "serverOff" : "check"} size={13} />
+              <Icon
+                name={mod.conflictCount > 0 ? "serverOff" : hasHash ? "check" : "refresh"}
+                size={13}
+              />
             </span>
             <span>
-              <b>{mod.conflictCount > 0 ? "检测到资源覆盖" : "未检测到资源冲突"}</b>
+              <b>
+                {mod.conflictCount > 0
+                  ? "检测到资源覆盖"
+                  : hasHash
+                    ? "未检测到资源冲突"
+                    : "尚未计算文件哈希"}
+              </b>
               <span>
                 {mod.conflictCount > 0
-                  ? "请检查右侧冲突详情后再启动"
-                  : "与当前启用模组的资源清单兼容"}
+                  ? "请核对覆盖顺序后再启动"
+                  : hasHash
+                    ? "与当前启用模组的资源清单兼容"
+                    : "重新扫描会补算 SHA-256，再判断文件完整性"}
               </span>
             </span>
           </div>
