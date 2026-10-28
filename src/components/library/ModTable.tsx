@@ -1,4 +1,5 @@
-import { useMemo, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import type { ModEntry } from "../../types";
 import { EmptyState } from "../ui/EmptyState";
 import { ModRow } from "./ModRow";
@@ -16,6 +17,9 @@ interface ModTableProps {
   onReorder: (ids: string[]) => void;
 }
 
+/** 指针移动超过这个距离才算拖拽，否则当成点击选中。 */
+const DRAG_THRESHOLD = 5;
+
 export function ModTable({
   mods,
   selectedId,
@@ -27,8 +31,19 @@ export function ModTable({
 }: ModTableProps) {
   const [filter, setFilter] = useState<FilterId>("all");
   const [sortMode, setSortMode] = useState<SortMode>("load");
-  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragId, setDragId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
+
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const pendingRef = useRef<{ id: string; startY: number; started: boolean } | null>(
+    null,
+  );
+  const dragOverRef = useRef<string | null>(null);
+  const suppressClickRef = useRef(false);
+  const modsRef = useRef(mods);
+  const reorderRef = useRef(onReorder);
+  modsRef.current = mods;
+  reorderRef.current = onReorder;
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -80,28 +95,84 @@ export function ModTable({
     );
   }
 
-  function handleDragStart(event: DragEvent<HTMLDivElement>, modId: string) {
-    if (!canDrag) {
-      event.preventDefault();
-      return;
+  const rowIdAt = useCallback((y: number) => {
+    const rows = [
+      ...(listRef.current?.querySelectorAll<HTMLElement>(".mod-row") ?? []),
+    ];
+    if (rows.length === 0) return null;
+    for (const row of rows) {
+      const rect = row.getBoundingClientRect();
+      if (y < rect.bottom) return row.dataset.modId ?? null;
     }
-    setDraggingId(modId);
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", modId);
+    return rows[rows.length - 1].dataset.modId ?? null;
+  }, []);
+
+  function commitReorder(sourceId: string, targetId: string) {
+    const ordered = [...modsRef.current]
+      .sort((a, b) => a.loadOrder - b.loadOrder)
+      .map((mod) => mod.id);
+    const from = ordered.indexOf(sourceId);
+    const to = ordered.indexOf(targetId);
+    if (from < 0 || to < 0 || from === to) return;
+    ordered.splice(from, 1);
+    ordered.splice(to, 0, sourceId);
+    reorderRef.current(ordered);
   }
 
-  function handleDrop(event: DragEvent<HTMLDivElement>, targetId: string) {
-    event.preventDefault();
-    const sourceId = draggingId ?? event.dataTransfer.getData("text/plain");
-    setDraggingId(null);
-    setDragOverId(null);
-    if (!sourceId || sourceId === targetId || !canDrag) return;
-    const ordered = [...mods].sort((a, b) => a.loadOrder - b.loadOrder).map((mod) => mod.id);
-    const sourceIndex = ordered.indexOf(sourceId);
-    const targetIndex = ordered.indexOf(targetId);
-    ordered.splice(sourceIndex, 1);
-    ordered.splice(targetIndex, 0, sourceId);
-    onReorder(ordered);
+  // HTML5 draggable 在 Tauri 的 WebView2 里会被窗口级文件拖放吃掉，
+  // 所以排序走 pointer 事件，和文件拖入互不干扰。
+  useEffect(() => {
+    function onMove(event: PointerEvent) {
+      const pending = pendingRef.current;
+      if (!pending) return;
+      if (!pending.started) {
+        if (Math.abs(event.clientY - pending.startY) < DRAG_THRESHOLD) return;
+        pending.started = true;
+        setDragId(pending.id);
+        document.body.classList.add("is-row-dragging");
+      }
+      event.preventDefault();
+      const target = rowIdAt(event.clientY);
+      dragOverRef.current = target;
+      setDragOverId(target);
+    }
+
+    function finish() {
+      const pending = pendingRef.current;
+      pendingRef.current = null;
+      document.body.classList.remove("is-row-dragging");
+      setDragId(null);
+      setDragOverId(null);
+      if (!pending?.started) return;
+      const target = dragOverRef.current;
+      if (target && target !== pending.id) {
+        commitReorder(pending.id, target);
+        // 拖拽结束后的 pointerup 会补一个 click，别让它把选中态也改掉。
+        suppressClickRef.current = true;
+        window.setTimeout(() => {
+          suppressClickRef.current = false;
+        }, 0);
+      }
+    }
+
+    window.addEventListener("pointermove", onMove, { passive: false });
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      document.body.classList.remove("is-row-dragging");
+    };
+  }, [rowIdAt]);
+
+  function handlePointerDown(
+    event: ReactPointerEvent<HTMLDivElement>,
+    modId: string,
+  ) {
+    if (!canDrag || event.button !== 0) return;
+    if ((event.target as HTMLElement).closest(".toggle")) return;
+    pendingRef.current = { id: modId, startY: event.clientY, started: false };
   }
 
   return (
@@ -145,7 +216,7 @@ export function ModTable({
         <span>大小</span>
         <span>启用</span>
       </div>
-      <div className="mod-rows">
+      <div className={`mod-rows ${dragId ? "is-sorting" : ""}`} ref={listRef}>
         {filtered.length === 0 ? (
           <EmptyState
             icon="box"
@@ -158,29 +229,23 @@ export function ModTable({
               key={mod.id}
               mod={mod}
               selected={selectedId === mod.id}
-              draggable={canDrag}
+              sortable={canDrag}
+              dragging={dragId === mod.id}
               dragOver={dragOverId === mod.id}
-              onSelect={() => onSelect(mod.id)}
+              onSelect={() => {
+                if (suppressClickRef.current) return;
+                onSelect(mod.id);
+              }}
               onToggle={(enabled) => onToggle(mod.id, enabled)}
-              onDragStart={(event) => handleDragStart(event, mod.id)}
-              onDragOver={(event) => {
-                if (!canDrag) return;
-                event.preventDefault();
-                event.dataTransfer.dropEffect = "move";
-                setDragOverId(mod.id);
-              }}
-              onDrop={(event) => handleDrop(event, mod.id)}
-              onDragEnd={() => {
-                setDraggingId(null);
-                setDragOverId(null);
-              }}
+              onPointerDown={(event) => handlePointerDown(event, mod.id)}
             />
           ))
         )}
       </div>
       <div className="table-foot">
         <span>
-          显示 {filtered.length} / {mods.length} · <b>{canDrag ? "拖拽可调整加载顺序" : "清除筛选后可排序"}</b>
+          显示 {filtered.length} / {mods.length} ·{" "}
+          <b>{canDrag ? "拖拽可调整加载顺序" : "清除筛选后可排序"}</b>
         </span>
         <span>本地文件优先 · SHA-256 延迟校验</span>
       </div>

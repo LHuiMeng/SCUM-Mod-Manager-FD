@@ -106,11 +106,16 @@ fn build_file_mod(
         meta.modified_at = Some(modified_at);
     }
 
-    let name = path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
+    let name = meta
+        .name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        });
     let tags = meta.tags.clone();
     let notes = meta.notes.clone();
     let enabled = meta.enabled;
@@ -155,6 +160,11 @@ fn build_directory_mod(
     let meta = metadata.entry_mut(&id);
     meta.file_size = Some(file_size);
     meta.modified_at = Some(epoch_millis(modified));
+    let name = meta
+        .name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| file_name.clone());
     let tags = meta.tags.clone();
     let notes = meta.notes.clone();
     let enabled = meta.enabled;
@@ -162,7 +172,7 @@ fn build_directory_mod(
 
     Ok(ModEntry {
         id,
-        name: file_name.clone(),
+        name: name.clone(),
         file_name: file_name.clone(),
         file_path: path_string(path),
         file_size,
@@ -555,8 +565,9 @@ fn epoch_millis(time: SystemTime) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_zip_file, import_paths, install_ue4ss_zip};
+    use super::{extract_zip_file, import_paths, install_ue4ss_zip, scan_local_mods, stable_id};
     use crate::paths::AppPaths;
+    use std::collections::HashSet;
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -589,6 +600,22 @@ mod tests {
         fs::create_dir_all(&paths.local_mods).unwrap();
         fs::create_dir_all(&paths.ue4ss_mods).unwrap();
         paths
+    }
+
+    #[test]
+    fn uses_the_recorded_display_name_over_the_file_name() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        fs::write(paths.local_mods.join("______.pak"), b"pak-body").unwrap();
+        let mut metadata = crate::metadata::MetadataFile::default();
+        let id = stable_id(&paths.local_mods, "______.pak");
+        metadata.entry_mut(&id).name = Some("衣物容器嵌套".to_string());
+
+        let mods = scan_local_mods(&paths, &mut metadata, &HashSet::new()).unwrap();
+
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].name, "衣物容器嵌套");
+        assert_eq!(mods[0].file_name, "______.pak");
     }
 
     #[test]

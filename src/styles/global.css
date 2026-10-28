@@ -893,7 +893,7 @@ textarea:focus-visible,
 .table-head,
 .mod-row {
   display: grid;
-  grid-template-columns: 32px 38px minmax(0, 1fr) 94px 72px 38px 20px;
+  grid-template-columns: 32px 38px minmax(0, 1fr) 94px 72px 46px 20px;
   align-items: center;
   gap: 9px;
 }
@@ -948,6 +948,30 @@ textarea:focus-visible,
 
 .mod-row.is-drag-over {
   box-shadow: inset 0 2px 0 var(--accent);
+}
+
+/* 指针拖拽排序：HTML5 drag 在 WebView2 里会被窗口级文件拖放吃掉 */
+.mod-row.is-sortable {
+  cursor: grab;
+}
+
+.mod-row.is-dragging {
+  z-index: 2;
+  cursor: grabbing;
+  opacity: 0.55;
+  background: var(--paper-hi);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.16);
+}
+
+.mod-rows.is-sorting .mod-row {
+  transition:
+    background 140ms ease,
+    box-shadow 140ms ease,
+    opacity 140ms ease;
+}
+
+body.is-row-dragging {
+  cursor: grabbing;
 }
 
 .mod-check {
@@ -2746,7 +2770,7 @@ textarea:focus-visible,
 
   .table-head,
   .mod-row {
-    grid-template-columns: 32px 38px minmax(0, 1fr) 72px 38px 20px;
+    grid-template-columns: 32px 38px minmax(0, 1fr) 72px 46px 20px;
   }
 
   .table-head span:nth-child(4),

@@ -1,3 +1,4 @@
+use crate::cloud;
 use crate::config;
 use crate::edition;
 use crate::launcher::ManagedProcess;
@@ -55,7 +56,8 @@ impl AppState {
             MetadataFile::default()
         });
         let deployed = deployed_file_names(&paths);
-        let mods = scan_local_mods(&paths, &mut metadata, &deployed).unwrap_or_default();
+        let mut mods = scan_local_mods(&paths, &mut metadata, &deployed).unwrap_or_default();
+        let _ = cloud::apply_catalog_names(&paths, &mut metadata, &mut mods);
         let _ = metadata::save_metadata(&paths, &metadata);
         let deployed_at = read_manifest(&paths).map(|manifest| manifest.deployed_at);
         let state = Self {
@@ -118,12 +120,20 @@ impl AppState {
 
         let mut metadata = self.metadata.lock().unwrap();
         let deployed = deployed_file_names(&self.paths);
-        let mods = scan_local_mods(&self.paths, &mut metadata, &deployed)?;
+        let mut mods = scan_local_mods(&self.paths, &mut metadata, &deployed)?;
+        let named = cloud::apply_catalog_names(&self.paths, &mut metadata, &mut mods);
         metadata::save_metadata(&self.paths, &metadata)?;
         let count = mods.len();
         *self.mods.write().unwrap() = mods;
         *self.last_scanned_at.lock().unwrap() = Some(Utc::now().to_rfc3339());
         drop(metadata);
+        if named > 0 {
+            self.log(
+                "info",
+                "cloud",
+                &format!("已按云端目录回填 {named} 个模组的显示名"),
+            );
+        }
         self.log(
             "info",
             "library",
@@ -135,10 +145,18 @@ impl AppState {
     pub fn refresh_files(&self) -> Result<LibrarySnapshot> {
         let mut metadata = self.metadata.lock().unwrap();
         let deployed = deployed_file_names(&self.paths);
-        let mods = scan_local_mods(&self.paths, &mut metadata, &deployed)?;
+        let mut mods = scan_local_mods(&self.paths, &mut metadata, &deployed)?;
+        let named = cloud::apply_catalog_names(&self.paths, &mut metadata, &mut mods);
         metadata::save_metadata(&self.paths, &metadata)?;
         *self.mods.write().unwrap() = mods;
         *self.last_scanned_at.lock().unwrap() = Some(Utc::now().to_rfc3339());
+        if named > 0 {
+            self.log(
+                "info",
+                "cloud",
+                &format!("已按云端目录回填 {named} 个模组的显示名"),
+            );
+        }
         Ok(self.snapshot())
     }
 

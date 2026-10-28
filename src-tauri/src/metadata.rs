@@ -19,6 +19,8 @@ pub struct ModMetadata {
     #[serde(alias = "pak_entries")]
     pub pak_entries: Vec<String>,
     pub conflicts: HashMap<String, Vec<String>>,
+    /// 云端目录给出的显示名。磁盘名可能被清洗过，显示名不能跟着变。
+    pub name: Option<String>,
     #[serde(alias = "file_size")]
     pub file_size: Option<u64>,
     #[serde(alias = "modified_at")]

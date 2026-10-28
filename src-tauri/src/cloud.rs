@@ -1,6 +1,7 @@
 use crate::edition;
+use crate::metadata::MetadataFile;
 use crate::models::{
-    AppSettings, CloudDownloadProgress, RemoteMod, MAX_CLOUD_DOWNLOAD_SEGMENTS,
+    AppSettings, CloudDownloadProgress, ModEntry, RemoteMod, MAX_CLOUD_DOWNLOAD_SEGMENTS,
     MIN_CLOUD_DOWNLOAD_SEGMENTS,
 };
 use crate::mods::install_ue4ss_zip;
@@ -12,7 +13,7 @@ use futures_util::StreamExt;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -882,6 +883,56 @@ fn load_catalog_cache(paths: &AppPaths) -> Result<Vec<RemoteMod>> {
     parse_catalog(paths, base, catalog)
 }
 
+/// 用云端目录缓存里的 sha256 → 名称映射补回显示名。
+///
+/// 旧版本下载时磁盘名被 ASCII 清洗过（`武器增强` 变成一串下划线），
+/// 而显示名只取文件名时用户就只看到下划线。内容哈希是稳定的，
+/// 可以据此把云端名找回来；匹配不上或已有名字的条目保持原样。
+pub fn apply_catalog_names(
+    paths: &AppPaths,
+    metadata: &mut MetadataFile,
+    mods: &mut [ModEntry],
+) -> usize {
+    let Ok(catalog) = load_catalog_cache(paths) else {
+        return 0;
+    };
+    let mut by_hash: HashMap<String, String> = HashMap::new();
+    for remote in catalog {
+        let hash = remote.sha256.trim().to_ascii_lowercase();
+        if hash.is_empty() {
+            continue;
+        }
+        by_hash.entry(hash).or_insert(remote.name);
+    }
+    if by_hash.is_empty() {
+        return 0;
+    }
+
+    let mut updated = 0;
+    for entry in mods.iter_mut() {
+        let known = metadata
+            .entries
+            .get(&entry.id)
+            .and_then(|meta| meta.name.clone())
+            .filter(|value| !value.trim().is_empty());
+        if let Some(name) = known {
+            entry.name = name;
+            continue;
+        }
+        let hash = entry.sha256.trim().to_ascii_lowercase();
+        if hash.is_empty() {
+            continue;
+        }
+        let Some(name) = by_hash.get(&hash).cloned() else {
+            continue;
+        };
+        entry.name = name.clone();
+        metadata.entry_mut(&entry.id).name = Some(name);
+        updated += 1;
+    }
+    updated
+}
+
 fn human_bytes(value: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if value < 1024 {
@@ -1111,14 +1162,14 @@ fn timestamp(value: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_cloud_transport, declared_ue4ss, download_remote, download_source_allowed,
-        fetch_catalog, human_bytes, install_downloaded, is_retryable_chunk_error,
-        load_catalog_cache, ordered_urls, parse_catalog, remote_filename, save_catalog_cache,
-        segment_plan, should_attach_credentials, AppSettings, CloudAccess,
+        allowed_cloud_transport, apply_catalog_names, declared_ue4ss, download_remote,
+        download_source_allowed, fetch_catalog, human_bytes, install_downloaded,
+        is_retryable_chunk_error, load_catalog_cache, ordered_urls, parse_catalog, remote_filename,
+        save_catalog_cache, segment_plan, should_attach_credentials, AppSettings, CloudAccess,
         CloudDownloadProgressCallback, RetryableChunkError, RuntimeSecrets,
     };
     use crate::edition::Edition;
-    use crate::models::{CloudDownloadProgress, RemoteMod};
+    use crate::models::{CloudDownloadProgress, ModEntry, RemoteMod};
     use crate::secrets::load_runtime_secrets;
     use crate::test_support::TempRoot;
     use serde_json::json;
@@ -2161,6 +2212,54 @@ mod tests {
             mods[0].download_url,
             "https://mods.example.test/mods/demo/download"
         );
+    }
+
+    #[test]
+    fn backfills_display_names_from_the_catalog_cache() {
+        let temp = TempRoot::new("cloud-name-backfill");
+        let paths = temp.paths();
+        let catalog = json!({
+            "mods": [{
+                "id": "demo",
+                "name": "衣物容器嵌套",
+                "sha256": "abcdef0123456789",
+                "type": "clientPak"
+            }]
+        });
+        save_catalog_cache(&paths, "https://mods.example.test", &catalog);
+
+        let mut metadata = crate::metadata::MetadataFile::default();
+        let mut mods = vec![ModEntry {
+            id: "legacy".to_string(),
+            name: "______".to_string(),
+            file_name: "______.pak".to_string(),
+            file_path: String::new(),
+            file_size: 1,
+            last_modified: String::new(),
+            enabled: true,
+            mod_type: "clientPak".to_string(),
+            load_order: 0,
+            tags: Vec::new(),
+            notes: String::new(),
+            sha256: "ABCDEF0123456789".to_string(),
+            origin_source: "local".to_string(),
+            deployed: false,
+            description: String::new(),
+            conflict_count: 0,
+            update_version: None,
+        }];
+
+        assert_eq!(apply_catalog_names(&paths, &mut metadata, &mut mods), 1);
+        assert_eq!(mods[0].name, "衣物容器嵌套");
+        assert_eq!(
+            metadata.entries["legacy"].name.as_deref(),
+            Some("衣物容器嵌套")
+        );
+
+        // 名字已经记下来了，第二次不该重复计数，也不该被缓存覆盖
+        metadata.entries.get_mut("legacy").unwrap().name = Some("用户自己改的名".to_string());
+        assert_eq!(apply_catalog_names(&paths, &mut metadata, &mut mods), 0);
+        assert_eq!(mods[0].name, "用户自己改的名");
     }
 
     #[test]

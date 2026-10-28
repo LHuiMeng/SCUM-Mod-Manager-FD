@@ -1,4 +1,4 @@
-import type { DragEvent } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import type { ModEntry } from "../../types";
 import { formatBytes, formatDate, modMonogram, modTypeLabel } from "../../lib/format";
 import { Icon } from "../ui/Icon";
@@ -7,27 +7,23 @@ import { Toggle } from "../ui/Toggle";
 interface ModRowProps {
   mod: ModEntry;
   selected: boolean;
-  draggable: boolean;
+  sortable: boolean;
+  dragging: boolean;
   dragOver: boolean;
   onSelect: () => void;
   onToggle: (enabled: boolean) => void;
-  onDragStart: (event: DragEvent<HTMLDivElement>) => void;
-  onDragOver: (event: DragEvent<HTMLDivElement>) => void;
-  onDrop: (event: DragEvent<HTMLDivElement>) => void;
-  onDragEnd: () => void;
+  onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
 }
 
 export function ModRow({
   mod,
   selected,
-  draggable,
+  sortable,
+  dragging,
   dragOver,
   onSelect,
   onToggle,
-  onDragStart,
-  onDragOver,
-  onDrop,
-  onDragEnd,
+  onPointerDown,
 }: ModRowProps) {
   const status = mod.updateVersion
     ? `有新版本 ${mod.updateVersion}`
@@ -35,12 +31,23 @@ export function ModRow({
       ? `加载顺序 ${String(mod.loadOrder + 1).padStart(2, "0")}`
       : "已停用";
 
+  const className = [
+    "mod-row",
+    selected ? "is-selected" : "",
+    dragOver ? "is-drag-over" : "",
+    dragging ? "is-dragging" : "",
+    sortable ? "is-sortable" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   return (
     <div
-      className={`mod-row ${selected ? "is-selected" : ""} ${dragOver ? "is-drag-over" : ""}`}
+      className={className}
       role="row"
       tabIndex={0}
       aria-selected={selected}
+      data-mod-id={mod.id}
       onClick={onSelect}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
@@ -48,11 +55,7 @@ export function ModRow({
           onSelect();
         }
       }}
-      draggable={draggable}
-      onDragStart={onDragStart}
-      onDragOver={onDragOver}
-      onDrop={onDrop}
-      onDragEnd={onDragEnd}
+      onPointerDown={onPointerDown}
     >
       <span className="mod-check" aria-hidden="true">
         {selected ? <Icon name="check" size={10} /> : null}
@@ -68,15 +71,15 @@ export function ModRow({
       </div>
       <span className="mod-type">{modTypeLabel(mod.type)}</span>
       <span className="mod-size">{formatBytes(mod.fileSize)}</span>
-      <span onClick={(event) => event.stopPropagation()}>
+      <span onClick={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
         <Toggle
           checked={mod.enabled}
           onChange={onToggle}
           label={mod.enabled ? `停用 ${mod.name}` : `启用 ${mod.name}`}
         />
       </span>
-      {draggable ? (
-        <span className="row-drag" aria-hidden="true">
+      {sortable ? (
+        <span className="row-drag" title="拖动调整加载顺序">
           <Icon name="drag" size={14} />
         </span>
       ) : null}
