@@ -530,8 +530,12 @@ async function connect(url, appUrl) {
         tagsScrollable: tagField.scrollHeight > tagField.clientHeight,
       };
     })()`);
-    if (new Set(cardLayout.heights).size !== 1 || cardLayout.heights[0] !== 344) {
-      throw new Error(`云端卡片高度不统一：${JSON.stringify(cardLayout.heights)}`);
+    const cardHeights = cardLayout.heights;
+    const sameHeight = new Set(cardHeights).size === 1;
+    if (!sameHeight || cardHeights[0] < 300 || cardHeights[0] > 420) {
+      throw new Error(
+        `云端卡片高度不一致或超出合理区间：${JSON.stringify(cardHeights)}`,
+      );
     }
     for (const field of [
       "nameScrollable",

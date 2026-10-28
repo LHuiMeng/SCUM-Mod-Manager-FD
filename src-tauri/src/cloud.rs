@@ -4,7 +4,7 @@ use crate::models::{
     MIN_CLOUD_DOWNLOAD_SEGMENTS,
 };
 use crate::mods::install_ue4ss_zip;
-use crate::paths::{safe_disk_name, AppPaths};
+use crate::paths::{free_space, safe_disk_name, AppPaths};
 use crate::secrets::RuntimeSecrets;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -29,6 +29,8 @@ static DOWNLOAD_CONNECTIONS: OnceLock<Semaphore> = OnceLock::new();
 /// 全局下载连接上限。单模组上限（MAX_CLOUD_DOWNLOAD_SEGMENTS）必须小于它，
 /// 否则一个模组就能占满全部槽位，其它模组的下载只能等它让出。
 const MAX_CLOUD_CONNECTIONS: usize = 256;
+/// 每 4MB 允许增加一路并发。小于 32MB 的文件会被 MIN_CLOUD_DOWNLOAD_SEGMENTS
+/// 的下限顶回 8 路，ramp 只在更大的文件上真正起作用。
 const CONNECTION_RAMP_BYTES: u64 = 4 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
 
@@ -146,6 +148,7 @@ pub async fn fetch_catalog(
                 match response.json::<Value>().await {
                     Ok(value) => {
                         settings.cloud.active_base_url = base.clone();
+                        save_catalog_cache(paths, &base, &value);
                         return parse_catalog(paths, &base, value);
                     }
                     Err(error) => errors.push(format!("{url}: {error}")),
@@ -165,7 +168,17 @@ pub async fn download_remote(
     id: &str,
     on_progress: CloudDownloadProgressCallback,
 ) -> Result<String> {
-    let catalog = fetch_catalog(paths, settings, secrets, access).await?;
+    let catalog = match fetch_catalog(paths, settings, secrets, access).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            // 目录接口抖动不该让已知的 download_url 和 SHA-256 一起失效。
+            let cached = load_catalog_cache(paths).with_context(|| {
+                format!("云端目录不可用（{error:#}），且没有可用的本地目录缓存")
+            })?;
+            eprintln!("云端目录不可用，改用上次成功的本地缓存：{error:#}");
+            cached
+        }
+    };
     let remote = catalog
         .iter()
         .find(|item| item.id == id)
@@ -275,6 +288,17 @@ async fn download_candidate(
     let plan = segment_plan(total, settings.cloud.max_download_segments);
     if plan.workers == 0 || plan.total_chunks == 0 {
         bail!("服务器返回的文件大小为 0，无法分片下载");
+    }
+    if let Some(available) = free_space(directory) {
+        // 分片全部落盘后还要合并出一份完整文件，峰值是两倍大小。
+        let needed = total.saturating_mul(2).saturating_add(64 * 1024 * 1024);
+        if available < needed {
+            bail!(
+                "磁盘空间不足：合并分片需要约 {}，当前可用 {}",
+                human_bytes(needed),
+                human_bytes(available)
+            );
+        }
     }
     notify_download_progress(
         &on_progress,
@@ -478,7 +502,45 @@ async fn download_worker(state: Arc<SegmentedDownloadState>) -> Result<()> {
     }
 }
 
+const CHUNK_RETRIES: usize = 2;
+const CHUNK_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+/// 分片级的临时失败：服务器 5xx/429、字节数不符。这类错误重试有意义，
+/// 4xx 与协议不匹配则直接失败，重试只会浪费时间。
+#[derive(Debug, thiserror::Error)]
+#[error("{reason}")]
+struct RetryableChunkError {
+    reason: String,
+}
+
+fn is_retryable_chunk_error(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<RetryableChunkError>().is_some() {
+        return true;
+    }
+    if let Some(request_error) = error.downcast_ref::<reqwest::Error>() {
+        return request_error.is_timeout()
+            || request_error.is_connect()
+            || request_error.is_request()
+            || request_error.is_body();
+    }
+    error.downcast_ref::<std::io::Error>().is_some()
+}
+
 async fn download_chunk(state: &SegmentedDownloadState, index: usize) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        match download_chunk_once(state, index).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < CHUNK_RETRIES && is_retryable_chunk_error(&error) => {
+                attempt += 1;
+                tokio::time::sleep(CHUNK_RETRY_DELAY * attempt as u32).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn download_chunk_once(state: &SegmentedDownloadState, index: usize) -> Result<()> {
     let start = (index as u64)
         .checked_mul(state.plan.chunk_size)
         .context("分片起点溢出")?;
@@ -499,11 +561,15 @@ async fn download_chunk(state: &SegmentedDownloadState, index: usize) -> Result<
         state.access,
     );
     let response = request.send().await.context("分片请求失败")?;
-    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        bail!(
-            "分片请求返回 HTTP {}，服务器可能忽略了 Range",
-            response.status()
-        );
+    let status = response.status();
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(RetryableChunkError {
+                reason: format!("分片请求返回 HTTP {status}"),
+            }
+            .into());
+        }
+        bail!("分片请求返回 HTTP {status}，服务器可能忽略了 Range");
     }
     let content_range = response
         .headers()
@@ -534,18 +600,40 @@ async fn download_chunk(state: &SegmentedDownloadState, index: usize) -> Result<
         .with_context(|| format!("无法创建分片文件 {}", part_path.display()))?;
     let mut stream = response.bytes_stream();
     let mut received = 0_u64;
+    // 中途失败时把已经计进总进度的字节扣回去，否则重试会让进度虚高。
+    macro_rules! rollback {
+        () => {
+            state.downloaded.fetch_sub(received, Ordering::Relaxed);
+        };
+    }
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("分片数据流中断")?;
-        file.write_all(&chunk).await?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                rollback!();
+                return Err(error).context("分片数据流中断");
+            }
+        };
+        if let Err(error) = file.write_all(&chunk).await {
+            rollback!();
+            return Err(error).context("分片写入失败");
+        }
         received += chunk.len() as u64;
         state
             .downloaded
             .fetch_add(chunk.len() as u64, Ordering::Relaxed);
         state.report_downloading(false);
     }
-    file.flush().await?;
+    if let Err(error) = file.flush().await {
+        rollback!();
+        return Err(error).context("分片写入失败");
+    }
     if received != expected {
-        bail!("分片字节数不匹配：期望 {expected}，实际 {received}");
+        rollback!();
+        return Err(RetryableChunkError {
+            reason: format!("分片字节数不匹配：期望 {expected}，实际 {received}"),
+        }
+        .into());
     }
     state.report_downloading(true);
     Ok(())
@@ -753,6 +841,59 @@ fn is_configured_cloud_origin(settings: &AppSettings, url: &Url) -> bool {
 
 fn download_source_allowed(settings: &AppSettings, url: &Url, has_declared_hash: bool) -> bool {
     has_declared_hash || is_configured_cloud_origin(settings, url)
+}
+
+fn catalog_cache_file(paths: &AppPaths) -> PathBuf {
+    paths.root.join("cache").join("cloud_catalog.json")
+}
+
+/// 记住最后一次成功拉到的目录，供目录接口抖动时回退使用。
+fn save_catalog_cache(paths: &AppPaths, base: &str, catalog: &Value) {
+    let file = catalog_cache_file(paths);
+    let Some(parent) = file.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "base": base,
+        "savedAt": Utc::now().to_rfc3339(),
+        "catalog": catalog,
+    });
+    if let Ok(bytes) = serde_json::to_vec(&payload) {
+        let _ = std::fs::write(&file, bytes);
+    }
+}
+
+fn load_catalog_cache(paths: &AppPaths) -> Result<Vec<RemoteMod>> {
+    let file = catalog_cache_file(paths);
+    let bytes =
+        std::fs::read(&file).with_context(|| format!("无法读取云端目录缓存 {}", file.display()))?;
+    let payload: Value = serde_json::from_slice(&bytes).context("云端目录缓存格式无效")?;
+    let base = payload
+        .get("base")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let catalog = payload
+        .get("catalog")
+        .cloned()
+        .context("云端目录缓存缺少目录内容")?;
+    parse_catalog(paths, base, catalog)
+}
+
+fn human_bytes(value: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if value < 1024 {
+        return format!("{value} B");
+    }
+    let mut size = value as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
 }
 
 fn download_message(remote: &RemoteMod, verified: bool) -> String {
@@ -971,9 +1112,10 @@ fn timestamp(value: Option<&Value>) -> Option<String> {
 mod tests {
     use super::{
         allowed_cloud_transport, declared_ue4ss, download_remote, download_source_allowed,
-        fetch_catalog, install_downloaded, ordered_urls, parse_catalog, remote_filename,
+        fetch_catalog, human_bytes, install_downloaded, is_retryable_chunk_error,
+        load_catalog_cache, ordered_urls, parse_catalog, remote_filename, save_catalog_cache,
         segment_plan, should_attach_credentials, AppSettings, CloudAccess,
-        CloudDownloadProgressCallback, RuntimeSecrets,
+        CloudDownloadProgressCallback, RetryableChunkError, RuntimeSecrets,
     };
     use crate::edition::Edition;
     use crate::models::{CloudDownloadProgress, RemoteMod};
@@ -986,7 +1128,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
@@ -1010,6 +1152,20 @@ mod tests {
         }
 
         fn with_range(expected_sha256: String, download_status: u16, supports_range: bool) -> Self {
+            Self::build(expected_sha256, download_status, supports_range, 0)
+        }
+
+        /// 前 `failures` 个分片请求返回 503，用来验证分片级重试。
+        fn with_flaky(expected_sha256: String, failures: usize) -> Self {
+            Self::build(expected_sha256, 200, true, failures)
+        }
+
+        fn build(
+            expected_sha256: String,
+            download_status: u16,
+            supports_range: bool,
+            failures: usize,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
@@ -1028,6 +1184,8 @@ mod tests {
             let captured = Arc::new(Mutex::new(Vec::new()));
             let thread_stop = stop.clone();
             let thread_captured = captured.clone();
+            let flaky = Arc::new(AtomicUsize::new(failures));
+            let thread_flaky = flaky.clone();
             let handle = thread::spawn(move || {
                 while !thread_stop.load(Ordering::Relaxed) {
                     match listener.accept() {
@@ -1038,6 +1196,7 @@ mod tests {
                             download_status,
                             supports_range,
                             &thread_captured,
+                            &thread_flaky,
                         ),
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(2));
@@ -1081,6 +1240,7 @@ mod tests {
         download_status: u16,
         supports_range: bool,
         captured: &Mutex<Vec<CapturedRequest>>,
+        flaky: &AtomicUsize,
     ) {
         stream.set_nonblocking(false).unwrap();
         stream
@@ -1162,6 +1322,17 @@ mod tests {
                 "text/plain",
                 b"range invalid",
                 &[("Content-Range", format!("bytes */{}", file_body.len()))],
+            );
+            return;
+        }
+        if end > 0 && flaky.load(Ordering::Relaxed) > 0 {
+            flaky.fetch_sub(1, Ordering::Relaxed);
+            write_response(
+                &mut stream,
+                503,
+                "text/plain",
+                b"temporarily unavailable",
+                &[],
             );
             return;
         }
@@ -1903,5 +2074,111 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("不是 ZIP"));
+    }
+
+    #[test]
+    fn retries_a_flaky_chunk_instead_of_failing_the_download() {
+        let temp = TempRoot::new("cloud-download-retry");
+        let paths = temp.paths();
+        let server = MockServer::with_flaky(file_sha256(), 1);
+        let mut settings = AppSettings {
+            cloud: crate::models::CloudSettings {
+                base_urls: vec![server.base_url.clone()],
+                active_base_url: String::new(),
+                max_download_segments: 16,
+            },
+            ..AppSettings::default()
+        };
+        let secrets = load_runtime_secrets(&paths, Edition::Public);
+
+        let result = test_runtime()
+            .block_on(download_remote(
+                &paths,
+                &mut settings,
+                &secrets,
+                CloudAccess::Public,
+                "demo",
+                no_progress(),
+            ))
+            .unwrap();
+
+        assert!(result.contains("SHA-256 校验"));
+        assert!(paths.local_mods.join("Demo.pak").exists());
+        assert_eq!(server.finish().len(), expected_segmented_requests(16) + 1);
+    }
+
+    #[test]
+    fn gives_up_after_the_retry_budget_is_spent() {
+        let temp = TempRoot::new("cloud-download-retry-exhausted");
+        let paths = temp.paths();
+        let server = MockServer::with_flaky(file_sha256(), 500);
+        let mut settings = AppSettings {
+            cloud: crate::models::CloudSettings {
+                base_urls: vec![server.base_url.clone()],
+                active_base_url: String::new(),
+                max_download_segments: 16,
+            },
+            ..AppSettings::default()
+        };
+        let secrets = load_runtime_secrets(&paths, Edition::Public);
+
+        let error = test_runtime()
+            .block_on(download_remote(
+                &paths,
+                &mut settings,
+                &secrets,
+                CloudAccess::Public,
+                "demo",
+                no_progress(),
+            ))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("HTTP 503"));
+        assert!(!paths.local_mods.join("Demo.pak").exists());
+        let _ = server.finish();
+    }
+
+    #[test]
+    fn round_trips_the_catalog_cache() {
+        let temp = TempRoot::new("cloud-catalog-cache");
+        let paths = temp.paths();
+        let catalog = json!({
+            "mods": [{
+                "id": "demo",
+                "name": "Demo",
+                "sha256": "abc123",
+                "type": "clientPak"
+            }]
+        });
+
+        save_catalog_cache(&paths, "https://mods.example.test", &catalog);
+        let mods = load_catalog_cache(&paths).unwrap();
+
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].id, "demo");
+        assert_eq!(mods[0].sha256, "abc123");
+        assert_eq!(
+            mods[0].download_url,
+            "https://mods.example.test/mods/demo/download"
+        );
+    }
+
+    #[test]
+    fn formats_human_readable_sizes() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(64 * 1024 * 1024), "64.0 MB");
+    }
+
+    #[test]
+    fn retries_only_transient_chunk_errors() {
+        let transient: anyhow::Error = RetryableChunkError {
+            reason: "分片请求返回 HTTP 503".to_string(),
+        }
+        .into();
+        assert!(is_retryable_chunk_error(&transient));
+
+        let fatal = anyhow::anyhow!("分片响应区间不匹配");
+        assert!(!is_retryable_chunk_error(&fatal));
     }
 }

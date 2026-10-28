@@ -92,6 +92,9 @@ git log --oneline -1
 - 本地 PAK：`{root}/~mods/`
 - UE4SS：`{root}/ue4ss_runtime/`
 - 部署清单：`{root}/deployment_manifest.json`
+- 云端目录缓存：`{root}/cache/cloud_catalog.json`（目录接口抖动时供下载回退）
+- 下载暂存：`{root}/downloads/`，24 小时前的残留会在启动时清理
+- 覆盖前备份：`{root}/backups/`
 - 日志：`{root}/logs/runtime.jsonl`
 - 凭据：`{root}/secrets/`，SFTP 密码使用 Windows DPAPI 加密保存为 `*.bin`
 - Tauri、WebView2 的缓存也通过 `appDirectoriesOverride` 指向该目录

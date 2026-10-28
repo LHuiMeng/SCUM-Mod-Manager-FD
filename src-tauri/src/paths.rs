@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone)]
@@ -81,6 +82,7 @@ impl AppPaths {
             .with_context(|| format!("无法创建 UE4SS 目录 {}", self.ue4ss_mods.display()))?;
         std::fs::create_dir_all(&self.logs_dir)
             .with_context(|| format!("无法创建日志目录 {}", self.logs_dir.display()))?;
+        prune_stale_downloads(&self.root);
         Ok(())
     }
 
@@ -198,6 +200,66 @@ pub fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// 下载暂存目录的保留时长。超过这个时间的残留（进程崩溃、断电）在启动时清掉。
+const STALE_DOWNLOAD_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// 清理 `{root}/downloads` 下过期的分片目录与临时文件，只动这一个目录。
+pub fn prune_stale_downloads(root: &Path) {
+    let downloads = root.join("downloads");
+    let Ok(entries) = std::fs::read_dir(&downloads) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < STALE_DOWNLOAD_AGE {
+            continue;
+        }
+        let path = entry.path();
+        if metadata.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// 目标路径所在卷的可用字节数。非 Windows 平台返回 `None`，调用方需容忍未知。
+#[cfg(windows)]
+pub fn free_space(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0_u64;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(available)
+}
+
+#[cfg(not(windows))]
+pub fn free_space(_path: &Path) -> Option<u64> {
+    None
+}
+
 pub fn is_within(path: &Path, root: &Path) -> bool {
     let normalized_path = normalize_for_compare(path);
     let normalized_root = normalize_for_compare(root);
@@ -215,8 +277,14 @@ fn normalize_for_compare(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_within, resolve_data_root, safe_disk_name, safe_file_component};
+    use super::{
+        free_space, is_within, prune_stale_downloads, resolve_data_root, safe_disk_name,
+        safe_file_component,
+    };
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+    use uuid::Uuid;
 
     #[test]
     fn default_data_root_stays_next_to_the_program() {
@@ -290,5 +358,35 @@ mod tests {
         let name = safe_disk_name(&long, "mod");
         assert_eq!(name.chars().count(), 80);
         assert!(name.starts_with("超长模组名称"));
+    }
+
+    #[test]
+    fn prunes_only_stale_download_artifacts() {
+        let root = std::env::temp_dir().join(format!("scum-mod-prune-{}", Uuid::new_v4()));
+        let downloads = root.join("downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        let stale = downloads.join("old.parts");
+        fs::write(&stale, b"x").unwrap();
+        let fresh = downloads.join("new.parts");
+        fs::write(&fresh, b"x").unwrap();
+
+        let aged = fs::OpenOptions::new().write(true).open(&stale).unwrap();
+        let two_days_ago = SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        aged.set_times(fs::FileTimes::new().set_modified(two_days_ago))
+            .unwrap();
+        drop(aged);
+
+        prune_stale_downloads(&root);
+
+        assert!(!stale.exists(), "48 小时前的残留应被清掉");
+        assert!(fresh.exists(), "新文件不能被误删");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn free_space_reads_the_volume_of_a_real_directory() {
+        let available = free_space(&std::env::temp_dir()).expect("Windows 上应能读到卷可用空间");
+        assert!(available > 0, "可用空间应为正数");
     }
 }
