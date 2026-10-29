@@ -1,7 +1,37 @@
-# SCUM Mod Desk v3
+# SCUM Mod Manager FD · v3
 
-《SCUM》Windows 模组管理器的 Rust/Tauri 重写版本。前端使用 React + TypeScript，
-桌面后端、文件系统操作、进程管理、云目录与 SFTP 全部由 Rust 执行。
+[![CI](https://github.com/LHuiMeng/SCUM-Mod-Manager-FD/actions/workflows/ci.yml/badge.svg)](https://github.com/LHuiMeng/SCUM-Mod-Manager-FD/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/LHuiMeng/SCUM-Mod-Manager-FD?display_name=tag&label=release)](https://github.com/LHuiMeng/SCUM-Mod-Manager-FD/releases/latest)
+[![License](https://img.shields.io/github/license/LHuiMeng/SCUM-Mod-Manager-FD)](LICENSE)
+
+《SCUM》Windows 模组管理器的 Rust/Tauri 重写版本。React + TypeScript 负责界面，
+文件系统、进程、网络、云目录、SFTP 与凭据操作全部由 Rust 后端执行。
+
+旧版 Flutter 实现已完整归档到
+[`archive/flutter-v2.6.5`](https://github.com/LHuiMeng/SCUM-Mod-Manager-FD/tree/archive/flutter-v2.6.5)
+分支和同名 tag；`main` 分支自 v3.0.0 起为 Rust/Tauri 架构。
+
+## 下载
+
+前往 [GitHub Releases](https://github.com/LHuiMeng/SCUM-Mod-Manager-FD/releases/latest)
+下载 Windows x64 安装包或便携包。
+
+程序必须安装到用户可写的非 C 盘目录，例如 `R:\SCUM Mod Desk`。不要安装到
+`Program Files`；配置、模组、日志和凭据都会写入程序目录下的 `app-data/`。
+
+## 预览
+
+| 亮色模组库 | 暗色模组库 |
+| --- | --- |
+| ![亮色模组库](docs/screenshots/library-light.png) | ![暗色模组库](docs/screenshots/library-dark.png) |
+
+| 资源冲突检查 | 云端目录 |
+| --- | --- |
+| ![资源冲突检查](docs/screenshots/conflict.png) | ![云端目录](docs/screenshots/cloud.png) |
+
+| 远程服务器 | 设置 |
+| --- | --- |
+| ![远程服务器](docs/screenshots/server.png) | ![设置](docs/screenshots/settings.png) |
 
 ## 功能
 

@@ -4,7 +4,7 @@ version = "3.0.0"
 description = "SCUM Mod Desk rebuilt with Tauri and Rust"
 authors = ["LHuiMeng"]
 license = "MIT"
-repository = "https://github.com/LHuiMeng/SCUM-Mod-Desk-v3"
+repository = "https://github.com/LHuiMeng/SCUM-Mod-Manager-FD"
 edition = "2021"
 rust-version = "1.90"
 

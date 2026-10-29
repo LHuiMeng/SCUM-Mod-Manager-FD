@@ -3,6 +3,10 @@
   "private": true,
   "version": "3.0.0",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LHuiMeng/SCUM-Mod-Manager-FD.git"
+  },
   "scripts": {
     "dev": "vite",
     "build": "npm run typecheck && vite build",
