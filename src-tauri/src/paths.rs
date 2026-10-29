@@ -12,6 +12,7 @@ pub struct AppPaths {
     pub ue4ss_mods: PathBuf,
     pub config_file: PathBuf,
     pub metadata_file: PathBuf,
+    pub locales_dir: PathBuf,
     pub deployment_manifest: PathBuf,
     pub logs_dir: PathBuf,
     pub sftp_known_hosts: PathBuf,
@@ -46,6 +47,7 @@ impl AppPaths {
             ue4ss_mods: root.join("ue4ss_runtime").join("ue4ss").join("Mods"),
             config_file: root.join("config.json"),
             metadata_file: root.join("mods_meta.json"),
+            locales_dir: root.join("locales"),
             deployment_manifest: root.join("deployment_manifest.json"),
             logs_dir: root.join("logs"),
             sftp_known_hosts: root.join("secrets").join("sftp_known_hosts.json"),
@@ -82,6 +84,8 @@ impl AppPaths {
             .with_context(|| format!("无法创建 UE4SS 目录 {}", self.ue4ss_mods.display()))?;
         std::fs::create_dir_all(&self.logs_dir)
             .with_context(|| format!("无法创建日志目录 {}", self.logs_dir.display()))?;
+        std::fs::create_dir_all(&self.locales_dir)
+            .with_context(|| format!("无法创建翻译目录 {}", self.locales_dir.display()))?;
         prune_stale_downloads(&self.root);
         Ok(())
     }
@@ -127,6 +131,7 @@ impl AppPaths {
             ue4ss_mods: root.join("ue4ss_runtime").join("ue4ss").join("Mods"),
             config_file: root.join("config.json"),
             metadata_file: root.join("mods_meta.json"),
+            locales_dir: root.join("locales"),
             deployment_manifest: root.join("deployment_manifest.json"),
             logs_dir: root.join("logs"),
             sftp_known_hosts: root.join("secrets").join("sftp_known_hosts.json"),

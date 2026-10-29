@@ -1,15 +1,17 @@
 import { useMemo, useState } from "react";
 import type { AppEdition, CloudDownloadProgress, RemoteMod } from "../../types";
+import { useI18n } from "../../i18n";
 import {
   cloudDownloadDetail,
   cloudDownloadIsActive,
   cloudDownloadPercent,
   cloudDownloadPhaseLabel,
 } from "../../lib/cloudDownload";
-import { formatBytes, formatDate, modMonogram, modTypeLabel } from "../../lib/format";
+import { formatBytes, formatDate, modTypeKey } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
 import { Icon } from "../ui/Icon";
+import { ModCover } from "../ui/ModCover";
 import { SearchField } from "../ui/SearchField";
 import { Tag } from "../ui/Tag";
 
@@ -38,6 +40,7 @@ export function CloudScreen({
   onDownload,
   onOpenSettings,
 }: CloudScreenProps) {
+  const { t, language } = useI18n();
   const [search, setSearch] = useState("");
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -46,24 +49,32 @@ export function CloudScreen({
       [mod.name, mod.author, mod.description, ...mod.tags].join(" ").toLowerCase().includes(query),
     );
   }, [mods, search]);
+  const installedCount = useMemo(
+    () => mods.filter((mod) => mod.installed).length,
+    [mods],
+  );
   return (
     <section className="page page-cloud">
       <header className="page-header">
         <div>
-          <h1>云端目录</h1>
-          <p>从云源安装模组，下载完成后自动进入本地库。</p>
+          <h1>{t("cloud.title")}</h1>
+          <p>{t("cloud.subtitle")}</p>
         </div>
         <div className="heading-tools">
-          <SearchField value={search} onChange={setSearch} placeholder="搜索云端模组" />
+          <SearchField
+            value={search}
+            onChange={setSearch}
+            placeholder={t("cloud.searchPlaceholder")}
+          />
           <Button
             icon="refresh"
             onClick={onRefresh}
             disabled={loading}
           >
-            {loading ? "正在获取" : "刷新目录"}
+            {loading ? t("cloud.loading") : t("cloud.refresh")}
           </Button>
           <Button icon="settings" onClick={onOpenSettings}>
-            云源设置
+            {t("cloud.settings")}
           </Button>
         </div>
       </header>
@@ -73,38 +84,50 @@ export function CloudScreen({
           <Icon name={edition === "server" ? "lock" : "cloud"} size={15} />
         </span>
         <div>
-          <b>{edition === "server" ? "服务器版目录" : "公开版目录"}</b>
+          <b>
+            {t(edition === "server" ? "cloud.edition.server" : "cloud.edition.public")}
+          </b>
           <span>
-            {edition === "server"
-              ? "内置共享凭据，可读取公开模组与服务器版模组。"
-              : "此安装包不含私人凭据，只能读取公开模组。"}
+            {t(
+              edition === "server"
+                ? "cloud.edition.serverDetail"
+                : "cloud.edition.publicDetail",
+            )}
           </span>
         </div>
+        {configured && !error && mods.length > 0 ? (
+          <span className="cloud-edition-meta">
+            {t("cloud.meta.count", { count: mods.length })}
+            {installedCount > 0
+              ? t("cloud.meta.installed", { count: installedCount })
+              : ""}
+          </span>
+        ) : null}
       </section>
 
       {!configured ? (
         <EmptyState
           icon="cloud"
-          title="尚未配置云源"
-          description="安装包没有预置可用云源。请先在设置中配置线路，或安装带默认云源的正式版本。"
+          title={t("cloud.empty.unconfiguredTitle")}
+          description={t("cloud.empty.unconfiguredDescription")}
           action={
             <Button variant="primary" onClick={onOpenSettings}>
-              打开云源设置
+              {t("cloud.empty.openSettings")}
             </Button>
           }
         />
       ) : error ? (
         <EmptyState
           icon="cloud"
-          title="无法连接云服务器"
+          title={t("cloud.empty.unreachableTitle")}
           description={error}
-          action={<Button onClick={onRefresh}>重新尝试</Button>}
+          action={<Button onClick={onRefresh}>{t("common.retry")}</Button>}
         />
       ) : filtered.length === 0 && !loading ? (
         <EmptyState
           icon="cloud"
-          title="目录中没有匹配项"
-          description="换一个关键词，或者刷新云端目录。"
+          title={t("cloud.empty.noMatchTitle")}
+          description={t("cloud.empty.noMatchDescription")}
         />
       ) : (
         <div className="remote-grid">
@@ -112,13 +135,20 @@ export function CloudScreen({
             const progress = downloads[mod.id];
             const active = progress ? cloudDownloadIsActive(progress) : false;
             const percent = progress ? cloudDownloadPercent(progress) : 0;
-            const detail = progress ? cloudDownloadDetail(progress) : "";
-            const activeLabel = progress ? cloudDownloadPhaseLabel(progress.phase) : "";
+            const detail = progress ? cloudDownloadDetail(progress, t) : "";
+            const activeLabel = progress
+              ? cloudDownloadPhaseLabel(progress.phase, t)
+              : "";
             const done = progress?.phase === "completed";
             return (
-              <article className="remote-card" key={mod.id}>
+              <article className="remote-card" key={mod.id} data-mod-type={mod.type}>
                 <header>
-                  <span className="remote-mark">{modMonogram(mod.name)}</span>
+                  <ModCover
+                    name={mod.name}
+                    src={mod.coverUrl}
+                    className="remote-mark"
+                    imageClassName="remote-mark-image"
+                  />
                   <div className="remote-identity">
                     <b className="remote-name" title={mod.name}>
                       {mod.name}
@@ -128,20 +158,22 @@ export function CloudScreen({
                     </span>
                   </div>
                   <div className="remote-badges">
-                    <span className="remote-state">{modTypeLabel(mod.type)}</span>
-                    {mod.installed ? <span className="remote-installed">已安装</span> : null}
+                    <span className="remote-state">{t(modTypeKey(mod.type))}</span>
+                    {mod.installed ? (
+                      <span className="remote-installed">{t("cloud.installed")}</span>
+                    ) : null}
                   </div>
                 </header>
 
                 <p className="remote-description" title={mod.description || undefined}>
-                  {mod.description || "暂无模组描述"}
+                  {mod.description || t("cloud.noDescription")}
                 </p>
 
                 <div className="remote-tags">
                   {mod.tags.length > 0 ? (
                     mod.tags.slice(0, 4).map((tag) => <Tag key={tag}>{tag}</Tag>)
                   ) : (
-                    <span className="remote-empty-label">暂无标签</span>
+                    <span className="remote-empty-label">{t("cloud.noTags")}</span>
                   )}
                   {mod.tags.length > 4 ? (
                     <span className="remote-empty-label">+{mod.tags.length - 4}</span>
@@ -153,18 +185,18 @@ export function CloudScreen({
                     {done ? (
                       <div className="remote-download-done">
                         <Icon name="check" size={13} />
-                        <span>已安装到本地库</span>
+                        <span>{t("cloud.installedLocal")}</span>
                       </div>
                     ) : (
                       <>
                         <div className="remote-download-top">
-                          <span>{cloudDownloadPhaseLabel(progress.phase)}</span>
+                          <span>{cloudDownloadPhaseLabel(progress.phase, t)}</span>
                           <b>{percent}%</b>
                         </div>
                         <div
                           className="remote-progress-track"
                           role="progressbar"
-                          aria-label={`${mod.name} 下载进度`}
+                          aria-label={t("cloud.downloadProgress", { name: mod.name })}
                           aria-valuemin={0}
                           aria-valuemax={100}
                           aria-valuenow={percent}
@@ -181,7 +213,10 @@ export function CloudScreen({
 
                 <footer>
                   <span>
-                    {formatBytes(mod.fileSize)} · 更新于 {formatDate(mod.updatedAt)}
+                    {formatBytes(mod.fileSize)} ·{" "}
+                    {t("cloud.updatedAt", {
+                      date: formatDate(mod.updatedAt, language),
+                    })}
                   </span>
                   <Button
                     size="sm"
@@ -190,10 +225,10 @@ export function CloudScreen({
                     disabled={!configured || active}
                   >
                     {active
-                      ? `${activeLabel} ${percent}%`
+                      ? activeLabel
                       : mod.installed
-                        ? "重新下载"
-                        : "下载"}
+                        ? t("cloud.downloadAgain")
+                        : t("cloud.download")}
                   </Button>
                 </footer>
               </article>
@@ -205,7 +240,7 @@ export function CloudScreen({
       <div className="page-footnote">
         <Icon name="lock" size={13} />
         <span>
-          下载与校验都由 Rust 后端完成，单模组最多 {maxSegments} 路分片。
+          {t("cloud.footnote", { segments: maxSegments })}
         </span>
       </div>
     </section>

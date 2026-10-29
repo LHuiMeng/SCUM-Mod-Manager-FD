@@ -3,14 +3,14 @@ use crate::cloud;
 use crate::launcher;
 use crate::models::{
     AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, DetectPathsResult, DownloadResult,
-    GameStatus, ImportResult, InstallUpdateResult, LibrarySnapshot, RemoteFile, RemoteMod,
-    RuntimeLog, SftpAccountInput, SftpConnectionResult, UploadResult,
+    GameStatus, ImportResult, InstallUpdateResult, LibrarySnapshot, LocaleBundle, RemoteFile,
+    RemoteMod, RuntimeLog, SftpAccountInput, SftpConnectionResult, UploadResult,
 };
 use crate::paths::path_string;
 use crate::sftp;
 use crate::state::AppState;
 use crate::steam;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
@@ -99,6 +99,27 @@ pub async fn update_mod_metadata(
 }
 
 #[tauri::command]
+pub async fn save_conflict_winners(
+    app: AppHandle,
+    winners: BTreeMap<String, String>,
+) -> Result<LibrarySnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AppState>().save_conflict_winners(winners)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn delete_mod(app: AppHandle, id: String) -> Result<LibrarySnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().delete_mod(&id))
+        .await
+        .map_err(error_text)?
+        .map_err(error_text)
+}
+
+#[tauri::command]
 pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<AppSettings, String> {
     tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().save_settings(settings))
         .await
@@ -109,6 +130,14 @@ pub async fn save_settings(app: AppHandle, settings: AppSettings) -> Result<AppS
 #[tauri::command]
 pub async fn set_theme(app: AppHandle, theme: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().set_theme(&theme))
+        .await
+        .map_err(error_text)?
+        .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn set_language(app: AppHandle, language: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().set_language(&language))
         .await
         .map_err(error_text)?
         .map_err(error_text)
@@ -211,6 +240,19 @@ pub fn clear_logs(state: State<'_, AppState>) {
 #[tauri::command]
 pub fn get_app_info(state: State<'_, AppState>) -> AppInfo {
     state.app_info()
+}
+
+#[tauri::command]
+pub fn get_locale(state: State<'_, AppState>, language: String) -> Result<LocaleBundle, String> {
+    crate::locales::load(&state.paths, &language).map_err(error_text)
+}
+
+#[tauri::command]
+pub fn get_locales(state: State<'_, AppState>) -> Result<Vec<LocaleBundle>, String> {
+    ["zh-CN", "en-US"]
+        .into_iter()
+        .map(|language| crate::locales::load(&state.paths, language).map_err(error_text))
+        .collect()
 }
 
 #[tauri::command]

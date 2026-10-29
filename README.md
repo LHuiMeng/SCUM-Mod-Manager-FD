@@ -6,13 +6,17 @@
 ## 功能
 
 - 扫描、导入和启用本地 `~mods/*.pak`
+- 读取 PAK 内部资源清单，检测已启用模组之间覆盖同一资源的冲突
+- 按完整 SHA-256 合并重复 PAK，并只部署一个主条目
+- 支持 PAK / UE4SS 模组封面与展示说明，模板见 `templates/mod-presentation/`
 - 部署到客户端/服务端 `Paks/~mods/`，覆盖原文件前自动备份，退出后恢复并回收
 - 管理 UE4SS 目录模组并同步 `mods.txt`
-- 拖拽调整 PAK 加载顺序，编辑标签与本地备注
+- 拖拽调整 PAK 加载顺序，编辑标签与本地备注，或把模组安全移入删除备份
 - 从 Steam 注册表和 `libraryfolders.vdf` 检测游戏路径
 - 浏览云模组目录，云目录提供 SHA-256 时强制校验，缺少时明确提示未校验
 - SFTP 浏览、主机指纹确认、连接测试与服务器模组上传
 - 亮色纸张主题与中性石墨暗色主题
+- 简体中文 / English 界面切换，支持用户覆盖翻译文件
 
 ## 技术栈
 
@@ -90,6 +94,7 @@ src/                         React 界面
   api/                       Tauri invoke 与浏览器 mock
   components/                页面、检查器、弹窗与通用控件
   styles/tokens.css          亮色/暗色主题 token
+  i18n/                      内置中英文翻译与 React i18n context
 src-tauri/                   Rust/Tauri 后端
   src/state.rs               应用状态与扫描/元数据
   src/mods/                  PAK 扫描、导入与部署
@@ -97,6 +102,7 @@ src-tauri/                   Rust/Tauri 后端
   src/sftp.rs                SFTP 浏览与上传
   src/secrets.rs             DPAPI 凭据保护
   resources/                 repak.exe 与 UE4SS 框架
+templates/mod-presentation/  模组封面与 mod.json 展示约定
 secrets/                     被 Git 隔离的本地敏感配置
 ```
 
@@ -113,8 +119,25 @@ app-data/
   ue4ss_runtime/
   backups/deploy/
   logs/
+  locales/                  用户翻译覆盖（JSON，key 可局部覆盖）
   secrets/
 ```
+
+### 界面翻译
+
+语言保存在 `config.json` 的 `language` 字段（`zh-CN` 或 `en-US`），界面切换会
+立即写入 `localStorage` 并尝试持久化到配置。若配置文件写入失败，语言会回退
+到切换前的值。
+
+用户可直接编辑 `app-data/locales/zh-CN.json` 或
+`app-data/locales/en-US.json`，保存后重新切换一次语言（或重启应用）即可生效，
+无需重新编译。只需写需要覆盖的 key，未提供的条目会回退到内置翻译。JSON 支持
+嵌套对象或扁平 key，并支持 `{name}`、`{count}` 形式的插值。
+首次启动会在该目录自动补齐 README 与示例文件，已存在的用户文件不会被覆盖。
+
+示例和完整说明见 `locales/README.md` 与 `locales/example.zh-CN.json`。
+内置字典位于 `src/i18n/locales/`；运行时会向 `app-data/locales/` 补齐完整的
+`zh-CN.example.json`、`en-US.example.json` 和最小覆盖示例。
 
 Tauri 与 WebView2 的缓存也保存在该目录。程序不会再回落到
 `%APPDATA%` 或 `%LOCALAPPDATA%`。升级会保留 `app-data`；便携版可直接删除

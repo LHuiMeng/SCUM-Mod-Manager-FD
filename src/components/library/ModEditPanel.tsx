@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ModEntry } from "../../types";
+import { useI18n } from "../../i18n";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
 import { Modal } from "../ui/Modal";
@@ -11,6 +12,7 @@ interface ModEditPanelProps {
 }
 
 export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
+  const { t } = useI18n();
   const [tags, setTags] = useState(mod.tags);
   const [tagDraft, setTagDraft] = useState("");
   const [notes, setNotes] = useState(mod.notes);
@@ -29,12 +31,12 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
 
   return (
     <Modal
-      title="编辑标签与备注"
-      description={`${mod.name} · 这些信息只保存在当前设备`}
+      title={t("edit.title")}
+      description={t("edit.description", { name: mod.name })}
       onClose={onClose}
       footer={
         <>
-          <Button onClick={onClose}>取消</Button>
+          <Button onClick={onClose}>{t("common.cancel")}</Button>
           <Button
             variant="primary"
             onClick={() => {
@@ -42,13 +44,13 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
               onClose();
             }}
           >
-            保存修改
+            {t("common.save")}
           </Button>
         </>
       }
     >
       <label className="field-label" htmlFor="tag-input">
-        标签
+        {t("edit.tags")}
       </label>
       <div className="tag-editor">
         {tags.map((tag) => (
@@ -57,7 +59,7 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
             className="tag-editor-chip"
             key={tag}
             onClick={() => setTags(tags.filter((item) => item !== tag))}
-            title="点击移除"
+            title={t("edit.removeTag")}
           >
             {tag}
             <Icon name="close" size={10} />
@@ -66,7 +68,7 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
         <input
           id="tag-input"
           value={tagDraft}
-          placeholder="输入后回车添加"
+          placeholder={t("edit.tagPlaceholder")}
           onChange={(event) => setTagDraft(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter") {
@@ -77,14 +79,14 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
         />
       </div>
       <label className="field-label" htmlFor="notes-input">
-        本地备注
+        {t("edit.notes")}
       </label>
       <textarea
         id="notes-input"
         className="note-input"
         value={notes}
         rows={7}
-        placeholder="记录兼容性、服务器用途或测试结果..."
+        placeholder={t("edit.notesPlaceholder")}
         onChange={(event) => setNotes(event.target.value)}
       />
     </Modal>

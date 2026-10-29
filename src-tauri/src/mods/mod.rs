@@ -1,8 +1,10 @@
 use crate::metadata::MetadataFile;
-use crate::models::{ImportResult, ModEntry};
+use crate::models::{ConflictGroup, ImportResult, ModEntry};
 use crate::paths::{path_string, safe_disk_name, AppPaths};
 use anyhow::{Context, Result};
+use base64::Engine;
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -13,13 +15,53 @@ use walkdir::WalkDir;
 use zip::ZipArchive;
 
 pub mod deploy;
+mod duplicates;
+mod pak_scan;
 
+pub use pak_scan::PakScanDiagnostic;
+pub(crate) use pak_scan::{analyze_conflicts, validate_conflict_winners};
+
+#[derive(Debug, Default)]
+pub struct LocalScanResult {
+    pub mods: Vec<ModEntry>,
+    pub diagnostics: Vec<PakScanDiagnostic>,
+}
+
+const MAX_COVER_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PRESENTATION_BYTES: u64 = 64 * 1024;
+const COVER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PresentationFile {
+    author: Option<String>,
+    cover: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct Presentation {
+    author: String,
+    cover_url: Option<String>,
+    description: String,
+}
+
+#[cfg(test)]
 pub fn scan_local_mods(
     paths: &AppPaths,
     metadata: &mut MetadataFile,
     deployed_names: &HashSet<String>,
 ) -> Result<Vec<ModEntry>> {
+    Ok(scan_local_mods_with_diagnostics(paths, metadata, deployed_names)?.mods)
+}
+
+pub fn scan_local_mods_with_diagnostics(
+    paths: &AppPaths,
+    metadata: &mut MetadataFile,
+    deployed_names: &HashSet<String>,
+) -> Result<LocalScanResult> {
     let mut mods = Vec::new();
+    let mut diagnostics = Vec::new();
 
     if paths.local_mods.exists() {
         for entry in std::fs::read_dir(&paths.local_mods)? {
@@ -34,6 +76,7 @@ pub fn scan_local_mods(
                 deployed_names,
                 &path,
                 "clientPak",
+                &mut diagnostics,
             )?);
         }
     }
@@ -53,6 +96,8 @@ pub fn scan_local_mods(
         }
     }
 
+    duplicates::promote_duplicate_metadata(&mods, metadata);
+    let mut mods = duplicates::collapse_identical_mods(mods, metadata);
     let order: HashMap<&str, usize> = metadata
         .order
         .iter()
@@ -74,8 +119,9 @@ pub fn scan_local_mods(
     for (index, item) in mods.iter_mut().enumerate() {
         item.load_order = index;
     }
+    refresh_conflicts(metadata, &mut mods);
     metadata.order = mods.iter().map(|item| item.id.clone()).collect();
-    Ok(mods)
+    Ok(LocalScanResult { mods, diagnostics })
 }
 
 fn build_file_mod(
@@ -84,6 +130,7 @@ fn build_file_mod(
     deployed_names: &HashSet<String>,
     path: &Path,
     mod_type: &str,
+    diagnostics: &mut Vec<PakScanDiagnostic>,
 ) -> Result<ModEntry> {
     let file_name = path
         .file_name()
@@ -95,15 +142,21 @@ fn build_file_mod(
     let modified = std::fs::metadata(path)?.modified().unwrap_or(UNIX_EPOCH);
     let modified_at = epoch_millis(modified);
     let meta = metadata.entry_mut(&id);
-    if !meta.sha256.is_empty()
-        && meta.file_size == Some(file_size)
-        && meta.modified_at == Some(modified_at)
-    {
+    let identity_matches =
+        meta.file_size == Some(file_size) && meta.modified_at == Some(modified_at);
+    if let Some(error) = pak_scan::refresh_pak_cache(meta, file_size, modified_at, || {
+        pak_scan::list_pak_entries(paths, path)
+    }) {
+        diagnostics.push(PakScanDiagnostic {
+            mod_id: id.clone(),
+            file_name: file_name.clone(),
+            message: error,
+        });
+    }
+    if !meta.sha256.is_empty() && identity_matches {
         // Reuse the cached digest when file identity did not change.
     } else {
         meta.sha256 = compute_sha256(path).unwrap_or_default();
-        meta.file_size = Some(file_size);
-        meta.modified_at = Some(modified_at);
     }
 
     let name = meta
@@ -121,10 +174,13 @@ fn build_file_mod(
     let enabled = meta.enabled;
     let sha256 = meta.sha256.clone();
     let conflict_count = meta.conflicts.len();
+    let presentation =
+        read_presentation(path.parent().unwrap_or(&paths.local_mods), Some(&file_name));
 
     Ok(ModEntry {
         id,
         name: name.clone(),
+        author: presentation.author.clone(),
         file_name: file_name.clone(),
         file_path: path_string(path),
         file_size,
@@ -137,10 +193,56 @@ fn build_file_mod(
         sha256,
         origin_source: "local".to_string(),
         deployed: deployed_names.contains(&file_name.to_ascii_lowercase()),
-        description: infer_description(&name, mod_type),
+        description: if presentation.description.is_empty() {
+            infer_description(&name, mod_type)
+        } else {
+            presentation.description
+        },
         conflict_count,
+        file_count: 0,
+        overridden_file_count: 0,
+        overriding_file_count: 0,
+        fully_overridden: false,
         update_version: None,
+        cover_url: presentation.cover_url,
+        duplicate_count: 0,
+        duplicate_aliases: Vec::new(),
     })
+}
+
+fn apply_conflicts(metadata: &mut MetadataFile, analysis: &pak_scan::ConflictAnalysis) {
+    for entry in metadata.entries.values_mut() {
+        entry.conflicts.clear();
+    }
+    for (id, entry_conflicts) in &analysis.entry_conflicts {
+        if let Some(entry) = metadata.entries.get_mut(id) {
+            entry.conflicts = entry_conflicts.clone();
+        }
+    }
+}
+
+/// Recompute conflict metadata and mirror the counts into the current entries.
+///
+/// This is also used after toggling a mod so the UI does not keep stale conflict
+/// counts until the next full library scan.
+pub fn refresh_conflicts(metadata: &mut MetadataFile, mods: &mut [ModEntry]) -> Vec<ConflictGroup> {
+    let analysis = pak_scan::analyze_conflicts(metadata, mods);
+    metadata.conflict_winners.retain(|key, winner| {
+        analysis
+            .groups
+            .iter()
+            .any(|group| group.key == *key && group.owners.iter().any(|owner| owner.id == *winner))
+    });
+    apply_conflicts(metadata, &analysis);
+    for item in mods {
+        let stats = analysis.stats.get(&item.id).copied().unwrap_or_default();
+        item.file_count = stats.file_count;
+        item.overridden_file_count = stats.overridden_file_count;
+        item.overriding_file_count = stats.overriding_file_count;
+        item.fully_overridden = stats.fully_overridden;
+        item.conflict_count = stats.overridden_file_count + stats.overriding_file_count;
+    }
+    analysis.groups
 }
 
 fn build_directory_mod(
@@ -169,10 +271,12 @@ fn build_directory_mod(
     let notes = meta.notes.clone();
     let enabled = meta.enabled;
     let conflict_count = meta.conflicts.len();
+    let presentation = read_presentation(path, None);
 
     Ok(ModEntry {
         id,
         name: name.clone(),
+        author: presentation.author.clone(),
         file_name: file_name.clone(),
         file_path: path_string(path),
         file_size,
@@ -185,10 +289,172 @@ fn build_directory_mod(
         sha256: String::new(),
         origin_source: "local".to_string(),
         deployed: deployed_names.contains(&file_name.to_ascii_lowercase()),
-        description: infer_description(&file_name, "ue4ssMod"),
+        description: if presentation.description.is_empty() {
+            infer_description(&file_name, "ue4ssMod")
+        } else {
+            presentation.description
+        },
         conflict_count,
+        file_count: 0,
+        overridden_file_count: 0,
+        overriding_file_count: 0,
+        fully_overridden: false,
         update_version: None,
+        cover_url: presentation.cover_url,
+        duplicate_count: 0,
+        duplicate_aliases: Vec::new(),
     })
+}
+
+fn read_presentation(root: &Path, pak_file_name: Option<&str>) -> Presentation {
+    let presentation = read_presentation_json(root, pak_file_name);
+    let mut result = Presentation {
+        author: presentation
+            .author
+            .map(|value| clean_text(&value, 120))
+            .unwrap_or_default(),
+        cover_url: None,
+        description: presentation
+            .description
+            .map(|value| clean_text(&value, 1200))
+            .unwrap_or_default(),
+    };
+    let declared = presentation
+        .cover
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| safe_cover_name(&value));
+    let discovered = declared
+        .and_then(|name| cover_data_url(&root.join(name), root))
+        .or_else(|| discover_cover(root, pak_file_name));
+    result.cover_url = discovered;
+    result
+}
+
+fn read_presentation_json(root: &Path, pak_file_name: Option<&str>) -> PresentationFile {
+    let candidates: Vec<PathBuf> = match pak_file_name {
+        Some(file_name) => {
+            let stem = Path::new(file_name)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            vec![
+                root.join(format!("{stem}.mod.json")),
+                root.join(format!("{stem}.presentation.json")),
+            ]
+        }
+        None => vec![root.join("mod.json"), root.join("presentation.json")],
+    };
+    for path in candidates {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > MAX_PRESENTATION_BYTES {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_slice::<PresentationFile>(&bytes) {
+            return value;
+        }
+    }
+    PresentationFile::default()
+}
+
+fn clean_text(value: &str, max_chars: usize) -> String {
+    value.trim().chars().take(max_chars).collect()
+}
+
+fn safe_cover_name(value: &str) -> Option<String> {
+    let path = Path::new(value.trim());
+    if path.is_absolute()
+        || path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        return None;
+    }
+    let extension = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    COVER_EXTENSIONS.contains(&extension.as_str()).then(|| {
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+fn discover_cover(root: &Path, pak_file_name: Option<&str>) -> Option<String> {
+    match pak_file_name {
+        Some(file_name) => {
+            let stem = Path::new(file_name)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            for extension in COVER_EXTENSIONS {
+                let candidate = root.join(format!("{stem}.cover.{extension}"));
+                if candidate.is_file() {
+                    if let Some(url) = cover_data_url(&candidate, root) {
+                        return Some(url);
+                    }
+                }
+            }
+        }
+        None => {
+            for stem in ["cover", "preview"] {
+                for extension in COVER_EXTENSIONS {
+                    let candidate = root.join(format!("{stem}.{extension}"));
+                    if candidate.is_file() {
+                        if let Some(url) = cover_data_url(&candidate, root) {
+                            return Some(url);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn cover_data_url(path: &Path, root: &Path) -> Option<String> {
+    let canonical_root = root.canonicalize().ok()?;
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(&canonical_root) {
+        return None;
+    }
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_COVER_BYTES {
+        return None;
+    }
+    let extension = canonical
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if !COVER_EXTENSIONS.contains(&extension.as_str()) {
+        return None;
+    }
+    let bytes = std::fs::read(&canonical).ok()?;
+    let mime = image_mime(&extension, &bytes)?;
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+fn image_mime(extension: &str, bytes: &[u8]) -> Option<&'static str> {
+    match extension {
+        "png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => Some("image/png"),
+        "jpg" | "jpeg" if bytes.starts_with(b"\xff\xd8\xff") => Some("image/jpeg"),
+        "webp" if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") => {
+            Some("image/webp")
+        }
+        _ => None,
+    }
 }
 
 pub fn stable_id(directory: &Path, name: &str) -> String {
@@ -295,7 +561,7 @@ pub fn install_ue4ss_zip(
     }
     if contains_pak {
         return extract_zip_matching(paths, archive, &paths.local_mods, replace, |name| {
-            name.to_ascii_lowercase().ends_with(".pak")
+            is_pak_import_asset(name)
         });
     }
 
@@ -357,6 +623,20 @@ pub fn install_ue4ss_zip(
         let _ = std::fs::remove_dir_all(&trash);
     }
     Ok((1, 0))
+}
+
+fn is_pak_import_asset(name: &str) -> bool {
+    let file_name = name
+        .rsplit(|character| character == '/' || character == '\\')
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    file_name.ends_with(".pak")
+        || file_name.ends_with(".mod.json")
+        || file_name.ends_with(".presentation.json")
+        || COVER_EXTENSIONS
+            .iter()
+            .any(|extension| file_name.ends_with(&format!(".cover.{extension}")))
 }
 
 fn zip_wrapper_directory(archive: &mut ZipArchive<File>) -> Result<Option<String>> {
@@ -565,7 +845,11 @@ fn epoch_millis(time: SystemTime) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_zip_file, import_paths, install_ue4ss_zip, scan_local_mods, stable_id};
+    use super::{
+        extract_zip_file, import_paths, install_ue4ss_zip, refresh_conflicts, scan_local_mods,
+        stable_id,
+    };
+    use crate::models::ModEntry;
     use crate::paths::AppPaths;
     use std::collections::HashSet;
     use std::fs::{self, File};
@@ -616,6 +900,184 @@ mod tests {
         assert_eq!(mods.len(), 1);
         assert_eq!(mods[0].name, "衣物容器嵌套");
         assert_eq!(mods[0].file_name, "______.pak");
+    }
+
+    #[test]
+    fn collapses_byte_identical_paks_and_keeps_the_canonical_file() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        fs::write(paths.local_mods.join("Alpha.pak"), b"same pak bytes").unwrap();
+        fs::write(paths.local_mods.join("Zeta.pak"), b"same pak bytes").unwrap();
+        let mut metadata = crate::metadata::MetadataFile::default();
+        let zeta_id = stable_id(&paths.local_mods, "Zeta.pak");
+        metadata.entry_mut(&zeta_id).name = Some("用户保留名".to_string());
+        metadata.entry_mut(&zeta_id).notes = "别名备注".to_string();
+
+        let mods = scan_local_mods(&paths, &mut metadata, &HashSet::new()).unwrap();
+
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].file_name, "Alpha.pak");
+        assert_eq!(mods[0].duplicate_count, 1);
+        assert_eq!(mods[0].duplicate_aliases.len(), 1);
+        assert_eq!(mods[0].name, "用户保留名");
+        assert_eq!(mods[0].notes, "别名备注");
+        assert_eq!(
+            metadata.entries[&mods[0].id].name.as_deref(),
+            Some("用户保留名")
+        );
+        assert!(metadata.entries.contains_key(&zeta_id));
+        assert_eq!(metadata.order, vec![mods[0].id.clone()]);
+    }
+
+    #[test]
+    fn reads_pak_sidecar_presentation_and_cover() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        fs::write(paths.local_mods.join("Weapon.pak"), b"pak-body").unwrap();
+        fs::write(
+            paths.local_mods.join("Weapon.mod.json"),
+            r#"{
+                "author": "IslandWorks",
+                "description": "替换武器外观，不改动数值。",
+                "cover": "Weapon.cover.png"
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            paths.local_mods.join("Weapon.cover.png"),
+            b"\x89PNG\r\n\x1a\npreview",
+        )
+        .unwrap();
+
+        let mods = scan_local_mods(
+            &paths,
+            &mut crate::metadata::MetadataFile::default(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(mods[0].author, "IslandWorks");
+        assert_eq!(mods[0].description, "替换武器外观，不改动数值。");
+        assert!(mods[0]
+            .cover_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+    }
+
+    #[test]
+    fn discovers_conventional_cover_and_rejects_fake_or_oversized_images() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        fs::write(paths.local_mods.join("CleanHUD.pak"), b"pak-body").unwrap();
+        fs::write(paths.local_mods.join("CleanHUD.cover.jpg"), b"not-a-jpeg").unwrap();
+        fs::write(
+            paths.local_mods.join("CleanHUD.cover.webp"),
+            b"RIFF\x0c\0\0\0WEBPpreview",
+        )
+        .unwrap();
+
+        let mods = scan_local_mods(
+            &paths,
+            &mut crate::metadata::MetadataFile::default(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(mods[0]
+            .cover_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("data:image/webp;base64,")));
+
+        fs::remove_file(paths.local_mods.join("CleanHUD.cover.webp")).unwrap();
+        fs::write(paths.local_mods.join("CleanHUD.cover.png"), b"not-a-png").unwrap();
+        let mods = scan_local_mods(
+            &paths,
+            &mut crate::metadata::MetadataFile::default(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(mods[0].cover_url, None);
+
+        let mut oversized = b"\x89PNG\r\n\x1a\n".to_vec();
+        oversized.resize((2 * 1024 * 1024 + 1) as usize, 0);
+        fs::write(paths.local_mods.join("CleanHUD.cover.png"), oversized).unwrap();
+        let mods = scan_local_mods(
+            &paths,
+            &mut crate::metadata::MetadataFile::default(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(mods[0].cover_url, None);
+    }
+
+    #[test]
+    fn reads_ue4ss_presentation_from_the_module_directory() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        let module = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(
+            module.join("presentation.json"),
+            br#"{"author":"Northstar"}"#,
+        )
+        .unwrap();
+        fs::write(module.join("preview.png"), b"\x89PNG\r\n\x1a\npreview").unwrap();
+
+        let mods = scan_local_mods(
+            &paths,
+            &mut crate::metadata::MetadataFile::default(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].author, "Northstar");
+        assert!(mods[0]
+            .cover_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+    }
+
+    #[test]
+    fn refreshes_conflict_counts_when_enabled_state_changes() {
+        let mut metadata = crate::metadata::MetadataFile::default();
+        metadata.entry_mut("first").pak_entries = vec!["SCUM/Content/Shared.uasset".to_string()];
+        metadata.entry_mut("second").pak_entries = vec!["scum/content/shared.uasset".to_string()];
+        let mut mods = vec![
+            ModEntry {
+                id: "first".to_string(),
+                mod_type: "clientPak".to_string(),
+                enabled: true,
+                ..ModEntry::default()
+            },
+            ModEntry {
+                id: "second".to_string(),
+                mod_type: "clientPak".to_string(),
+                enabled: true,
+                ..ModEntry::default()
+            },
+        ];
+
+        refresh_conflicts(&mut metadata, &mut mods);
+        assert_eq!(
+            mods.iter()
+                .map(|item| item.conflict_count)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+
+        mods[1].enabled = false;
+        metadata.entry_mut("second").enabled = false;
+        refresh_conflicts(&mut metadata, &mut mods);
+        assert_eq!(
+            mods.iter()
+                .map(|item| item.conflict_count)
+                .collect::<Vec<_>>(),
+            vec![0, 0]
+        );
+        assert!(metadata
+            .entries
+            .values()
+            .all(|entry| entry.conflicts.is_empty()));
     }
 
     #[test]
@@ -826,6 +1288,41 @@ mod tests {
             writer.write_all(body).unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn imports_pak_presentation_sidecars_from_zip() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        let archive = temp.path().join("WeaponPack.zip");
+        write_zip(
+            &archive,
+            &[
+                ("pack/Weapon.pak", b"pak"),
+                (
+                    "pack/Weapon.mod.json",
+                    br#"{"author":"IslandWorks","cover":"Weapon.cover.png"}"#,
+                ),
+                ("pack/Weapon.cover.png", b"\x89PNG\r\n\x1a\npreview"),
+                ("pack/readme.txt", b"ignored"),
+            ],
+        );
+
+        let result = import_paths(&paths, &[archive.to_string_lossy().into_owned()]).unwrap();
+
+        assert_eq!(result.imported, 3);
+        assert!(paths.local_mods.join("Weapon.pak").is_file());
+        assert!(paths.local_mods.join("Weapon.mod.json").is_file());
+        assert!(paths.local_mods.join("Weapon.cover.png").is_file());
+        assert!(!paths.local_mods.join("readme.txt").exists());
+        let mods = scan_local_mods(
+            &paths,
+            &mut crate::metadata::MetadataFile::default(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(mods[0].author, "IslandWorks");
+        assert!(mods[0].cover_url.is_some());
     }
 
     #[test]

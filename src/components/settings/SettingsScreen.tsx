@@ -5,8 +5,10 @@ import type {
   AppUpdateInfo,
   AppUpdatePhase,
   AppUpdateProgress,
+  Language,
   ThemeMode,
 } from "../../types";
+import { SUPPORTED_LANGUAGES, useI18n } from "../../i18n";
 import { clampCloudDownloadSegments } from "../../lib/cloudDownload";
 import { Button } from "../ui/Button";
 import { Toggle } from "../ui/Toggle";
@@ -15,6 +17,7 @@ import { UpdateSettings } from "./UpdateSettings";
 interface SettingsScreenProps {
   settings: AppSettings;
   theme: ThemeMode;
+  language: Language;
   edition: AppEdition;
   onSave: (settings: AppSettings) => void;
   onDetectPaths: () => Promise<{
@@ -23,6 +26,7 @@ interface SettingsScreenProps {
   } | null>;
   onLaunchOptionsChange: (options: AppSettings["launchOptions"]) => void;
   onThemePreview: (theme: ThemeMode) => void;
+  onLanguagePreview: (language: Language) => void;
   onChooseDirectory: (kind: "client" | "server") => Promise<string | null>;
   updateInfo: AppUpdateInfo | null;
   updatePhase: AppUpdatePhase;
@@ -35,11 +39,13 @@ interface SettingsScreenProps {
 export function SettingsScreen({
   settings,
   theme,
+  language,
   edition,
   onSave,
   onDetectPaths,
   onLaunchOptionsChange,
   onThemePreview,
+  onLanguagePreview,
   onChooseDirectory,
   updateInfo,
   updatePhase,
@@ -48,6 +54,7 @@ export function SettingsScreen({
   onCheckUpdate,
   onShowUpdate,
 }: SettingsScreenProps) {
+  const { t } = useI18n();
   const [draft, setDraft] = useState(settings);
   const [hint, setHint] = useState<string | null>(null);
 
@@ -58,13 +65,19 @@ export function SettingsScreen({
       theme: settings.theme,
       launchOptions: settings.launchOptions,
     }));
-  }, [settings.theme, settings.launchOptions]);
+  }, [settings.launchOptions, settings.theme]);
 
   useEffect(() => {
     setDraft((current) =>
       current.theme === theme ? current : { ...current, theme },
     );
   }, [theme]);
+
+  useEffect(() => {
+    setDraft((current) =>
+      current.language === language ? current : { ...current, language },
+    );
+  }, [language]);
 
   function update(patch: Partial<AppSettings>) {
     setDraft((current) => ({ ...current, ...patch }));
@@ -83,8 +96,8 @@ export function SettingsScreen({
     const found = Boolean(paths.scumInstallPath.trim() || paths.serverInstallPath.trim());
     setHint(
       found
-        ? "已填入检测到的路径，保存后生效。"
-        : "没有从 Steam 库中找到 SCUM，请手动选择目录。",
+        ? t("settings.hint.detected")
+        : t("settings.hint.notFound"),
     );
     window.setTimeout(() => setHint(null), 6000);
   }
@@ -93,12 +106,12 @@ export function SettingsScreen({
     <section className="page page-settings">
       <header className="page-header">
         <div>
-          <h1>设置</h1>
-          <p>游戏路径、启动参数、主题与云源。凭据由 Rust 后端保管，前端不接触。</p>
+          <h1>{t("settings.title")}</h1>
+          <p>{t("settings.subtitle")}</p>
         </div>
         <div className="heading-tools">
           <Button icon="search" onClick={() => void handleDetect()}>
-            自动检测路径
+            {t("settings.autoDetect")}
           </Button>
           <Button
             variant="primary"
@@ -114,7 +127,7 @@ export function SettingsScreen({
               })
             }
           >
-            保存设置
+            {t("settings.save")}
           </Button>
         </div>
       </header>
@@ -128,12 +141,12 @@ export function SettingsScreen({
       <div className="settings-sheet">
         <section className="settings-group">
           <div className="section-title">
-            <span>游戏路径</span>
-            <b>客户端与服务端分开保存</b>
+            <span>{t("settings.paths.title")}</span>
+            <b>{t("settings.paths.note")}</b>
           </div>
           <div className="form-grid">
             <label className="form-span-2">
-              <span>SCUM 客户端</span>
+              <span>{t("settings.paths.client")}</span>
               <div className="input-with-button">
                 <input
                   value={draft.scumInstallPath}
@@ -148,12 +161,12 @@ export function SettingsScreen({
                     if (path) update({ scumInstallPath: path });
                   }}
                 >
-                  选择
+                  {t("settings.paths.select")}
                 </Button>
               </div>
             </label>
             <label className="form-span-2">
-              <span>SCUM Server 服务端</span>
+              <span>{t("settings.paths.server")}</span>
               <div className="input-with-button">
                 <input
                   value={draft.serverInstallPath}
@@ -168,7 +181,7 @@ export function SettingsScreen({
                     if (path) update({ serverInstallPath: path });
                   }}
                 >
-                  选择
+                  {t("settings.paths.select")}
                 </Button>
               </div>
             </label>
@@ -186,47 +199,47 @@ export function SettingsScreen({
 
         <section className="settings-group">
           <div className="section-title">
-            <span>启动参数</span>
-            <b>改动立即生效</b>
+            <span>{t("settings.startup.title")}</span>
+            <b>{t("settings.startup.note")}</b>
           </div>
           <div className="setting-switches">
             <label>
               <span>
-                <b>启用日志</b>
-                <small>向游戏附加 -log</small>
+                <b>{t("settings.startup.log")}</b>
+                <small>{t("settings.startup.logDetail")}</small>
               </span>
               <Toggle
                 checked={draft.launchOptions.log}
                 onChange={(log) => updateLaunchOptions({ log })}
-                label="启用日志"
+                label={t("settings.startup.log")}
               />
             </label>
             <label>
               <span>
-                <b>文件打开日志</b>
-                <small>向游戏附加 -fileopenlog</small>
+                <b>{t("settings.startup.fileLog")}</b>
+                <small>{t("settings.startup.fileLogDetail")}</small>
               </span>
               <Toggle
                 checked={draft.launchOptions.fileOpenLog}
                 onChange={(fileOpenLog) => updateLaunchOptions({ fileOpenLog })}
-                label="文件打开日志"
+                label={t("settings.startup.fileLog")}
               />
             </label>
             <label>
               <span>
-                <b>禁用 BattlEye</b>
-                <small>存在 PAK 模组时强制开启</small>
+                <b>{t("settings.startup.battlEye")}</b>
+                <small>{t("settings.startup.battlEyeDetail")}</small>
               </span>
               <Toggle
                 checked={draft.launchOptions.noBattlEye}
                 onChange={(noBattlEye) => updateLaunchOptions({ noBattlEye })}
-                label="禁用 BattlEye"
+                label={t("settings.startup.battlEye")}
               />
             </label>
             <label>
               <span>
-                <b>服务端端口</b>
-                <small>仅启动服务端时使用</small>
+                <b>{t("settings.startup.port")}</b>
+                <small>{t("settings.startup.portDetail")}</small>
               </span>
               <input
                 className="compact-input"
@@ -243,8 +256,8 @@ export function SettingsScreen({
 
         <section className="settings-group">
           <div className="section-title">
-            <span>外观</span>
-            <b>同一布局，不同材质</b>
+            <span>{t("settings.appearance.title")}</span>
+            <b>{t("settings.appearance.note")}</b>
           </div>
           <div className="theme-options">
             <button
@@ -259,8 +272,8 @@ export function SettingsScreen({
                 <i />
                 <i />
               </span>
-              <b>暖纸亮色</b>
-              <small>默认外观</small>
+              <b>{t("settings.appearance.light")}</b>
+              <small>{t("settings.appearance.lightDetail")}</small>
             </button>
             <button
               type="button"
@@ -274,20 +287,26 @@ export function SettingsScreen({
                 <i />
                 <i />
               </span>
-              <b>中性炭黑</b>
-              <small>夜间使用</small>
+              <b>{t("settings.appearance.dark")}</b>
+              <small>{t("settings.appearance.darkDetail")}</small>
             </button>
           </div>
         </section>
 
         <section className="settings-group settings-cloud">
           <div className="section-title">
-            <span>云源线路</span>
-            <b>{edition === "server" ? "服务器版使用内置共享凭据" : "公开版仅访问公开目录"}</b>
+            <span>{t("settings.cloud.title")}</span>
+            <b>
+              {t(
+                edition === "server"
+                  ? "settings.cloud.serverNote"
+                  : "settings.cloud.publicNote",
+              )}
+            </b>
           </div>
           <div className="settings-cloud-fields">
             <label>
-              <span>候选地址</span>
+              <span>{t("settings.cloud.urls")}</span>
               <textarea
                 className="note-input settings-textarea"
                 rows={4}
@@ -307,7 +326,7 @@ export function SettingsScreen({
               />
             </label>
             <label className="settings-segment-field">
-              <span>并行分片上限</span>
+              <span>{t("settings.cloud.segments")}</span>
               <input
                 type="number"
                 min={8}
@@ -334,14 +353,43 @@ export function SettingsScreen({
                   })
                 }
               />
-              <small>单个模组最多 128 路，多个模组共享 256 路总上限。</small>
+              <small>{t("settings.cloud.segmentsHelp")}</small>
             </label>
           </div>
           <div className="settings-note">
-            {edition === "server"
-              ? "共享密钥只由服务器安装包携带并交给 Rust 后端使用，前端不会读取密钥内容。"
-              : "公开版不会读取或发送私人密钥；需要私人模组时请改用服务器安装包。"}
+            {t(
+              edition === "server"
+                ? "settings.cloud.serverSecret"
+                : "settings.cloud.publicSecret",
+            )}
           </div>
+        </section>
+
+        <section
+          className="settings-group settings-language"
+          aria-label={t("settings.language.switch")}
+        >
+          <div className="section-title">
+            <span>{t("settings.language.title")}</span>
+            <b>{t("settings.language.note")}</b>
+          </div>
+          <div className="language-options">
+            {SUPPORTED_LANGUAGES.map((language) => (
+              <button
+                type="button"
+                key={language.id}
+                className={draft.language === language.id ? "is-active" : ""}
+                onClick={() => {
+                  update({ language: language.id });
+                  onLanguagePreview(language.id);
+                }}
+              >
+                <b>{language.label}</b>
+                <small>{language.id}</small>
+              </button>
+            ))}
+          </div>
+          <p className="settings-note">{t("settings.language.overrideNote")}</p>
         </section>
       </div>
     </section>

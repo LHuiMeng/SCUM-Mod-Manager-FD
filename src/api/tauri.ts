@@ -5,7 +5,9 @@ import type {
   AppSettings,
   AppUpdateInfo,
   ImportResult,
+  Language,
   LibrarySnapshot,
+  LocaleBundle,
   RemoteFile,
   RemoteMod,
   RuntimeLog,
@@ -30,9 +32,17 @@ export const api = {
   reorderMods: (ids: string[]) => call<LibrarySnapshot>("reorder_mods", { ids }),
   updateModMetadata: (id: string, tags: string[], notes: string) =>
     call<LibrarySnapshot>("update_mod_metadata", { id, tags, notes }),
+  saveConflictWinners: (winners: Record<string, string>) =>
+    call<LibrarySnapshot>("save_conflict_winners", { winners }),
+  deleteMod: (id: string) => call<LibrarySnapshot>("delete_mod", { id }),
   saveSettings: (settings: AppSettings) =>
     call<AppSettings>("save_settings", { settings }),
   setTheme: (theme: ThemeMode) => call<void>("set_theme", { theme }),
+  setLanguage: (language: Language) =>
+    call<void>("set_language", { language }),
+  getLocale: (language: Language) =>
+    call<LocaleBundle>("get_locale", { language }),
+  getLocales: () => call<LocaleBundle[]>("get_locales"),
   detectPaths: () =>
     call<{ scumInstallPath: string; serverInstallPath: string }>("detect_paths"),
   launchGame: (mode: "client" | "server") =>
@@ -71,7 +81,7 @@ export async function chooseFiles(): Promise<string[]> {
   const selected = await open({
     multiple: true,
     directory: false,
-    filters: [{ name: "SCUM 模组", extensions: ["pak", "zip"] }],
+    filters: [{ name: "SCUM Mods", extensions: ["pak", "zip"] }],
   });
   if (!selected) return [];
   return Array.isArray(selected) ? selected : [selected];

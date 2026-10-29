@@ -1,24 +1,35 @@
 import type { ModEntry } from "../../types";
-import { compactHash, formatBytes, formatDate, modMonogram, modTypeLabel } from "../../lib/format";
+import { useI18n } from "../../i18n";
+import { compactHash, formatBytes, formatDate, modMonogram, modTypeKey } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
+import { ModCover } from "../ui/ModCover";
 import { Tag } from "../ui/Tag";
 
 interface ModInspectorProps {
   mod: ModEntry | null;
   onEdit: () => void;
+  onDelete: () => void;
   onOpenFolder: () => void;
+  onOpenConflicts: () => void;
 }
 
-export function ModInspector({ mod, onEdit, onOpenFolder }: ModInspectorProps) {
+export function ModInspector({
+  mod,
+  onEdit,
+  onDelete,
+  onOpenFolder,
+  onOpenConflicts,
+}: ModInspectorProps) {
+  const { t, language } = useI18n();
   if (!mod) {
     return (
       <aside className="inspector inspector-empty">
         <span className="empty-selection-mark">
           <Icon name="box" size={30} />
         </span>
-        <h2>选择一个模组</h2>
-        <p>在左侧列表中选择条目，查看加载顺序、校验状态和本地备注。</p>
+        <h2>{t("inspector.emptyTitle")}</h2>
+        <p>{t("inspector.emptyDescription")}</p>
       </aside>
     );
   }
@@ -26,102 +37,178 @@ export function ModInspector({ mod, onEdit, onOpenFolder }: ModInspectorProps) {
   const hasHash = Boolean(mod.sha256);
 
   return (
-    <aside className="inspector">
+    <aside className="inspector" data-mod-type={mod.type}>
       <div className="inspector-preview">
-        <span className="inspector-monogram">{modMonogram(mod.name)}</span>
+        <ModCover
+          name={mod.name}
+          src={mod.coverUrl}
+          className="inspector-art"
+          imageClassName="inspector-art-image"
+        />
+        <span className="inspector-monogram" aria-hidden="true">
+          {modMonogram(mod.name)}
+        </span>
         <div className="preview-meta">
           <span className={`preview-badge ${mod.enabled ? "is-on" : "is-off"}`}>
             <i />
             {mod.enabled
-              ? `已启用 · 顺序 ${String(mod.loadOrder + 1).padStart(2, "0")}`
-              : "已停用"}
+              ? t("inspector.enabledOrder", {
+                  order: String(mod.loadOrder + 1).padStart(2, "0"),
+                })
+              : t("common.disabled")}
           </span>
           <span className={`preview-badge ${mod.conflictCount > 0 ? "is-warn" : ""}`}>
-            {mod.conflictCount > 0 ? `${mod.conflictCount} 个冲突` : "无资源冲突"}
+            {mod.conflictCount > 0
+              ? t("common.conflictCount", { count: mod.conflictCount })
+              : t("common.noConflict")}
           </span>
+          {mod.duplicateCount ? (
+            <span className="preview-badge is-muted">
+              {t("inspector.duplicateCopies", { count: mod.duplicateCount })}
+            </span>
+          ) : null}
         </div>
       </div>
       <div className="inspector-body">
         <span className="inspector-kicker">
-          {mod.tags[0] ?? "未分类"} / {modTypeLabel(mod.type)}
+          {t(modTypeKey(mod.type))} ·{" "}
+          {t(mod.originSource === "cloud" ? "inspector.originCloud" : "inspector.originLocal")}
         </span>
         <h2>{mod.name}</h2>
-        <div className="inspector-byline">
-          {mod.originSource === "cloud" ? "云端来源" : "本地文件"} · 更新于 {formatDate(mod.lastModified)}
-        </div>
+        {mod.author ? (
+          <div className="inspector-author">
+            {t("inspector.author", { name: mod.author })}
+          </div>
+        ) : null}
         <div className="tag-row">
-          {mod.tags.length > 0 ? mod.tags.map((tag) => <Tag key={tag}>{tag}</Tag>) : <Tag>未分类</Tag>}
+          {mod.tags.length > 0 ? (
+            mod.tags.map((tag) => <Tag key={tag}>{tag}</Tag>)
+          ) : (
+            <Tag>{t("common.uncategorized")}</Tag>
+          )}
         </div>
         <Button className="detail-action" trailingIcon="edit" onClick={onEdit}>
-          编辑标签与备注
+          {t("inspector.edit")}
         </Button>
 
         <section className="inspector-section">
           <div className="section-title">
-            <span>模组概览</span>
-            <b className={mod.conflictCount > 0 ? "is-warn" : hasHash ? "is-good" : "is-muted"}>
-              {mod.conflictCount > 0 ? `${mod.conflictCount} 个冲突` : hasHash ? "哈希已记录" : "未校验"}
+            <span>{t("inspector.presentation")}</span>
+            <b>
+              {mod.coverUrl
+                ? t("inspector.coverLoaded")
+                : t("inspector.defaultMonogram")}
             </b>
           </div>
-          <div className="detail-facts">
-            <div>
-              <span>文件大小</span>
-              <b>{formatBytes(mod.fileSize)}</b>
-            </div>
-            <div>
-              <span>加载位置</span>
-              <b>{mod.enabled ? String(mod.loadOrder + 1).padStart(2, "0") : "停用"}</b>
-            </div>
-            <div>
-              <span>模组类型</span>
-              <b>{modTypeLabel(mod.type)}</b>
-            </div>
-            <div>
-              <span>最近更新</span>
-              <b>{formatDate(mod.lastModified)}</b>
-            </div>
-          </div>
-          <div className={`health-row ${mod.conflictCount > 0 ? "has-conflict" : ""}`}>
-            <span className="health-icon">
-              <Icon
-                name={mod.conflictCount > 0 ? "serverOff" : hasHash ? "check" : "refresh"}
-                size={13}
-              />
-            </span>
-            <span>
-              <b>
-                {mod.conflictCount > 0
-                  ? "检测到资源覆盖"
-                  : hasHash
-                    ? "未检测到资源冲突"
-                    : "尚未计算文件哈希"}
-              </b>
-              <span>
-                {mod.conflictCount > 0
-                  ? "请核对覆盖顺序后再启动"
-                  : hasHash
-                    ? "与当前启用模组的资源清单兼容"
-                    : "重新扫描会补算 SHA-256，再判断文件完整性"}
-              </span>
-            </span>
-          </div>
+          <p className={`inspector-description ${mod.description ? "" : "is-empty"}`}>
+            {mod.description || t("inspector.descriptionEmpty")}
+          </p>
         </section>
 
         <section className="inspector-section">
           <div className="section-title">
-            <span>本地备注</span>
-            <b>仅保存在当前设备</b>
+            <span>{t("inspector.overview")}</span>
+            <b className={mod.conflictCount > 0 ? "is-warn" : hasHash ? "is-good" : "is-muted"}>
+              {mod.conflictCount > 0
+                ? t("common.conflictCount", { count: mod.conflictCount })
+                : hasHash
+                  ? t("inspector.hashRecorded")
+                  : t("inspector.unverified")}
+            </b>
+          </div>
+          <div className="detail-facts">
+            <div>
+              <span>{t("inspector.fileSize")}</span>
+              <b>{formatBytes(mod.fileSize)}</b>
+            </div>
+            <div>
+              <span>{t("inspector.loadOrder")}</span>
+              <b>
+                {mod.enabled
+                  ? String(mod.loadOrder + 1).padStart(2, "0")
+                  : t("inspector.disabledShort")}
+              </b>
+            </div>
+            <div>
+              <span>{t("inspector.recentUpdate")}</span>
+              <b>{formatDate(mod.lastModified, language)}</b>
+            </div>
+          </div>
+          {mod.conflictCount > 0 ? (
+            <button
+              type="button"
+              className="health-row has-conflict conflict-health-trigger"
+              onClick={onOpenConflicts}
+              aria-haspopup="dialog"
+            >
+              <span className="health-icon">
+                <Icon name="serverOff" size={13} />
+              </span>
+              <span className="health-copy">
+                <b>
+                  {mod.fullyOverridden
+                    ? t("inspector.fullyOverriddenTitle")
+                    : t("inspector.conflictTitle")}
+                </b>
+                <span>
+                  {mod.fullyOverridden
+                    ? t("inspector.fullyOverriddenDetail")
+                    : t("inspector.conflictDetail")}
+                </span>
+              </span>
+              <span className="conflict-health-chevron" aria-hidden="true">
+                <Icon name="chevronRight" size={14} />
+              </span>
+            </button>
+          ) : (
+            <div className={`health-row ${hasHash ? "" : "is-unverified"}`}>
+              <span className="health-icon">
+                <Icon name={hasHash ? "check" : "refresh"} size={13} />
+              </span>
+              <span className="health-copy">
+                <b>
+                  {hasHash
+                    ? t("inspector.noConflictTitle")
+                    : t("inspector.noHashTitle")}
+                </b>
+                <span>
+                  {hasHash
+                    ? t("inspector.noConflictDetail")
+                    : t("inspector.noHashDetail")}
+                </span>
+              </span>
+            </div>
+          )}
+        </section>
+
+        <section className="inspector-section">
+          <div className="section-title">
+            <span>{t("inspector.notesTitle")}</span>
+            <b>{t("inspector.deviceOnly")}</b>
           </div>
           <div className={`note-box ${mod.notes ? "" : "is-empty"}`}>
-            {mod.notes || "还没有备注。记录兼容性、服务器用途或测试结果。"}
+            {mod.notes || t("inspector.notesEmpty")}
           </div>
         </section>
       </div>
       <div className="inspector-footer">
-        <span>SHA-256 {compactHash(mod.sha256)}</span>
-        <button type="button" onClick={onOpenFolder}>
-          打开文件目录 →
-        </button>
+        <div className="inspector-footer-meta">
+          <span>
+            SHA-256 {compactHash(mod.sha256, t("common.notCalculated"))}
+          </span>
+          <button type="button" onClick={onOpenFolder}>
+            {t("inspector.openFolder")}
+          </button>
+        </div>
+        <Button
+          className="inspector-delete-button"
+          size="sm"
+          variant="danger"
+          icon="trash"
+          onClick={onDelete}
+        >
+          {t("inspector.delete")}
+        </Button>
       </div>
     </aside>
   );

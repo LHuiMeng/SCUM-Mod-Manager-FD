@@ -66,7 +66,8 @@ X-Scum-Gate: <shared-key>
       "sha256": "64-character-lowercase-hex",
       "tags": ["client"],
       "updatedAt": "2026-10-27T00:00:00Z",
-      "type": "clientPak"
+      "type": "clientPak",
+      "coverUrl": "images/example-mod.webp"
     }
   ]
 }
@@ -74,6 +75,9 @@ X-Scum-Gate: <shared-key>
 
 字段兼容 `download_url`、`fileSize`/`file_size`/`size`、`updated_at` 和
 `mod_type` 等旧写法。`id` 缺失时使用 `slug`，再回退到安全化后的名称。
+封面兼容 `coverUrl`/`cover_url`、`imageUrl`/`image_url` 与
+`cover`/`image`；相对地址按当前云源解析，只接受 HTTPS（本机回环可用 HTTP）。
+本地展示文件约定见 `templates/mod-presentation/README.md`。
 
 ## 下载与校验
 

@@ -1,0 +1,19 @@
+{
+  "library": {
+    "title": "My Mod Library",
+    "subtitle": "Drop mods here; order controls load priority.",
+    "scan": "Rescan",
+    "import": "Add mods"
+  },
+  "launch": {
+    "start": "Launch game"
+  },
+  "cloud": {
+    "title": "Mod Cloud"
+  },
+  "settings": {
+    "language": {
+      "overrideNote": "Edit app-data/locales/en-US.json and switch language again to apply."
+    }
+  }
+}

@@ -1,11 +1,12 @@
 import type { NavSection } from "../../types";
+import { useI18n } from "../../i18n";
 import { Icon, type IconName } from "../ui/Icon";
 
-const items: Array<{ id: NavSection; label: string; icon: IconName }> = [
-  { id: "library", label: "模组库", icon: "box" },
-  { id: "cloud", label: "云端", icon: "cloud" },
-  { id: "server", label: "服务器", icon: "server" },
-  { id: "logs", label: "日志", icon: "log" },
+const items: Array<{ id: NavSection; labelKey: "nav.library" | "nav.cloud" | "nav.server" | "nav.logs"; icon: IconName }> = [
+  { id: "library", labelKey: "nav.library", icon: "box" },
+  { id: "cloud", labelKey: "nav.cloud", icon: "cloud" },
+  { id: "server", labelKey: "nav.server", icon: "server" },
+  { id: "logs", labelKey: "nav.logs", icon: "log" },
 ];
 
 interface SidebarProps {
@@ -15,8 +16,9 @@ interface SidebarProps {
 }
 
 export function Sidebar({ active, onChange, onSettings }: SidebarProps) {
+  const { t } = useI18n();
   return (
-    <aside className="sidebar" aria-label="主导航">
+    <aside className="sidebar" aria-label={t("nav.ariaLabel")}>
       <div className="rail-logo" aria-label="SCUM Mod Desk">
         SM
       </div>
@@ -27,11 +29,11 @@ export function Sidebar({ active, onChange, onSettings }: SidebarProps) {
             key={item.id}
             className={`rail-button ${active === item.id ? "is-active" : ""}`}
             aria-current={active === item.id ? "page" : undefined}
-            title={item.label}
+            title={t(item.labelKey)}
             onClick={() => onChange(item.id)}
           >
             <Icon name={item.icon} size={19} />
-            <span>{item.label}</span>
+            <span>{t(item.labelKey)}</span>
           </button>
         ))}
       </nav>
@@ -40,11 +42,11 @@ export function Sidebar({ active, onChange, onSettings }: SidebarProps) {
           type="button"
           className={`rail-button ${active === "settings" ? "is-active" : ""}`}
           aria-current={active === "settings" ? "page" : undefined}
-          title="设置"
+          title={t("nav.settings")}
           onClick={onSettings}
         >
           <Icon name="settings" size={19} />
-          <span>设置</span>
+          <span>{t("nav.settings")}</span>
         </button>
       </div>
     </aside>

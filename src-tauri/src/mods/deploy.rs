@@ -1,12 +1,14 @@
 use super::extract_zip_file;
+use crate::metadata::MetadataFile;
 use crate::models::{AppSettings, ModEntry};
+use crate::mods::pak_scan;
 use crate::paths::{is_within, path_string, safe_file_component, AppPaths};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -33,22 +35,33 @@ pub fn read_manifest(paths: &AppPaths) -> Option<DeployedManifest> {
 }
 
 pub fn deployed_file_names(paths: &AppPaths) -> HashSet<String> {
-    read_manifest(paths)
-        .map(|manifest| {
-            manifest
-                .files
-                .iter()
-                .chain(manifest.directories.iter())
-                .flat_map(|path| {
-                    let path = Path::new(path);
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-                        .into_iter()
-                        .chain(Some(path.to_string_lossy().to_ascii_lowercase()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(manifest) = read_manifest(paths) else {
+        return HashSet::new();
+    };
+    let mut names = HashSet::new();
+    for path in manifest.files.iter().chain(manifest.directories.iter()) {
+        let path = Path::new(path);
+        names.insert(path.to_string_lossy().to_ascii_lowercase());
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        let file_name = file_name.to_string_lossy().to_ascii_lowercase();
+        // Deployment adds game-order prefixes without renaming the local library.
+        if let Some(original) = strip_deployed_pak_prefix(&file_name) {
+            names.insert(original.to_string());
+        }
+        names.insert(file_name);
+    }
+    names
+}
+
+fn strip_deployed_pak_prefix(file_name: &str) -> Option<&str> {
+    let (prefix, original) = file_name.split_once('_')?;
+    if prefix.len() < 3 || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let (_, extension) = original.rsplit_once('.')?;
+    extension.eq_ignore_ascii_case("pak").then_some(original)
 }
 
 pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
@@ -154,6 +167,9 @@ pub struct RescueSummary {
 
 pub fn rescue_mods_from_game(paths: &AppPaths, settings: &AppSettings) -> Result<RescueSummary> {
     let mut summary = RescueSummary::default();
+    let managed_targets = read_manifest(paths)
+        .map(|manifest| manifest.files)
+        .unwrap_or_default();
     for install in [&settings.scum_install_path, &settings.server_install_path] {
         if install.trim().is_empty() {
             continue;
@@ -167,6 +183,13 @@ pub fn rescue_mods_from_game(paths: &AppPaths, settings: &AppSettings) -> Result
         for entry in entries.flatten() {
             let source = entry.path();
             if source.is_file() && super::is_pak(&source) {
+                // Managed prefixed targets are reclaimed, not imported back as new local mods.
+                if managed_targets
+                    .iter()
+                    .any(|target| same_path(Path::new(target), &source))
+                {
+                    continue;
+                }
                 let destination = paths.local_mods.join(entry.file_name());
                 std::fs::create_dir_all(&paths.local_mods)?;
                 if destination.exists() {
@@ -188,6 +211,7 @@ pub fn deploy_local_mods(
     is_server: bool,
 ) -> Result<Option<String>> {
     reclaim_mods(paths)?;
+    let metadata = crate::metadata::load_metadata(paths)?;
     let install = if is_server {
         settings.server_install_path.trim()
     } else {
@@ -210,7 +234,11 @@ pub fn deploy_local_mods(
     std::fs::create_dir_all(&pak_dir)
         .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
 
-    let enabled: Vec<&ModEntry> = mods.iter().filter(|item| item.enabled).collect();
+    let canonical_mods = super::duplicates::collapse_identical_mods(
+        mods.to_vec(),
+        &crate::metadata::MetadataFile::default(),
+    );
+    let enabled: Vec<&ModEntry> = canonical_mods.iter().filter(|item| item.enabled).collect();
     if enabled.is_empty() {
         return Ok(None);
     }
@@ -226,14 +254,45 @@ pub fn deploy_local_mods(
         .join(uuid::Uuid::new_v4().to_string());
 
     let deploy_result = (|| -> Result<()> {
-        for item in enabled.iter().filter(|item| item.mod_type == "clientPak") {
+        let mut client_paks = enabled
+            .iter()
+            .copied()
+            .filter(|item| item.mod_type == "clientPak")
+            .collect::<Vec<_>>();
+        client_paks.sort_by(|left, right| {
+            left.load_order
+                .cmp(&right.load_order)
+                .then_with(|| {
+                    left.file_name
+                        .to_ascii_lowercase()
+                        .cmp(&right.file_name.to_ascii_lowercase())
+                })
+                .then_with(|| left.file_name.cmp(&right.file_name))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let pak_prefix_width = deployment_prefix_width(client_paks.len());
+        for (index, item) in client_paks.iter().enumerate() {
             let source = PathBuf::from(&item.file_path);
             if !source.is_file() {
                 continue;
             }
-            let target = pak_dir.join(&item.file_name);
+            let target = pak_dir.join(numbered_pak_file_name(
+                index,
+                &item.file_name,
+                pak_prefix_width,
+            ));
             copy_file_record(&source, &target, &backup_root, &mut manifest)?;
         }
+        let override_file_name = conflict_override_file_name(client_paks.len());
+        deploy_conflict_override(
+            paths,
+            &canonical_mods,
+            &metadata,
+            &pak_dir,
+            &backup_root,
+            &mut manifest,
+            &override_file_name,
+        )?;
 
         let ue4ss_enabled: Vec<&&ModEntry> = enabled
             .iter()
@@ -242,7 +301,7 @@ pub fn deploy_local_mods(
         if !ue4ss_enabled.is_empty() {
             if let Some(binaries) = find_binaries_dir(install) {
                 ensure_runtime_framework(paths)?;
-                sync_ue4ss_mods_txt(paths, mods)?;
+                sync_ue4ss_mods_txt(paths, &canonical_mods)?;
                 deploy_framework(paths, &binaries, &backup_root, &mut manifest)?;
                 for item in ue4ss_enabled {
                     deploy_ue4ss_mod(item, &binaries, &backup_root, &mut manifest)?;
@@ -274,6 +333,146 @@ pub fn deploy_local_mods(
 
     write_manifest(paths, &manifest)?;
     Ok(Some(manifest.deployed_at))
+}
+
+const CONFLICT_OVERRIDE_FILE: &str = "999_SCUM_Mod_Desk_Overrides.pak";
+
+fn deployment_prefix_width(client_pak_count: usize) -> usize {
+    client_pak_count.to_string().len().max(3)
+}
+
+fn numbered_pak_file_name(index: usize, original: &str, width: usize) -> String {
+    format!("{index:0width$}_{original}")
+}
+
+fn conflict_override_file_name(client_pak_count: usize) -> String {
+    let width = deployment_prefix_width(client_pak_count);
+    if width == 3 {
+        return CONFLICT_OVERRIDE_FILE.to_string();
+    }
+    format!("{}_SCUM_Mod_Desk_Overrides.pak", "9".repeat(width))
+}
+
+fn deploy_conflict_override(
+    paths: &AppPaths,
+    mods: &[ModEntry],
+    metadata: &MetadataFile,
+    pak_dir: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+    override_file_name: &str,
+) -> Result<()> {
+    let analysis = pak_scan::analyze_conflicts(metadata, mods);
+    let selected_groups = analysis
+        .groups
+        .iter()
+        .filter(|group| {
+            group
+                .selected_winner_id
+                .as_deref()
+                .is_some_and(|winner| winner != group.default_winner_id)
+        })
+        .collect::<Vec<_>>();
+    if selected_groups.is_empty() {
+        return Ok(());
+    }
+
+    let mods_by_id = mods
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut selected_entries: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
+    for group in selected_groups {
+        let winner = mods_by_id
+            .get(group.winner_id.as_str())
+            .with_context(|| format!("找不到冲突组的覆盖模组：{}", group.winner_id))?;
+        if !winner.enabled || winner.mod_type != "clientPak" {
+            bail!("冲突组的覆盖模组当前不可部署：{}", winner.name);
+        }
+        let pak_path = PathBuf::from(&winner.file_path);
+        if !pak_path.is_file() {
+            bail!("覆盖模组的 PAK 文件不存在：{}", pak_path.display());
+        }
+        let available = metadata
+            .entries
+            .get(&winner.id)
+            .into_iter()
+            .flat_map(|entry| entry.pak_entries.iter())
+            .filter_map(|entry| pak_scan::normalize_entry_path(entry))
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        for resource in &group.paths {
+            if !available.contains(&resource.to_ascii_lowercase()) {
+                bail!("自定义覆盖无法完成：{} 缺少资源 {}", winner.name, resource);
+            }
+            let key = resource.to_ascii_lowercase();
+            if let Some((existing, _)) = selected_entries.get(&key) {
+                if !existing.eq_ignore_ascii_case(&winner.file_path) {
+                    bail!("资源 {resource} 同时被多个覆盖 PAK 选中");
+                }
+            } else {
+                selected_entries.insert(key, (resource.clone(), pak_path.clone()));
+            }
+        }
+    }
+    if selected_entries.is_empty() {
+        return Ok(());
+    }
+
+    let merged_root = paths.root.join("~merged");
+    let stage_root = merged_root.join(uuid::Uuid::new_v4().to_string());
+    let tree = stage_root.join("tree");
+    let output = stage_root.join(override_file_name);
+    let result = (|| -> Result<()> {
+        std::fs::create_dir_all(&tree)
+            .with_context(|| format!("无法创建覆盖暂存目录 {}", tree.display()))?;
+        let mut expected = BTreeSet::new();
+        for (_, (resource, pak_path)) in &selected_entries {
+            let relative = safe_pak_relative_path(resource)?;
+            let destination = tree.join(relative);
+            if !is_within(&destination, &tree) {
+                bail!("覆盖暂存路径越界：{resource}");
+            }
+            pak_scan::extract_pak_entry(paths, pak_path, resource, &destination)?;
+            expected.insert(resource.to_ascii_lowercase());
+        }
+        pak_scan::pack_pak(paths, &tree, &output)?;
+        let packed = pak_scan::list_pak_entries(paths, &output)?
+            .into_iter()
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        if !expected.is_subset(&packed) {
+            bail!("覆盖 PAK 校验失败：打包结果缺少预期资源");
+        }
+        copy_file_record(
+            &output,
+            &pak_dir.join(override_file_name),
+            backup_root,
+            manifest,
+        )?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&stage_root);
+    let _ = std::fs::remove_dir(&merged_root);
+    result
+}
+
+fn safe_pak_relative_path(resource: &str) -> Result<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in Path::new(resource).components() {
+        let Component::Normal(name) = component else {
+            bail!("拒绝不安全的 PAK 资源路径：{resource}");
+        };
+        let name = name.to_string_lossy();
+        if name.is_empty() || name.contains(':') || name.chars().any(char::is_control) {
+            bail!("拒绝不安全的 PAK 资源路径：{resource}");
+        }
+        relative.push(name.as_ref());
+    }
+    if relative.as_os_str().is_empty() {
+        bail!("PAK 资源路径为空");
+    }
+    Ok(relative)
 }
 
 pub fn find_pak_dir(install: &Path) -> Option<PathBuf> {
@@ -501,6 +700,7 @@ mod tests {
         deploy_local_mods, read_manifest, reclaim_mods, rescue_mods_from_game, sync_ue4ss_state,
         DeployedManifest,
     };
+    use crate::metadata::{save_metadata, MetadataFile};
     use crate::models::{AppSettings, ModEntry};
     use crate::paths::path_string;
     use crate::test_support::TempRoot;
@@ -508,6 +708,7 @@ mod tests {
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipWriter};
 
@@ -525,6 +726,7 @@ mod tests {
         ModEntry {
             id: name.to_ascii_lowercase(),
             name,
+            author: String::new(),
             file_name,
             file_path: path_string(path),
             file_size: path.metadata().map(|item| item.len()).unwrap_or(0),
@@ -539,7 +741,14 @@ mod tests {
             deployed: false,
             description: String::new(),
             conflict_count: 0,
+            file_count: 0,
+            overridden_file_count: 0,
+            overriding_file_count: 0,
+            fully_overridden: false,
             update_version: None,
+            cover_url: None,
+            duplicate_count: 0,
+            duplicate_aliases: Vec::new(),
         }
     }
 
@@ -590,16 +799,240 @@ mod tests {
             .unwrap()
             .expect("PAK should be deployed");
 
-        let target = pak_dir.join("TestWeapon.pak");
+        let target = pak_dir.join("000_TestWeapon.pak");
         assert_eq!(fs::read(&target).unwrap(), b"pak-content");
         let manifest = read_manifest(&paths).expect("deployment manifest should exist");
         assert_eq!(manifest.deployed_at, deployed_at);
         assert!(manifest.files.contains(&path_string(&target)));
+        let deployed_names = super::deployed_file_names(&paths);
+        assert!(deployed_names.contains("testweapon.pak"));
+        assert!(deployed_names.contains("000_testweapon.pak"));
 
         assert_eq!(reclaim_mods(&paths).unwrap(), 1);
         assert!(!target.exists());
         assert!(!paths.deployment_manifest.exists());
         assert!(source.exists());
+    }
+
+    #[test]
+    fn deploys_only_the_canonical_entry_for_identical_pak_hashes() {
+        let temp = TempRoot::new("deploy-duplicate-paks");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = paths.local_mods.join("Alpha.pak");
+        let zeta = paths.local_mods.join("Zeta.pak");
+        fs::write(&alpha, b"same-pak-content").unwrap();
+        fs::write(&zeta, b"same-pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut alpha_entry = mod_entry(&alpha, true, "clientPak");
+        alpha_entry.sha256 = hash.to_string();
+        let mut zeta_entry = mod_entry(&zeta, true, "clientPak");
+        zeta_entry.sha256 = hash.to_string();
+
+        deploy_local_mods(&paths, &settings, &[alpha_entry, zeta_entry], false).unwrap();
+
+        assert!(pak_dir.join("000_Alpha.pak").is_file());
+        assert!(!pak_dir.join("001_Zeta.pak").exists());
+        let manifest = read_manifest(&paths).unwrap();
+        assert_eq!(manifest.files.len(), 1);
+        assert!(manifest.files[0].ends_with("000_Alpha.pak"));
+    }
+
+    #[test]
+    fn deploys_client_paks_with_load_order_prefixes() {
+        let temp = TempRoot::new("deploy-load-order-prefixes");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = paths.local_mods.join("Alpha.pak");
+        let beta = paths.local_mods.join("Beta.pak");
+        let gamma = paths.local_mods.join("Gamma.pak");
+        fs::write(&alpha, b"alpha").unwrap();
+        fs::write(&beta, b"beta").unwrap();
+        fs::write(&gamma, b"gamma").unwrap();
+        let mut alpha_mod = mod_entry(&alpha, true, "clientPak");
+        alpha_mod.load_order = 2;
+        let mut beta_mod = mod_entry(&beta, true, "clientPak");
+        beta_mod.load_order = 0;
+        let mut gamma_mod = mod_entry(&gamma, true, "clientPak");
+        gamma_mod.load_order = 1;
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(&paths, &settings, &[alpha_mod, gamma_mod, beta_mod], false).unwrap();
+
+        assert_eq!(fs::read(pak_dir.join("000_Beta.pak")).unwrap(), b"beta");
+        assert_eq!(fs::read(pak_dir.join("001_Gamma.pak")).unwrap(), b"gamma");
+        assert_eq!(fs::read(pak_dir.join("002_Alpha.pak")).unwrap(), b"alpha");
+        assert_eq!(fs::read(&alpha).unwrap(), b"alpha");
+        assert_eq!(fs::read(&beta).unwrap(), b"beta");
+        assert_eq!(fs::read(&gamma).unwrap(), b"gamma");
+        assert!(super::deployed_file_names(&paths).contains("alpha.pak"));
+        assert!(super::deployed_file_names(&paths).contains("beta.pak"));
+        assert!(super::deployed_file_names(&paths).contains("gamma.pak"));
+    }
+
+    #[test]
+    fn override_prefix_stays_after_large_numeric_ranges() {
+        let width = super::deployment_prefix_width(1000);
+        let last_pak = super::numbered_pak_file_name(999, "Last.pak", width);
+        let override_pak = super::conflict_override_file_name(1000);
+
+        assert_eq!(width, 4);
+        assert_eq!(last_pak, "0999_Last.pak");
+        assert_eq!(override_pak, "9999_SCUM_Mod_Desk_Overrides.pak");
+        assert!(last_pak < override_pak);
+    }
+
+    #[test]
+    fn selected_conflict_winner_creates_a_real_override_pak() {
+        let temp = TempRoot::new("deploy-conflict-winner");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = build_test_pak(
+            temp.path(),
+            &paths,
+            "Alpha",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"alpha-uasset"),
+                ("SCUM/Content/Assets/Shared.uexp", b"alpha-uexp"),
+            ],
+        );
+        let beta = build_test_pak(
+            temp.path(),
+            &paths,
+            "Beta",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"beta-uasset"),
+                ("SCUM/Content/Assets/Shared.uexp", b"beta-uexp"),
+            ],
+        );
+        let mut alpha_mod = mod_entry(&alpha, true, "clientPak");
+        alpha_mod.load_order = 0;
+        let mut beta_mod = mod_entry(&beta, true, "clientPak");
+        beta_mod.load_order = 1;
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut(&alpha_mod.id).pak_entries = vec![
+            "SCUM/Content/Assets/Shared.uasset".to_string(),
+            "SCUM/Content/Assets/Shared.uexp".to_string(),
+        ];
+        metadata.entry_mut(&beta_mod.id).pak_entries = vec![
+            "SCUM/Content/Assets/Shared.uasset".to_string(),
+            "SCUM/Content/Assets/Shared.uexp".to_string(),
+        ];
+        metadata.conflict_winners.insert(
+            "scum/content/assets/shared".to_string(),
+            alpha_mod.id.clone(),
+        );
+        save_metadata(&paths, &metadata).unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(&paths, &settings, &[alpha_mod, beta_mod], false).unwrap();
+
+        let override_pak = pak_dir.join(super::CONFLICT_OVERRIDE_FILE);
+        assert!(override_pak.is_file());
+        assert_eq!(
+            read_pak_file(&paths, &override_pak, "SCUM/Content/Assets/Shared.uasset"),
+            b"alpha-uasset"
+        );
+        assert_eq!(
+            read_pak_file(&paths, &override_pak, "SCUM/Content/Assets/Shared.uexp"),
+            b"alpha-uexp"
+        );
+        let manifest = read_manifest(&paths).unwrap();
+        assert!(manifest
+            .files
+            .iter()
+            .any(|path| path.ends_with(super::CONFLICT_OVERRIDE_FILE)));
+        assert!(!paths.root.join("~merged").exists());
+
+        reclaim_mods(&paths).unwrap();
+        assert!(!override_pak.exists());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn invalid_custom_winner_blocks_deployment_and_cleans_staging() {
+        let temp = TempRoot::new("deploy-conflict-winner-failure");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = build_test_pak(
+            temp.path(),
+            &paths,
+            "Alpha",
+            &[("SCUM/Content/Assets/Shared.uasset", b"alpha")],
+        );
+        let beta = build_test_pak(
+            temp.path(),
+            &paths,
+            "Beta",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"beta"),
+                ("SCUM/Content/Assets/Shared.uexp", b"beta-sidecar"),
+            ],
+        );
+        let mut alpha_mod = mod_entry(&alpha, true, "clientPak");
+        alpha_mod.load_order = 0;
+        let mut beta_mod = mod_entry(&beta, true, "clientPak");
+        beta_mod.load_order = 1;
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut(&alpha_mod.id).pak_entries =
+            vec!["SCUM/Content/Assets/Shared.uasset".to_string()];
+        metadata.entry_mut(&beta_mod.id).pak_entries = vec![
+            "SCUM/Content/Assets/Shared.uasset".to_string(),
+            "SCUM/Content/Assets/Shared.uexp".to_string(),
+        ];
+        metadata.conflict_winners.insert(
+            "scum/content/assets/shared".to_string(),
+            alpha_mod.id.clone(),
+        );
+        save_metadata(&paths, &metadata).unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        let error =
+            deploy_local_mods(&paths, &settings, &[alpha_mod, beta_mod], false).unwrap_err();
+
+        assert!(error.to_string().contains("缺少资源"));
+        assert!(!pak_dir.join("000_Alpha.pak").exists());
+        assert!(!pak_dir.join("001_Beta.pak").exists());
+        assert!(!pak_dir.join(super::CONFLICT_OVERRIDE_FILE).exists());
+        assert!(!paths.deployment_manifest.exists());
+        assert!(!paths.root.join("~merged").exists());
     }
 
     #[test]
@@ -801,7 +1234,7 @@ mod tests {
         let second = paths.local_mods.join("Second.pak");
         fs::write(&first, b"first").unwrap();
         fs::write(&second, b"second").unwrap();
-        fs::create_dir_all(pak_dir.join("Second.pak")).unwrap();
+        fs::create_dir_all(pak_dir.join("001_Second.pak")).unwrap();
         let settings = AppSettings {
             scum_install_path: path_string(&install),
             ..AppSettings::default()
@@ -814,8 +1247,8 @@ mod tests {
         let error = deploy_local_mods(&paths, &settings, &mods, false).unwrap_err();
 
         assert!(error.to_string().contains("不是文件"));
-        assert!(!pak_dir.join("First.pak").exists());
-        assert!(pak_dir.join("Second.pak").is_dir());
+        assert!(!pak_dir.join("000_First.pak").exists());
+        assert!(pak_dir.join("001_Second.pak").is_dir());
         assert!(!paths.deployment_manifest.exists());
     }
 
@@ -875,6 +1308,43 @@ mod tests {
     }
 
     #[test]
+    fn rescue_skips_files_owned_by_the_deployment_manifest() {
+        let temp = TempRoot::new("rescue-managed-deploy-prefix");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let managed = pak_dir.join("000_Managed.pak");
+        fs::write(&managed, b"managed").unwrap();
+        let manifest = DeployedManifest {
+            deployed_at: "2026-01-01T00:00:00Z".to_string(),
+            roots: vec![path_string(&install)],
+            files: vec![path_string(&managed)],
+            directories: Vec::new(),
+            backups: Vec::new(),
+        };
+        fs::write(
+            &paths.deployment_manifest,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        let result = rescue_mods_from_game(&paths, &settings).unwrap();
+
+        assert_eq!(result.rescued, 0);
+        assert_eq!(result.skipped, 0);
+        assert!(!paths.local_mods.join("000_Managed.pak").exists());
+    }
+
+    #[test]
     fn ue4ss_mods_txt_preserves_unmanaged_lines_and_replaces_stale_entries() {
         let temp = TempRoot::new("ue4ss-mods-txt");
         let paths = temp.paths();
@@ -915,5 +1385,50 @@ mod tests {
         assert!(managed.contains(&base64::engine::general_purpose::STANDARD.encode("EnabledMod")));
         assert!(managed.contains(&base64::engine::general_purpose::STANDARD.encode("DisabledMod")));
         assert!(!managed.contains("OldManaged"));
+    }
+
+    fn build_test_pak(
+        root: &Path,
+        paths: &crate::paths::AppPaths,
+        label: &str,
+        entries: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let input = root.join(format!("{label}-input"));
+        for (relative, body) in entries {
+            let path = input.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        let pak = root.join(format!("{label}.pak"));
+        let output = Command::new(paths.resource("repak.exe"))
+            .arg("pack")
+            .arg("-m")
+            .arg("../../../")
+            .arg(&input)
+            .arg(&pak)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "repak pack failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        pak
+    }
+
+    fn read_pak_file(paths: &crate::paths::AppPaths, pak: &Path, resource: &str) -> Vec<u8> {
+        let output = Command::new(paths.resource("repak.exe"))
+            .arg("get")
+            .arg("--")
+            .arg(pak)
+            .arg(resource)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "repak get failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
     }
 }

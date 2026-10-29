@@ -1038,6 +1038,7 @@ fn parse_catalog(paths: &AppPaths, base: &str, value: Value) -> Result<Vec<Remot
         let mod_type = text(object.get("type"))
             .or_else(|| text(object.get("mod_type")))
             .unwrap_or_else(|| "clientPak".to_string());
+        let cover_url = catalog_cover_url(base, object);
         mods.push(RemoteMod {
             installed: installed.contains(&id.to_ascii_lowercase())
                 || installed.contains(&name.to_ascii_lowercase()),
@@ -1058,9 +1059,35 @@ fn parse_catalog(paths: &AppPaths, base: &str, value: Value) -> Result<Vec<Remot
                 .or_else(|| timestamp(object.get("uploadedAt")))
                 .unwrap_or_else(|| Utc::now().to_rfc3339()),
             mod_type,
+            cover_url,
         });
     }
     Ok(mods)
+}
+
+fn catalog_cover_url(base: &str, object: &serde_json::Map<String, Value>) -> Option<String> {
+    let candidate = [
+        "coverUrl",
+        "cover_url",
+        "imageUrl",
+        "image_url",
+        "cover",
+        "image",
+    ]
+    .iter()
+    .find_map(|key| text(object.get(*key)))?;
+    let parsed = Url::parse(base)
+        .ok()
+        .and_then(|base| base.join(candidate.trim()).ok())
+        .or_else(|| Url::parse(candidate.trim()).ok())?;
+    if !allowed_cloud_transport(&parsed)
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(parsed.to_string())
 }
 
 fn installed_names(paths: &AppPaths) -> HashSet<String> {
@@ -1423,8 +1450,9 @@ mod tests {
             "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extras}Connection: close\r\n\r\n",
             body.len()
         );
-        stream.write_all(header.as_bytes()).unwrap();
-        stream.write_all(body).unwrap();
+        // 下载端放弃重试时会直接断开连接，模拟服务器不该因为写失败 panic
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body);
     }
 
     fn no_progress() -> CloudDownloadProgressCallback {
@@ -1466,7 +1494,8 @@ mod tests {
                 "sha256": "ABC123",
                 "tags": ["weapon", 7],
                 "released_at": "2026-10-26T00:00:00Z",
-                "type": "clientPak"
+                "type": "clientPak",
+                "coverUrl": "images/installed-weapon.webp"
             }, {
                 "id": "script-pack",
                 "name": "ScriptPack",
@@ -1484,6 +1513,10 @@ mod tests {
         assert_eq!(mods[0].file_size, 4096);
         assert_eq!(mods[0].tags, vec!["weapon"]);
         assert_eq!(
+            mods[0].cover_url.as_deref(),
+            Some("https://mods.example.test/images/installed-weapon.webp")
+        );
+        assert_eq!(
             mods[0].download_url,
             "https://mods.example.test/mods/installed-weapon/download"
         );
@@ -1491,6 +1524,35 @@ mod tests {
         assert_eq!(mods[1].mod_type, "ue4ssMod");
         assert_eq!(mods[1].file_size, 1024);
         assert_eq!(mods[1].updated_at, "2026-09-03T19:56:43+00:00");
+    }
+
+    #[test]
+    fn only_accepts_safe_catalog_cover_urls() {
+        let temp = TempRoot::new("cloud-cover-urls");
+        let paths = temp.paths();
+        let value = json!({
+            "mods": [
+                {"id":"relative","name":"Relative","coverUrl":"images/relative.webp"},
+                {"id":"absolute","name":"Absolute","imageUrl":"https://cdn.example.test/absolute.png"},
+                {"id":"unsafe","name":"Unsafe","cover_url":"javascript:alert(1)"},
+                {"id":"plain-http","name":"Plain HTTP","cover":"http://cdn.example.test/plain.jpg"},
+                {"id":"credentials","name":"Credentials","cover":"https://demo.invalid@cdn.example.test/private.png"}
+            ]
+        });
+
+        let mods = parse_catalog(&paths, "https://mods.example.test/", value).unwrap();
+
+        assert_eq!(
+            mods[0].cover_url.as_deref(),
+            Some("https://mods.example.test/images/relative.webp")
+        );
+        assert_eq!(
+            mods[1].cover_url.as_deref(),
+            Some("https://cdn.example.test/absolute.png")
+        );
+        assert_eq!(mods[2].cover_url, None);
+        assert_eq!(mods[3].cover_url, None);
+        assert_eq!(mods[4].cover_url, None);
     }
 
     #[test]
@@ -1529,6 +1591,7 @@ mod tests {
             updated_at: String::new(),
             mod_type: "clientPak".to_string(),
             installed: false,
+            cover_url: None,
         };
 
         assert_eq!(remote_filename(&remote), "Unsafe Demo.pak");
@@ -2021,6 +2084,7 @@ mod tests {
             updated_at: String::new(),
             mod_type: mod_type.to_string(),
             installed: false,
+            cover_url: None,
         }
     }
 
@@ -2246,7 +2310,15 @@ mod tests {
             deployed: false,
             description: String::new(),
             conflict_count: 0,
+            file_count: 0,
+            overridden_file_count: 0,
+            overriding_file_count: 0,
+            fully_overridden: false,
             update_version: None,
+            author: String::new(),
+            cover_url: None,
+            duplicate_count: 0,
+            duplicate_aliases: Vec::new(),
         }];
 
         assert_eq!(apply_catalog_names(&paths, &mut metadata, &mut mods), 1);

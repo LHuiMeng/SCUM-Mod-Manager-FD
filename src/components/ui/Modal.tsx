@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from "react";
+import { useI18n } from "../../i18n";
 import { Icon } from "./Icon";
 
 interface ModalProps {
@@ -14,6 +15,7 @@ const FOCUSABLE =
   'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
 
 export function Modal({ title, description, children, footer, onClose, wide }: ModalProps) {
+  const { t } = useI18n();
   const cardRef = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
@@ -71,7 +73,12 @@ export function Modal({ title, description, children, footer, onClose, wide }: M
             <h2 id="modal-title">{title}</h2>
             {description ? <p>{description}</p> : null}
           </div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="关闭">
+          <button
+            type="button"
+            className="icon-button"
+            onClick={onClose}
+            aria-label={t("common.close")}
+          >
             <Icon name="close" size={16} />
           </button>
         </header>

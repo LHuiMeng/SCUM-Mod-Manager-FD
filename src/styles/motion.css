@@ -1,0 +1,312 @@
+/*
+ * Interactive motion layer for SCUM Mod Desk.
+ * Import after global.css. Motion is intentionally short and never drives layout.
+ */
+
+/* Row reveal and stagger */
+.mod-rows > .mod-row {
+  transform-origin: center;
+  animation: motion-row-in 180ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  transition:
+    box-shadow 160ms ease,
+    opacity 160ms ease,
+    transform 160ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.mod-rows > .mod-row:nth-child(1) {
+  animation-delay: 0ms;
+}
+
+.mod-rows > .mod-row:nth-child(2) {
+  animation-delay: 12ms;
+}
+
+.mod-rows > .mod-row:nth-child(3) {
+  animation-delay: 24ms;
+}
+
+.mod-rows > .mod-row:nth-child(4) {
+  animation-delay: 36ms;
+}
+
+.mod-rows > .mod-row:nth-child(5) {
+  animation-delay: 48ms;
+}
+
+.mod-rows > .mod-row:nth-child(6) {
+  animation-delay: 60ms;
+}
+
+.mod-rows > .mod-row:nth-child(7) {
+  animation-delay: 72ms;
+}
+
+.mod-rows > .mod-row:nth-child(8) {
+  animation-delay: 84ms;
+}
+
+.mod-rows > .mod-row:nth-child(n + 9) {
+  animation-delay: 84ms;
+}
+
+@keyframes motion-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.998);
+  }
+}
+
+.mod-row.is-entering {
+  animation: motion-row-in 220ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.mod-row.is-new {
+  animation:
+    motion-row-in 240ms cubic-bezier(0.22, 1, 0.36, 1) backwards,
+    motion-row-spotlight 280ms ease-out;
+}
+
+@keyframes motion-row-spotlight {
+  from {
+    box-shadow:
+      inset 0 0 0 1px var(--accent),
+      inset 0 0 26px var(--accent-soft);
+  }
+
+  to {
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}
+
+.mod-row.is-removing {
+  pointer-events: none;
+  user-select: none;
+  animation: motion-row-out 220ms cubic-bezier(0.4, 0, 1, 1) both;
+}
+
+@keyframes motion-row-out {
+  to {
+    opacity: 0;
+    transform: translateY(-3px) scale(0.996);
+  }
+}
+
+.mod-row.is-selected::before {
+  transform-origin: center;
+  animation: motion-selection-bar 160ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+@keyframes motion-selection-bar {
+  from {
+    opacity: 0;
+    transform: scaleY(0.35);
+  }
+}
+
+/* Drag lift and drop target */
+.mod-row.is-dragging {
+  z-index: 4;
+  opacity: 0.84;
+  animation: none;
+  transform: translateY(-3px) rotate(-0.18deg) scale(0.998);
+  box-shadow:
+    0 12px 26px rgba(0, 0, 0, 0.18),
+    0 3px 8px rgba(0, 0, 0, 0.1);
+}
+
+.mod-row.is-dragging.is-fully-overridden {
+  opacity: 0.84;
+}
+
+.mod-row.is-drag-over {
+  background-color: var(--accent-soft);
+  box-shadow:
+    inset 0 2px 0 var(--accent),
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
+  animation: motion-drop-settle 180ms ease-out;
+}
+
+@keyframes motion-drop-settle {
+  from {
+    box-shadow: inset 0 0 0 1px transparent;
+  }
+}
+
+.mod-rows.is-sorting {
+  user-select: none;
+}
+
+.mod-rows.is-sorting .mod-row {
+  will-change: transform, box-shadow;
+}
+
+.mod-rows.is-sorting .row-drag {
+  opacity: 0.74;
+}
+
+.row-drag {
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+
+.mod-row:hover .row-drag {
+  transform: translateX(1px);
+}
+
+/* Fully overridden rows stay readable while clearly de-emphasized. */
+.mod-row.is-fully-overridden {
+  opacity: 0.52;
+}
+
+.mod-row.is-fully-overridden:hover,
+.mod-row.is-fully-overridden:focus-within,
+.mod-row.is-fully-overridden.is-selected {
+  opacity: 0.76;
+}
+
+/* Toggle: spring-like knob and immediate track feedback */
+.toggle {
+  transition:
+    background-color 180ms ease,
+    box-shadow 160ms ease,
+    transform 140ms ease;
+}
+
+.toggle:hover:not(:disabled) {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.toggle.is-off:hover:not(:disabled) {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 7%, transparent);
+}
+
+.toggle:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.toggle span {
+  transform-origin: center;
+  transition:
+    transform 210ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    background-color 180ms ease;
+}
+
+.toggle:active:not(:disabled) span {
+  transform: scale(0.88);
+}
+
+.toggle.is-off:active:not(:disabled) span {
+  transform: translateX(-16px) scale(0.88);
+}
+
+/* Buttons: a small physical press without shifting surrounding layout */
+.button {
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    box-shadow 160ms ease,
+    transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.button:active:not(:disabled) {
+  transform: translateY(1px) scale(0.985);
+}
+
+/* Cover art reveals softly inside its existing clipped container. */
+.mod-cover-image {
+  transform-origin: center;
+  animation: motion-cover-in 220ms ease-out both;
+}
+
+@keyframes motion-cover-in {
+  from {
+    opacity: 0;
+    transform: scale(1.025);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Status and conflict surfaces appear without changing their internal markup. */
+.status-pill {
+  transform-origin: center;
+  animation: motion-status-in 180ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+@keyframes motion-status-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px) scale(0.97);
+  }
+}
+
+[class^="conflict-"]:not(.mod-row),
+[class*=" conflict-"]:not(.mod-row) {
+  animation: motion-conflict-in 180ms ease-out backwards;
+}
+
+@keyframes motion-conflict-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* Existing dialog and toast entrances keep their shape; only timing is refined. */
+.modal-backdrop {
+  animation-duration: 180ms;
+  animation-timing-function: ease-out;
+}
+
+.modal-card {
+  animation-duration: 240ms;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.toast {
+  animation-duration: 240ms;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.toast:hover {
+  border-color: var(--line-strong);
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.22);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mod-rows > .mod-row,
+  .mod-row.is-entering,
+  .mod-row.is-new,
+  .mod-row.is-removing,
+  .mod-row.is-selected::before,
+  .mod-row.is-drag-over,
+  .row-drag,
+  .toggle,
+  .toggle span,
+  .button,
+  .mod-cover-image,
+  .status-pill,
+  [class^="conflict-"]:not(.mod-row),
+  [class*=" conflict-"]:not(.mod-row),
+  .modal-backdrop,
+  .modal-card,
+  .toast {
+    animation-delay: 0ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-delay: 0ms !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .mod-row.is-dragging {
+    transform: none !important;
+  }
+}

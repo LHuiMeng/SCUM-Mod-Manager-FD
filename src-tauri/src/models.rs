@@ -8,6 +8,10 @@ fn default_theme() -> String {
     "light".to_string()
 }
 
+fn default_language() -> String {
+    "zh-CN".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LaunchOptions {
@@ -109,6 +113,8 @@ pub struct AppSettings {
     #[serde(alias = "serverInstallPath", alias = "server_install_path")]
     pub server_install_path: String,
     pub theme: String,
+    #[serde(default = "default_language")]
+    pub language: String,
     #[serde(alias = "launchOptions", alias = "launch_options")]
     pub launch_options: LaunchOptions,
     #[serde(alias = "cloud", alias = "cloud_sources")]
@@ -129,6 +135,7 @@ impl Default for AppSettings {
             scum_install_path: String::new(),
             server_install_path: String::new(),
             theme: default_theme(),
+            language: default_language(),
             launch_options: LaunchOptions::default(),
             cloud: CloudSettings::default(),
             sftp_accounts: Vec::new(),
@@ -138,10 +145,11 @@ impl Default for AppSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct ModEntry {
     pub id: String,
     pub name: String,
+    pub author: String,
     pub file_name: String,
     pub file_path: String,
     pub file_size: u64,
@@ -157,7 +165,73 @@ pub struct ModEntry {
     pub deployed: bool,
     pub description: String,
     pub conflict_count: usize,
+    #[serde(default)]
+    pub file_count: usize,
+    #[serde(default)]
+    pub overridden_file_count: usize,
+    #[serde(default)]
+    pub overriding_file_count: usize,
+    #[serde(default)]
+    pub fully_overridden: bool,
     pub update_version: Option<String>,
+    pub cover_url: Option<String>,
+    #[serde(default)]
+    pub duplicate_count: usize,
+    #[serde(default)]
+    pub duplicate_aliases: Vec<String>,
+}
+
+impl Default for ModEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            author: String::new(),
+            file_name: String::new(),
+            file_path: String::new(),
+            file_size: 0,
+            last_modified: String::new(),
+            enabled: false,
+            mod_type: String::new(),
+            load_order: 0,
+            tags: Vec::new(),
+            notes: String::new(),
+            sha256: String::new(),
+            origin_source: "local".to_string(),
+            deployed: false,
+            description: String::new(),
+            conflict_count: 0,
+            file_count: 0,
+            overridden_file_count: 0,
+            overriding_file_count: 0,
+            fully_overridden: false,
+            update_version: None,
+            cover_url: None,
+            duplicate_count: 0,
+            duplicate_aliases: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConflictOwner {
+    pub id: String,
+    pub name: String,
+    pub load_order: usize,
+    #[serde(rename = "type")]
+    pub mod_type: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ConflictGroup {
+    pub key: String,
+    pub paths: Vec<String>,
+    pub owners: Vec<ConflictOwner>,
+    pub default_winner_id: String,
+    pub winner_id: String,
+    pub selected_winner_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +258,7 @@ impl Default for GameStatus {
 #[serde(rename_all = "camelCase")]
 pub struct LibrarySnapshot {
     pub mods: Vec<ModEntry>,
+    pub conflicts: Vec<ConflictGroup>,
     pub settings: AppSettings,
     pub game_status: GameStatus,
     pub last_deployed_at: Option<String>,
@@ -203,7 +278,7 @@ pub struct RuntimeLog {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct RemoteMod {
     pub id: String,
     pub name: String,
@@ -218,6 +293,27 @@ pub struct RemoteMod {
     #[serde(rename = "type")]
     pub mod_type: String,
     pub installed: bool,
+    pub cover_url: Option<String>,
+}
+
+impl Default for RemoteMod {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            author: String::new(),
+            version: String::new(),
+            description: String::new(),
+            file_size: 0,
+            download_url: String::new(),
+            sha256: String::new(),
+            tags: Vec::new(),
+            updated_at: String::new(),
+            mod_type: String::new(),
+            installed: false,
+            cover_url: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,9 +424,19 @@ pub struct InstallUpdateResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocaleBundle {
+    pub language: String,
+    pub messages: std::collections::BTreeMap<String, String>,
+    pub source: String,
+    pub locale_directory: String,
+    pub warnings: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::LaunchOptions;
+    use super::{ConflictGroup, ConflictOwner, LaunchOptions};
 
     #[test]
     fn client_args_include_pak_compatibility_flags() {
@@ -355,5 +461,30 @@ mod tests {
             port: "7777".to_string(),
         };
         assert_eq!(options.build_args(true, false), vec!["-log", "-port=7777"]);
+    }
+
+    #[test]
+    fn conflict_contract_serializes_camel_case_and_type() {
+        let group = ConflictGroup {
+            key: "scum/content/shared".to_string(),
+            paths: vec!["SCUM/Content/Shared.uasset".to_string()],
+            owners: vec![ConflictOwner {
+                id: "alpha".to_string(),
+                name: "Alpha".to_string(),
+                load_order: 0,
+                mod_type: "clientPak".to_string(),
+            }],
+            default_winner_id: "alpha".to_string(),
+            winner_id: "alpha".to_string(),
+            selected_winner_id: None,
+        };
+
+        let value = serde_json::to_value(group).unwrap();
+
+        assert_eq!(value["defaultWinnerId"], "alpha");
+        assert_eq!(value["winnerId"], "alpha");
+        assert_eq!(value["selectedWinnerId"], serde_json::Value::Null);
+        assert_eq!(value["owners"][0]["loadOrder"], 0);
+        assert_eq!(value["owners"][0]["type"], "clientPak");
     }
 }

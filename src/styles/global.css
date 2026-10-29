@@ -72,23 +72,97 @@ textarea:focus-visible,
 }
 
 .app-frame {
-  width: calc(100% - 16px);
-  height: calc(100% - 16px);
-  margin: 8px;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  margin: 0;
   display: flex;
   overflow: hidden;
   border-radius: var(--radius-window);
   color: var(--ink);
   background: var(--rail);
-  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.3);
 }
 
 .app-frame.is-maximized {
-  width: 100%;
-  height: 100%;
-  margin: 0;
   border-radius: 0;
-  box-shadow: none;
+}
+
+.window-resize-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  pointer-events: none;
+}
+
+.window-resize-handle {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+  -webkit-app-region: no-drag;
+}
+
+.window-resize-handle.is-north,
+.window-resize-handle.is-south {
+  right: 16px;
+  left: 16px;
+  height: 10px;
+  cursor: ns-resize;
+}
+
+.window-resize-handle.is-north {
+  top: 0;
+}
+
+.window-resize-handle.is-south {
+  bottom: 0;
+}
+
+.window-resize-handle.is-west,
+.window-resize-handle.is-east {
+  top: 16px;
+  bottom: 16px;
+  width: 10px;
+  cursor: ew-resize;
+}
+
+.window-resize-handle.is-west {
+  left: 0;
+}
+
+.window-resize-handle.is-east {
+  right: 0;
+}
+
+.window-resize-handle.is-north-west,
+.window-resize-handle.is-north-east,
+.window-resize-handle.is-south-west,
+.window-resize-handle.is-south-east {
+  width: 22px;
+  height: 22px;
+}
+
+.window-resize-handle.is-north-west {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+
+.window-resize-handle.is-north-east {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+
+.window-resize-handle.is-south-west {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}
+
+.window-resize-handle.is-south-east {
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
 }
 
 .sidebar {
@@ -532,12 +606,12 @@ textarea:focus-visible,
 }
 
 .toggle.is-off {
-  background: color-mix(in srgb, var(--ink) 16%, transparent);
+  background: var(--toggle-off-track);
 }
 
 .toggle.is-off span {
   transform: translateX(-16px);
-  background: var(--paper-hi);
+  background: var(--toggle-off-knob);
 }
 
 .toggle:disabled {
@@ -634,7 +708,7 @@ textarea:focus-visible,
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 22px 22px 0;
+  padding: 24px 24px 0;
 }
 
 .page-heading {
@@ -642,7 +716,7 @@ textarea:focus-visible,
   align-items: flex-end;
   justify-content: space-between;
   gap: 18px;
-  padding: 0 2px 17px;
+  padding: 0 0 21px;
 }
 
 .page-heading h1,
@@ -897,7 +971,8 @@ textarea:focus-visible,
 .table-head {
   height: 38px;
   flex: 0 0 38px;
-  padding: 0 13px;
+  /* 右侧 21px = 13px 内边距 + 8px 滚动条槽，和 .mod-rows 的稳定滚动条槽对齐 */
+  padding: 0 21px 0 13px;
   color: var(--muted);
   font-family: var(--mono);
   font-size: var(--type-micro);
@@ -905,10 +980,26 @@ textarea:focus-visible,
   text-transform: uppercase;
 }
 
+/* 数字列右对齐，表头跟着右对齐；开关列居中，避免 2 个字压在 46px 开关左沿 */
+.table-head span:nth-child(4) {
+  text-align: right;
+}
+
+.table-head span:nth-child(5) {
+  text-align: center;
+}
+
 .mod-rows {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  /* 行数变化时不再让 8px 滚动条把数据列推离表头 */
+  scrollbar-gutter: stable;
+}
+
+/* 空态铺满列表区域后居中，而不是贴在表格顶部 */
+.mod-rows > .empty-state {
+  min-height: 100%;
 }
 
 .mod-row {
@@ -926,9 +1017,19 @@ textarea:focus-visible,
   background: color-mix(in srgb, var(--paper-hi) 58%, transparent);
 }
 
+/* 暗色下 paper-hi 只比行底亮一点，悬停要用 paper-lo 才看得出来 */
+:root[data-theme="dark"] .mod-row:hover {
+  background: color-mix(in srgb, var(--paper-lo) 62%, transparent);
+}
+
 .mod-row.is-selected {
   background: var(--paper-hi);
   transition: box-shadow 140ms ease;
+}
+
+/* 暗色下 paper-hi 和行底几乎同色，选中态要靠更深一档的表面才看得出来 */
+:root[data-theme="dark"] .mod-row.is-selected {
+  background: var(--paper-lo);
 }
 
 .mod-row.is-selected::before {
@@ -970,6 +1071,25 @@ body.is-row-dragging {
   cursor: grabbing;
 }
 
+.mod-cover {
+  position: relative;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.mod-cover-image {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.mod-cover-fallback {
+  display: grid;
+  place-items: center;
+}
+
 .mod-thumb {
   position: relative;
   width: 34px;
@@ -985,12 +1105,22 @@ body.is-row-dragging {
   font-weight: 600;
 }
 
+.mod-thumb .mod-cover-image {
+  position: absolute;
+  inset: 0;
+}
+
+.mod-thumb .mod-cover-fallback {
+  position: relative;
+  z-index: 1;
+}
+
 .mod-row.is-selected .mod-thumb {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 58%, transparent);
   color: var(--ink);
 }
 
-.mod-thumb::after {
+.mod-thumb:not(:has(.mod-cover-image))::after {
   content: "";
   position: absolute;
   width: 27px;
@@ -1114,22 +1244,52 @@ body.is-row-dragging {
     var(--paper-lo);
 }
 
+.inspector-art {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+.inspector-art .mod-cover-image {
+  object-position: center 42%;
+}
+
+.inspector-art .mod-cover-fallback {
+  display: none;
+}
+
+.inspector-art:has(.mod-cover-image)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--paper-lo) 6%, transparent) 30%,
+    color-mix(in srgb, var(--paper-lo) 76%, transparent) 100%
+  );
+}
+
 .inspector-monogram {
   position: absolute;
-  left: 16px;
-  top: 4px;
-  color: color-mix(in srgb, var(--ink) 9%, transparent);
+  right: 18px;
+  top: 6px;
+  color: color-mix(in srgb, var(--ink) 8%, transparent);
   font-family: "Archivo", sans-serif;
-  font-size: 54px;
+  font-size: 46px;
   font-weight: 600;
-  letter-spacing: -0.06em;
+  letter-spacing: -0.05em;
   line-height: 1;
+}
+
+.inspector-art:has(.mod-cover-image) + .inspector-monogram {
+  display: none;
 }
 
 .preview-meta {
   position: relative;
   z-index: 1;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   width: 100%;
@@ -1147,6 +1307,7 @@ body.is-row-dragging {
   background: color-mix(in srgb, var(--paper-hi) 65%, transparent);
   font-family: var(--mono);
   font-size: var(--type-micro);
+  white-space: nowrap;
 }
 
 .preview-badge i {
@@ -1163,6 +1324,10 @@ body.is-row-dragging {
 .preview-badge.is-warn {
   border-color: color-mix(in srgb, var(--warn) 42%, transparent);
   color: var(--warn);
+}
+
+.preview-badge.is-muted {
+  color: var(--muted);
 }
 
 .inspector-body {
@@ -1196,8 +1361,8 @@ body.is-row-dragging {
   white-space: nowrap;
 }
 
-.inspector-byline {
-  margin-top: 7px;
+.inspector-author {
+  margin-top: 5px;
   color: var(--muted);
   font-size: var(--type-meta);
 }
@@ -1229,6 +1394,19 @@ body.is-row-dragging {
   border-top: 1px solid var(--line);
 }
 
+.inspector-description {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: var(--type-label);
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.inspector-description.is-empty {
+  opacity: 0.72;
+}
+
 .section-title {
   display: flex;
   align-items: center;
@@ -1258,7 +1436,7 @@ body.is-row-dragging {
 
 .detail-facts {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   margin-top: 12px;
   overflow: hidden;
   border: 1px solid var(--line);
@@ -1270,12 +1448,8 @@ body.is-row-dragging {
   padding: 11px;
 }
 
-.detail-facts > div:nth-child(odd) {
-  border-right: 1px solid var(--line);
-}
-
-.detail-facts > div:nth-child(n + 3) {
-  border-top: 1px solid var(--line);
+.detail-facts > div + div {
+  border-left: 1px solid var(--line);
 }
 
 .detail-facts span {
@@ -1336,6 +1510,7 @@ body.is-row-dragging {
 
 .note-box {
   min-height: 64px;
+  flex: 1;
   margin-top: 10px;
   padding: 11px;
   border: 1px solid var(--line);
@@ -1344,6 +1519,17 @@ body.is-row-dragging {
   background: var(--soft-fill);
   font-size: var(--type-label);
   line-height: 1.65;
+}
+
+/* 备注是唯一可伸展的区块：让检查器底部不留一块空台面 */
+.inspector-section:last-of-type {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.inspector-section:last-of-type .note-box {
+  flex: 1;
 }
 
 .note-box.is-empty {
@@ -1365,6 +1551,19 @@ body.is-row-dragging {
   font-size: var(--type-micro);
 }
 
+.inspector-footer-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.inspector-footer-meta > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .inspector-footer button {
   min-height: 32px;
   padding: 0 4px;
@@ -1375,6 +1574,29 @@ body.is-row-dragging {
 
 .inspector-footer button:hover {
   color: var(--ink);
+}
+
+.inspector-footer .inspector-delete-button {
+  flex: 0 0 auto;
+  padding: 0 9px;
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent);
+  font-family: inherit;
+}
+
+.inspector-footer .inspector-delete-button:hover {
+  border-color: color-mix(in srgb, var(--danger) 48%, transparent);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+.delete-confirm-note {
+  margin: 0;
+  padding: 11px 12px;
+  border-left: 2px solid var(--danger);
+  color: var(--ink);
+  background: var(--soft-fill);
+  font-size: var(--type-label);
+  line-height: 1.65;
 }
 
 .inspector-empty {
@@ -1424,7 +1646,7 @@ body.is-row-dragging {
 }
 
 .page-header h1 {
-  font-size: 28px;
+  font-size: 30px;
 }
 
 .page-footnote {
@@ -1509,6 +1731,15 @@ body.is-row-dragging {
   white-space: nowrap;
 }
 
+.cloud-edition-meta {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--type-meta);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .empty-state {
   min-height: 260px;
   display: flex;
@@ -1547,7 +1778,9 @@ body.is-row-dragging {
 .remote-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  align-items: start;
+  /* 同一行的卡等高，卡脚贴底；剩余高度留在网格下方，不再把第二行顶下去 */
+  align-items: stretch;
+  align-content: start;
   gap: 12px;
 }
 
@@ -1569,17 +1802,24 @@ body.is-row-dragging {
 }
 
 .remote-mark {
+  position: relative;
   width: 40px;
   height: 40px;
   flex: 0 0 auto;
   display: grid;
   place-items: center;
+  overflow: hidden;
   border-radius: 10px;
   color: var(--accent);
   background: var(--accent-soft);
   font-family: "Archivo", sans-serif;
   font-size: var(--type-body);
   font-weight: 600;
+}
+
+.remote-mark .mod-cover-image {
+  position: absolute;
+  inset: 0;
 }
 
 .remote-identity {
@@ -1738,7 +1978,7 @@ body.is-row-dragging {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-top: 2px;
+  margin-top: auto;
   padding-top: 10px;
   border-top: 1px solid var(--line);
 }
@@ -1977,15 +2217,24 @@ body.is-row-dragging {
 .log-console {
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 0 0 var(--radius-lg) var(--radius-lg);
   color: var(--muted);
-  background: color-mix(in srgb, var(--rail) 6%, var(--paper));
+  background: color-mix(in srgb, var(--rail) 4%, var(--paper));
   font-family: var(--mono);
 }
 
+/* 空态铺满控制台并居中，不要贴在面板顶部三分之一处 */
+.log-console > .empty-state {
+  flex: 1;
+  min-height: 0;
+}
+
 .log-line {
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: 82px 40px 96px minmax(0, 1fr);
   gap: 10px;
@@ -2035,18 +2284,16 @@ body.is-row-dragging {
   max-width: none;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: 28px;
-  align-items: start;
-  padding: 0 24px;
+  gap: 14px;
+  align-items: stretch;
+  padding: 0;
 }
 
 .settings-group {
-  padding: 21px 0;
-  border-bottom: 1px solid var(--line);
-}
-
-.settings-group:last-child {
-  border-bottom: 0;
+  padding: 18px 20px 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--soft-fill);
 }
 
 .settings-sheet > .settings-cloud {
@@ -2166,6 +2413,52 @@ body.is-row-dragging {
 .theme-options small {
   align-self: start;
   margin-top: 4px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+
+.settings-language {
+  grid-column: 1 / -1;
+}
+
+.language-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 13px;
+}
+
+.language-options > button {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+}
+
+.language-options > button:hover {
+  border-color: var(--line-strong);
+  background: var(--soft-fill-hover);
+}
+
+.language-options > button.is-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.language-options b {
+  font-size: var(--type-body);
+  font-weight: 600;
+}
+
+.language-options small {
   color: var(--muted);
   font-family: var(--mono);
   font-size: var(--type-micro);
@@ -2561,6 +2854,21 @@ body.is-row-dragging {
   background: var(--paper);
 }
 
+.tag-editor:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* 这些字段已经用边框 + 柔光圈表达焦点，不要再叠一圈 2px 硬描边 */
+.search-field input:focus-visible,
+.tag-editor input:focus-visible,
+.form-grid input:focus-visible,
+.settings-group input:focus-visible,
+.compact-input:focus-visible,
+.note-input:focus-visible {
+  outline: none;
+}
+
 .tag-editor-chip {
   height: 25px;
   display: inline-flex;
@@ -2764,8 +3072,7 @@ body.is-row-dragging {
 
   .settings-sheet {
     grid-template-columns: 1fr;
-    column-gap: 0;
-    padding: 0 18px;
+    gap: 12px;
   }
 }
 
@@ -2806,11 +3113,11 @@ body.is-row-dragging {
     gap: 12px;
   }
 
-  .heading-tools {
+  .page-heading .heading-tools {
     width: 100%;
   }
 
-  .search-field {
+  .page-heading .search-field {
     flex: 1;
     width: auto;
   }
@@ -2904,11 +3211,34 @@ body.is-row-dragging {
     align-items: flex-start;
     flex-direction: column;
   }
+
+  /* 标题在窄窗堆到一行后，工具组别贴着左边缘，跟卡片左沿一起收在右边 */
+  .page-header .heading-tools {
+    width: 100%;
+    justify-content: flex-end;
+  }
 }
 
 @media (max-height: 760px) {
   .mod-row {
     min-height: 58px;
+  }
+
+  /* 720 高的窗口里省回标题与行高，列表可视行数不低于 5 */
+  .library-main {
+    padding-top: 18px;
+  }
+
+  .page {
+    padding-top: 18px;
+  }
+
+  .page-heading {
+    padding-bottom: 15px;
+  }
+
+  .page-header {
+    padding-bottom: 16px;
   }
 
   .inspector-preview {

@@ -312,6 +312,9 @@ async function connect(url, appUrl) {
     const primary = await evaluate(
       "document.querySelectorAll('.page-transition .button-primary').length",
     );
+    const resizeHandles = await evaluate(
+      "document.querySelectorAll('.window-resize-handle').length",
+    );
     if (info.horizontalOverflow) throw new Error("出现横向溢出");
     if (info.clipped.length) throw new Error(`控件越界：${JSON.stringify(info.clipped)}`);
     for (const [label, rect] of Object.entries(info.controls)) {
@@ -320,8 +323,9 @@ async function connect(url, appUrl) {
       }
     }
     if (primary !== 1) throw new Error(`主操作数量应为 1，实际 ${primary}`);
+    if (resizeHandles !== 8) throw new Error(`窗口缩放命中区数量异常：${resizeHandles}`);
     screenshots.push(await screenshot("1440-light-library-initial"));
-    return { info, primary };
+    return { info, primary, resizeHandles };
   });
 
   await test("搜索、清空与筛选", async () => {
@@ -379,6 +383,164 @@ async function connect(url, appUrl) {
       )}`,
     );
     return { before, after };
+  });
+
+  await test("冲突覆盖链、胜者保存与响应式弹层", async () => {
+    const selected = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-row-main > b")?.innerText === "SCUM_WeaponPack_Elite");
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+    if (!selected) throw new Error("找不到用于冲突验收的模组行");
+    await waitFor(
+      `document.querySelector(".mod-row.is-selected .mod-row-main > b")?.innerText === "SCUM_WeaponPack_Elite"`,
+    );
+
+    const before = await evaluate(`(() => {
+      const row = document.querySelector(".mod-row.is-selected");
+      return {
+        conflictPill: row?.querySelector(".mod-conflict-pill")?.innerText ?? "",
+        healthTrigger: Boolean(document.querySelector(".inspector .conflict-health-trigger")),
+      };
+    })()`);
+    if (!before.conflictPill.includes("覆盖") || !before.conflictPill.includes("被覆盖")) {
+      throw new Error(`覆盖统计未显示：${JSON.stringify(before)}`);
+    }
+    if (!before.healthTrigger) throw new Error("冲突详情入口不存在");
+
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('.conflict-panel') !== null");
+    const panel = await evaluate(`(() => {
+      const dialog = document.querySelector(".modal-card");
+      const choices = [...document.querySelectorAll(".conflict-choice")];
+      const paths = [...document.querySelectorAll(".conflict-paths code")];
+      const rect = dialog?.getBoundingClientRect();
+      return {
+        title: document.querySelector("#modal-title")?.innerText ?? "",
+        groups: document.querySelectorAll(".conflict-group").length,
+        choices: choices.map(choice => choice.innerText),
+        paths: paths.map(path => path.innerText),
+        selected: choices.find(choice => choice.getAttribute("aria-checked") === "true")?.innerText ?? "",
+        dialogInsideViewport: Boolean(rect && rect.left >= 0 && rect.right <= innerWidth + 1),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+      };
+    })()`);
+    if (panel.title !== "覆盖关系") throw new Error(`冲突弹层标题异常：${JSON.stringify(panel)}`);
+    if (panel.groups < 1 || panel.choices.length < 2 || panel.paths.length < 2) {
+      throw new Error(`冲突详情内容不完整：${JSON.stringify(panel)}`);
+    }
+    if (!panel.paths.some(path => path.endsWith(".uasset")) ||
+        !panel.paths.some(path => path.endsWith(".uexp"))) {
+      throw new Error(`UE 资源组未完整展示：${JSON.stringify(panel.paths)}`);
+    }
+    if (!panel.dialogInsideViewport || panel.horizontalOverflow) {
+      throw new Error(`冲突弹层越界：${JSON.stringify(panel)}`);
+    }
+    screenshots.push(await screenshot("1440-light-conflict"));
+
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1100,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(200);
+    const narrow = await evaluate(`(() => {
+      const dialog = document.querySelector(".modal-card");
+      const rect = dialog?.getBoundingClientRect();
+      const clipped = [...document.querySelectorAll(".modal-card button, .modal-card code")]
+        .filter(element => {
+          const box = element.getBoundingClientRect();
+          return box.width > 0 && (box.right > innerWidth + 1 || box.left < -1);
+        })
+        .slice(0, 8)
+        .map(element => (element.innerText || "").slice(0, 50));
+      return {
+        dialogInsideViewport: Boolean(rect && rect.left >= 0 && rect.right <= innerWidth + 1),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        clipped,
+      };
+    })()`);
+    if (narrow.dialogInsideViewport === false || narrow.horizontalOverflow || narrow.clipped.length) {
+      throw new Error(`1100 宽冲突弹层越界：${JSON.stringify(narrow)}`);
+    }
+    screenshots.push(await screenshot("1100-light-conflict"));
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1440,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(150);
+
+    const picked = await evaluate(`(() => {
+      const choice = [...document.querySelectorAll(".conflict-choice")]
+        .find(item => item.innerText.includes("SCUM_WeaponPack_Elite"));
+      if (!choice) return false;
+      choice.click();
+      return true;
+    })()`);
+    if (!picked) throw new Error("找不到覆盖胜者选项");
+    await waitFor(
+      `[...document.querySelectorAll(".conflict-choice")]
+        .find(item => item.innerText.includes("SCUM_WeaponPack_Elite"))
+        ?.getAttribute("aria-checked") === "true"`,
+    );
+    await clickText("保存覆盖选择", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+    await waitFor("document.body.innerText.includes('覆盖选择已保存')");
+    await waitFor(
+      `document.querySelector(".mod-row.is-selected .mod-conflict-pill")?.innerText.includes("覆盖 2 / 被覆盖 0")`,
+    );
+
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('.conflict-panel') !== null");
+    const currentWinner = await evaluate(
+      "document.querySelector('.conflict-winner-summary > div:nth-child(2) dd')?.innerText ?? ''",
+    );
+    if (currentWinner !== "SCUM_WeaponPack_Elite") {
+      throw new Error(`当前胜者未更新：${currentWinner}`);
+    }
+    await clickText("取消", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+    return { before, panel, narrow, currentWinner };
+  });
+
+  await test("模组类型配色与完全覆盖淡化", async () => {
+    const appearance = await evaluate(`(() => {
+      const types = ["clientPak", "serverPak", "ue4ssMod", "configFile", "script", "other"];
+      const colors = {};
+      for (const type of types) {
+        const row = document.createElement("div");
+        row.className = "mod-row";
+        row.dataset.modType = type;
+        const label = document.createElement("span");
+        label.className = "mod-type";
+        row.appendChild(label);
+        document.body.appendChild(row);
+        colors[type] = getComputedStyle(label).color;
+        row.remove();
+      }
+      const faded = document.createElement("div");
+      faded.className = "mod-row is-fully-overridden";
+      document.body.appendChild(faded);
+      const opacity = Number(getComputedStyle(faded).opacity);
+      faded.remove();
+      return {
+        colors,
+        uniqueColors: new Set(Object.values(colors)).size,
+        opacity,
+      };
+    })()`);
+    if (appearance.uniqueColors !== 6) {
+      throw new Error(`模组类型颜色未全部区分：${JSON.stringify(appearance)}`);
+    }
+    if (!(appearance.opacity > 0 && appearance.opacity < 1)) {
+      throw new Error(`完全被覆盖行未淡化：${appearance.opacity}`);
+    }
+    return appearance;
   });
 
   await test("启动选项弹层与参数切换", async () => {
@@ -468,12 +630,26 @@ async function connect(url, appUrl) {
       throw new Error(`暗色 token 异常：${JSON.stringify(dark)}`);
     }
     if (
-      dark.selectedRowBackground !== "rgb(28, 28, 28)" ||
+      dark.selectedRowBackground !== "rgb(35, 35, 35)" ||
       dark.selectedRowTransition.includes("background")
     ) {
       throw new Error(`暗色选中行对比度过渡异常：${JSON.stringify(dark)}`);
     }
     screenshots.push(await screenshot("1440-dark-library"));
+    const conflictRow = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-conflict-pill.has-conflict, .mod-conflict-pill.is-full"));
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+    if (!conflictRow) throw new Error("暗色主题下找不到冲突模组");
+    await waitFor("document.querySelector('.conflict-health-trigger') !== null");
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('.conflict-panel') !== null");
+    screenshots.push(await screenshot("1440-dark-conflict"));
+    await clickText("取消", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
     await clickAria("切换到亮色主题");
     await waitFor("document.documentElement.dataset.theme === 'light'");
     return dark;
@@ -574,6 +750,143 @@ async function connect(url, appUrl) {
     await waitFor("document.body.innerText.includes('没有日志')");
     screenshots.push(await screenshot("1440-light-logs-empty"));
     return { filtered };
+  });
+
+  await test("删除模组入口、重复副本备份与列表移除", async () => {
+    await navigate("模组库");
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-row-main > b")?.innerText === "SCUM_WeaponPack_Elite");
+      row?.click();
+      return true;
+    })()`);
+    await waitFor(
+      `document.querySelector(".mod-row.is-selected .mod-row-main > b")?.innerText === "SCUM_WeaponPack_Elite"`,
+    );
+    const rowCount = await evaluate("document.querySelectorAll('.mod-row').length");
+    await clickText("删除模组", ".inspector-footer button");
+    await waitFor("document.querySelector('.modal-card') !== null");
+    const copy = await evaluate("document.querySelector('.modal-card')?.innerText ?? ''");
+    if (!copy.includes("backups/deleted") || !copy.includes("另外 1 份相同副本")) {
+      throw new Error(`删除确认未说明备份或重复副本：${copy.slice(0, 220)}`);
+    }
+    screenshots.push(await screenshot("1440-light-delete-confirm"));
+    await clickText("移入备份", ".modal-foot button");
+    await waitFor("document.querySelector('.modal-card') === null");
+    await waitFor(`document.querySelectorAll('.mod-row').length === ${rowCount - 1}`);
+    await waitFor("document.body.innerText.includes('模组已移入备份')");
+    const removed = await evaluate(
+      `![...document.querySelectorAll(".mod-row-main > b")].some(item => item.innerText === "SCUM_WeaponPack_Elite")`,
+    );
+    if (!removed) throw new Error("删除后模组仍留在列表中");
+    return { copy: copy.slice(0, 220), rowCountAfter: rowCount - 1 };
+  });
+
+  await test("中英文切换、持久化与英文窄窗布局", async () => {
+    await navigate("设置");
+    await clickText("English", ".language-options button");
+    await waitFor("document.documentElement.lang === 'en-US'");
+    await waitFor("document.querySelector('h1')?.innerText === 'Settings'");
+    const stored = await evaluate("localStorage.getItem('scum-language')");
+    if (stored !== "en-US") throw new Error(`语言未持久化：${stored}`);
+
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1100,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(200);
+    const englishSettingsLayout = await evaluate(`(() => {
+      const clipped = [...document.querySelectorAll("h1, button, input, textarea")]
+        .filter(element => {
+          const box = element.getBoundingClientRect();
+          return box.width > 0 && (box.right > innerWidth + 1 || box.left < -1);
+        })
+        .slice(0, 12)
+        .map(element => ({
+          tag: element.tagName,
+          text: (element.innerText || element.value || "").slice(0, 40),
+          className: element.className,
+        }));
+      return {
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        clipped,
+      };
+    })()`);
+    if (englishSettingsLayout.horizontalOverflow || englishSettingsLayout.clipped.length) {
+      throw new Error(`英文设置页越界：${JSON.stringify(englishSettingsLayout)}`);
+    }
+    screenshots.push(await screenshot("1100-en-settings"));
+    await clickText("Library", ".rail-button");
+    await waitFor("document.querySelector('h1')?.innerText === 'Mod Library'");
+    await wait(200);
+    const englishLayout = await evaluate(`(() => {
+      const clipped = [...document.querySelectorAll("h1, button, input, textarea")]
+        .filter(element => {
+          const box = element.getBoundingClientRect();
+          return box.width > 0 && (box.right > innerWidth + 1 || box.left < -1);
+        })
+        .slice(0, 12)
+        .map(element => ({
+          tag: element.tagName,
+          text: (element.innerText || element.value || "").slice(0, 40),
+          className: element.className,
+        }));
+      return {
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        clipped,
+      };
+    })()`);
+    if (englishLayout.horizontalOverflow || englishLayout.clipped.length) {
+      throw new Error(`英文布局越界：${JSON.stringify(englishLayout)}`);
+    }
+    screenshots.push(await screenshot("1100-en-library"));
+    const selectedConflict = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-conflict-pill.has-conflict, .mod-conflict-pill.is-full"));
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+    if (!selectedConflict) throw new Error("英文界面找不到冲突详情入口");
+    await waitFor("document.querySelector('.conflict-health-trigger') !== null");
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('#modal-title')?.innerText === 'Override relationships'");
+    const englishConflict = await evaluate(`(() => {
+      const dialog = document.querySelector(".modal-card");
+      const rect = dialog?.getBoundingClientRect();
+      return {
+        groups: document.querySelectorAll(".conflict-group").length,
+        choices: document.querySelectorAll(".conflict-choice").length,
+        dialogInsideViewport: Boolean(rect && rect.left >= 0 && rect.right <= innerWidth + 1),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+      };
+    })()`);
+    if (
+      englishConflict.groups < 1 ||
+      englishConflict.choices < 2 ||
+      !englishConflict.dialogInsideViewport ||
+      englishConflict.horizontalOverflow
+    ) {
+      throw new Error(`英文冲突弹层异常：${JSON.stringify(englishConflict)}`);
+    }
+    screenshots.push(await screenshot("1100-en-conflict"));
+    await clickText("Cancel", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+
+    await clickText("Settings", ".rail-button");
+    await waitFor("document.querySelector('h1')?.innerText === 'Settings'");
+    await clickText("简体中文", ".language-options button");
+    await waitFor("document.documentElement.lang === 'zh-CN'");
+    await waitFor("document.querySelector('h1')?.innerText === '设置'");
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1440,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    return { stored, englishLayout };
   });
 
   await test("1100x720 所有页面无横向溢出", async () => {

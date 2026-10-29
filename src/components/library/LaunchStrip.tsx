@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { LaunchOptions } from "../../types";
+import { useI18n } from "../../i18n";
 import { formatBytes } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { Toggle } from "../ui/Toggle";
@@ -25,6 +26,7 @@ export function LaunchStrip({
   onOptionsChange,
   onOpenSettings,
 }: LaunchStripProps) {
+  const { t } = useI18n();
   const [optionsOpen, setOptionsOpen] = useState(false);
   const optionsRef = useRef<HTMLDivElement>(null);
 
@@ -54,17 +56,17 @@ export function LaunchStrip({
       <div className="strip-state">
         <span className={`strip-dot ${running ? "is-running" : ""}`} />
         <div>
-          <b>{running ? "游戏正在运行" : "可以启动客户端"}</b>
-          <span>{running ? "退出后回收本次部署" : "启动时部署启用模组"}</span>
+          <b>{running ? t("launch.runningTitle") : t("launch.readyTitle")}</b>
+          <span>{running ? t("launch.runningDetail") : t("launch.readyDetail")}</span>
         </div>
       </div>
       <div className="strip-facts">
         <span>
-          已启用 <b>{enabledCount}</b>
+          {t("launch.enabled")} <b>{enabledCount}</b>
         </span>
         <i />
         <span>
-          总大小 <b>{formatBytes(totalBytes)}</b>
+          {t("launch.totalSize")} <b>{formatBytes(totalBytes)}</b>
         </span>
       </div>
       <div className="launch-options-wrap" ref={optionsRef}>
@@ -75,34 +77,34 @@ export function LaunchStrip({
           aria-expanded={optionsOpen}
           aria-haspopup="dialog"
         >
-          启动选项
+          {t("launch.options")}
         </Button>
         {optionsOpen ? (
-          <div className="launch-options-popover" role="dialog" aria-label="启动选项">
+          <div className="launch-options-popover" role="dialog" aria-label={t("launch.options")}>
             <div className="launch-options-head">
-              <b>启动参数</b>
-              <span>改动立即保存，下次启动生效</span>
+              <b>{t("launch.optionsTitle")}</b>
+              <span>{t("launch.optionsDetail")}</span>
             </div>
             <label className="launch-option-row">
               <span>
-                <b>启用日志</b>
-                <small>向游戏附加 -log</small>
+                <b>{t("launch.log")}</b>
+                <small>{t("launch.logDetail")}</small>
               </span>
               <Toggle
                 checked={launchOptions.log}
                 onChange={(log) => onOptionsChange({ ...launchOptions, log })}
-                label="启用日志"
+                label={t("launch.log")}
               />
             </label>
             <label className="launch-option-row">
               <span>
-                <b>文件打开日志</b>
-                <small>向游戏附加 -fileopenlog</small>
+                <b>{t("launch.fileLog")}</b>
+                <small>{t("launch.fileLogDetail")}</small>
               </span>
               <Toggle
                 checked={launchOptions.fileOpenLog}
                 onChange={(fileOpenLog) => onOptionsChange({ ...launchOptions, fileOpenLog })}
-                label="文件打开日志"
+                label={t("launch.fileLog")}
               />
             </label>
             <Button
@@ -113,7 +115,7 @@ export function LaunchStrip({
                 onOpenSettings();
               }}
             >
-              全部启动设置
+              {t("launch.allSettings")}
             </Button>
           </div>
         ) : null}
@@ -124,7 +126,7 @@ export function LaunchStrip({
         icon={running ? "serverOff" : "play"}
         onClick={running ? onKill : onLaunch}
       >
-        {running ? "停止游戏" : "启动客户端"}
+        {running ? t("launch.stop") : t("launch.start")}
       </Button>
     </section>
   );

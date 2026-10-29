@@ -1,4 +1,5 @@
 export type ThemeMode = "light" | "dark";
+export type Language = "zh-CN" | "en-US";
 export type NavSection = "library" | "cloud" | "server" | "logs" | "settings";
 export type AppEdition = "public" | "server";
 export type ModType =
@@ -12,6 +13,7 @@ export type ModType =
 export interface ModEntry {
   id: string;
   name: string;
+  author?: string | null;
   fileName: string;
   filePath: string;
   fileSize: number;
@@ -26,7 +28,30 @@ export interface ModEntry {
   deployed: boolean;
   description: string;
   conflictCount: number;
+  fileCount: number;
+  overriddenFileCount: number;
+  overridingFileCount: number;
+  fullyOverridden: boolean;
   updateVersion?: string | null;
+  coverUrl?: string | null;
+  duplicateCount?: number;
+  duplicateAliases?: string[];
+}
+
+export interface ConflictOwner {
+  id: string;
+  name: string;
+  loadOrder: number;
+  type: ModType;
+}
+
+export interface ConflictGroup {
+  key: string;
+  paths: string[];
+  owners: ConflictOwner[];
+  defaultWinnerId: string;
+  winnerId: string;
+  selectedWinnerId?: string | null;
 }
 
 export interface LaunchOptions {
@@ -56,6 +81,7 @@ export interface AppSettings {
   scumInstallPath: string;
   serverInstallPath: string;
   theme: ThemeMode;
+  language: Language;
   launchOptions: LaunchOptions;
   cloud: CloudSettings;
   sftpAccounts: SftpAccount[];
@@ -71,6 +97,7 @@ export interface GameStatus {
 
 export interface LibrarySnapshot {
   mods: ModEntry[];
+  conflicts: ConflictGroup[];
   settings: AppSettings;
   gameStatus: GameStatus;
   lastDeployedAt: string | null;
@@ -100,6 +127,7 @@ export interface RemoteMod {
   updatedAt: string;
   type: ModType;
   installed: boolean;
+  coverUrl?: string | null;
 }
 
 export type CloudDownloadPhase =
@@ -148,6 +176,14 @@ export interface AppInfo {
   secretsPath: string;
   platform: string;
   edition: AppEdition;
+}
+
+export interface LocaleBundle {
+  language: Language;
+  messages: Record<string, string>;
+  source: "bundled" | "user" | "mixed";
+  localeDirectory: string;
+  warnings: string[];
 }
 
 export interface AppUpdateInfo {

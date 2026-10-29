@@ -1,0 +1,14 @@
+{
+  "id": "weapon-pack",
+  "name": "武器外观包",
+  "author": "IslandWorks",
+  "version": "1.2.0",
+  "description": "替换武器外观，保持原有数值与掉落表不变。",
+  "fileSize": 5242880,
+  "downloadUrl": "",
+  "sha256": "",
+  "tags": ["武器", "外观"],
+  "updatedAt": "2026-10-29T00:00:00Z",
+  "type": "clientPak",
+  "coverUrl": "images/weapon-pack.webp"
+}

@@ -52,6 +52,9 @@ fn normalize_settings(paths: &AppPaths, settings: &mut AppSettings, raw: Option<
     if settings.theme != "dark" && settings.theme != "light" {
         settings.theme = "light".to_string();
     }
+    if settings.language != "zh-CN" && settings.language != "en-US" {
+        settings.language = "zh-CN".to_string();
+    }
     settings.cloud.base_urls = settings
         .cloud
         .base_urls
@@ -296,6 +299,32 @@ mod tests {
         );
         assert_eq!(settings.cloud.active_base_url, "https://Mods.Example");
         assert_eq!(settings.cloud.max_download_segments, 128);
+    }
+
+    #[test]
+    fn normalizes_language_and_preserves_supported_values() {
+        let temp = TempRoot::new("config-language");
+        let paths = temp.paths();
+        fs::write(
+            &paths.config_file,
+            serde_json::to_vec_pretty(&json!({
+                "language": "en-US",
+                "theme": "dark"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_settings(&paths).unwrap().language, "en-US");
+
+        fs::write(
+            &paths.config_file,
+            serde_json::to_vec_pretty(&json!({
+                "language": "fr-FR"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_settings(&paths).unwrap().language, "zh-CN");
     }
 
     #[test]

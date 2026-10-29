@@ -1,23 +1,29 @@
 import type { CloudDownloadPhase, CloudDownloadProgress } from "../types";
+import { translate, type Translator } from "../i18n";
 import { formatBytes } from "./format";
 
 export const MIN_CLOUD_DOWNLOAD_SEGMENTS = 8;
 export const MAX_CLOUD_DOWNLOAD_SEGMENTS = 128;
 
-const phaseLabels: Record<CloudDownloadPhase, string> = {
-  queued: "等待下载槽位",
-  preparing: "正在分析分片",
-  downloading: "正在分片下载",
-  verifying: "正在校验文件",
-  installing: "正在安装模组",
-  completed: "下载完成",
-  error: "下载失败",
+const phaseKeys = {
+  queued: "cloudDownload.queued",
+  preparing: "cloudDownload.preparing",
+  downloading: "cloudDownload.downloading",
+  verifying: "cloudDownload.verifying",
+  installing: "cloudDownload.installing",
+  completed: "cloudDownload.completed",
+  error: "cloudDownload.error",
+} as const;
+
+const fallbackT: Translator = (key, variables) => {
+  return translate("zh-CN", null, key, variables);
 };
 
 export function cloudDownloadPhaseLabel(
   phase: CloudDownloadPhase,
+  t: Translator = fallbackT,
 ): string {
-  return phaseLabels[phase];
+  return t(phaseKeys[phase]);
 }
 
 export function clampCloudDownloadSegments(value: number): number {
@@ -52,14 +58,25 @@ export function cloudDownloadPercent(progress: CloudDownloadProgress): number {
   return Math.min(100, Math.round((progress.downloaded / progress.total) * 100));
 }
 
-export function cloudDownloadDetail(progress: CloudDownloadProgress): string {
-  if (progress.phase === "queued") return "正在等待空闲下载槽位";
-  if (progress.phase === "preparing") return "正在探测 Range 支持并规划动态分片";
-  if (progress.phase === "verifying") return "正在合并分片并校验 SHA-256";
-  if (progress.phase === "installing") return "正在解压或写入本地模组库";
-  if (progress.phase === "completed") return "模组已写入本地模组库";
-  if (progress.phase === "error") return progress.message || "下载任务未完成";
+export function cloudDownloadDetail(
+  progress: CloudDownloadProgress,
+  t: Translator = fallbackT,
+): string {
+  if (progress.phase === "queued") return t("cloudDownload.detail.queued");
+  if (progress.phase === "preparing") return t("cloudDownload.detail.preparing");
+  if (progress.phase === "verifying") return t("cloudDownload.detail.verifying");
+  if (progress.phase === "installing") return t("cloudDownload.detail.installing");
+  if (progress.phase === "completed") return t("cloudDownload.detail.completed");
+  if (progress.phase === "error") {
+    return progress.message || t("cloudDownload.detail.error");
+  }
   const downloaded = formatBytes(progress.downloaded);
-  const total = progress.total ? formatBytes(progress.total) : "大小待确认";
-  return `${downloaded} / ${total} · ${progress.segments} 路并发`;
+  const total = progress.total
+    ? formatBytes(progress.total)
+    : t("common.sizePending");
+  return t("cloudDownload.detail.active", {
+    downloaded,
+    total,
+    segments: progress.segments,
+  });
 }

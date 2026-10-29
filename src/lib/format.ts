@@ -1,4 +1,15 @@
 import type { ModType } from "../types";
+import type { Language } from "../types";
+import type { TranslationKey } from "../i18n";
+
+const TYPE_KEYS: Record<ModType, TranslationKey> = {
+  clientPak: "modType.clientPak",
+  serverPak: "modType.serverPak",
+  ue4ssMod: "modType.ue4ssMod",
+  configFile: "modType.configFile",
+  script: "modType.script",
+  other: "modType.other",
+};
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
@@ -25,6 +36,10 @@ export function modTypeLabel(type: ModType): string {
   }
 }
 
+export function modTypeKey(type: ModType): TranslationKey {
+  return TYPE_KEYS[type] ?? TYPE_KEYS.other;
+}
+
 /** 列表、检查器与云端卡片共用同一套字母块规则：优先取词首字母，中文名取前两字。 */
 export function modMonogram(name: string): string {
   const trimmed = name.trim();
@@ -34,32 +49,56 @@ export function modMonogram(name: string): string {
   return trimmed.slice(0, 2).toUpperCase();
 }
 
-export function formatDate(value: string | null | undefined, todayLabel = "今天"): string {
-  if (!value) return "未记录";
+export function formatDate(
+  value: string | null | undefined,
+  language: Language = "zh-CN",
+  todayLabel = language === "en-US" ? "Today" : "今天",
+): string {
+  if (!value) return language === "en-US" ? "Not recorded" : "未记录";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "未记录";
+  if (Number.isNaN(date.getTime())) {
+    return language === "en-US" ? "Not recorded" : "未记录";
+  }
   const now = new Date();
   if (date.toDateString() === now.toDateString()) return todayLabel;
   if (date.getFullYear() !== now.getFullYear()) {
-    return `${date.getFullYear()} 年 ${date.getMonth() + 1} 月 ${date.getDate()} 日`;
+    return language === "en-US"
+      ? date.toLocaleDateString("en-US", {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        })
+      : `${date.getFullYear()} 年 ${date.getMonth() + 1} 月 ${date.getDate()} 日`;
   }
-  return `${date.getMonth() + 1} 月 ${date.getDate()} 日`;
+  return language === "en-US"
+    ? date.toLocaleDateString("en-US", { month: "short", day: "numeric" })
+    : `${date.getMonth() + 1} 月 ${date.getDate()} 日`;
 }
 
-export function formatClock(value: string | null | undefined): string {
+export function formatClock(
+  value: string | null | undefined,
+  language: Language = "zh-CN",
+): string {
   if (!value) return "--:--";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "--:--";
-  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  return date.toLocaleTimeString(language, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 /** 日志用：同日只显示时分，跨天补日期，跨年补年份。 */
-export function formatTimestamp(value: string | null | undefined): string {
+export function formatTimestamp(
+  value: string | null | undefined,
+  language: Language = "zh-CN",
+): string {
   if (!value) return "--:--";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "--:--";
   const now = new Date();
-  const clock = formatClock(value);
+  const clock = formatClock(value, language);
   if (date.toDateString() === now.toDateString()) return clock;
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
@@ -69,7 +108,7 @@ export function formatTimestamp(value: string | null | undefined): string {
   return `${month}-${day} ${clock}`;
 }
 
-export function compactHash(hash: string): string {
-  if (!hash) return "尚未计算";
+export function compactHash(hash: string, emptyLabel = "尚未计算"): string {
+  if (!hash) return emptyLabel;
   return hash.length > 12 ? `${hash.slice(0, 4)}…${hash.slice(-4)}` : hash;
 }

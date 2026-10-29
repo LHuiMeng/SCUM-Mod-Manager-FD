@@ -1,4 +1,5 @@
 import type { ToastMessage } from "../../types";
+import { useI18n } from "../../i18n";
 
 interface ToastStackProps {
   messages: ToastMessage[];
@@ -6,6 +7,7 @@ interface ToastStackProps {
 }
 
 export function ToastStack({ messages, onDismiss }: ToastStackProps) {
+  const { t } = useI18n();
   return (
     <div className="toast-stack" aria-live="polite">
       {messages.map((message) => (
@@ -13,7 +15,7 @@ export function ToastStack({ messages, onDismiss }: ToastStackProps) {
           type="button"
           className={`toast toast-${message.tone}`}
           key={message.id}
-          title="点击关闭"
+          title={t("common.clickToClose")}
           onClick={() => onDismiss(message.id)}
         >
           <span className="toast-mark" />

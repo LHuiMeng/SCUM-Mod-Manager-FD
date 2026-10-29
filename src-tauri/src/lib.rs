@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod edition;
 mod launcher;
+mod locales;
 mod metadata;
 mod models;
 mod mods;
@@ -39,8 +40,11 @@ pub fn run() {
             commands::set_mod_enabled,
             commands::reorder_mods,
             commands::update_mod_metadata,
+            commands::save_conflict_winners,
+            commands::delete_mod,
             commands::save_settings,
             commands::set_theme,
+            commands::set_language,
             commands::detect_paths,
             commands::launch_game,
             commands::kill_game,
@@ -50,6 +54,8 @@ pub fn run() {
             commands::get_logs,
             commands::clear_logs,
             commands::get_app_info,
+            commands::get_locale,
+            commands::get_locales,
             commands::check_app_update,
             commands::install_app_update,
             commands::fetch_cloud_catalog,

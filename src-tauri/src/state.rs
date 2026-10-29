@@ -4,20 +4,20 @@ use crate::edition;
 use crate::launcher::ManagedProcess;
 use crate::metadata::{self, MetadataFile};
 use crate::models::{
-    AppInfo, AppSettings, GameStatus, LibrarySnapshot, ModEntry, RuntimeLog, SftpAccount,
-    SftpAccountInput,
+    AppInfo, AppSettings, ConflictGroup, GameStatus, LibrarySnapshot, ModEntry, RuntimeLog,
+    SftpAccount, SftpAccountInput,
 };
 use crate::mods::deploy::{
     deployed_file_names, read_manifest, reclaim_mods, rescue_mods_from_game, sync_ue4ss_state,
 };
-use crate::mods::scan_local_mods;
-use crate::paths::{path_string, AppPaths};
+use crate::mods::{refresh_conflicts, scan_local_mods_with_diagnostics};
+use crate::paths::{is_within, path_string, safe_disk_name, AppPaths};
 use crate::secrets::{load_runtime_secrets, RuntimeSecrets};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use tauri::AppHandle;
 use uuid::Uuid;
@@ -27,6 +27,7 @@ pub struct AppState {
     pub settings: Mutex<AppSettings>,
     pub metadata: Mutex<MetadataFile>,
     pub mods: RwLock<Vec<ModEntry>>,
+    pub conflicts: RwLock<Vec<ConflictGroup>>,
     pub game: Mutex<GameStatus>,
     pub process: Mutex<Option<ManagedProcess>>,
     pub next_launch_token: Mutex<u64>,
@@ -56,8 +57,11 @@ impl AppState {
             MetadataFile::default()
         });
         let deployed = deployed_file_names(&paths);
-        let mut mods = scan_local_mods(&paths, &mut metadata, &deployed).unwrap_or_default();
+        let scan =
+            scan_local_mods_with_diagnostics(&paths, &mut metadata, &deployed).unwrap_or_default();
+        let mut mods = scan.mods;
         let _ = cloud::apply_catalog_names(&paths, &mut metadata, &mut mods);
+        let conflicts = refresh_conflicts(&mut metadata, &mut mods);
         let _ = metadata::save_metadata(&paths, &metadata);
         let deployed_at = read_manifest(&paths).map(|manifest| manifest.deployed_at);
         let state = Self {
@@ -65,6 +69,7 @@ impl AppState {
             settings: Mutex::new(settings),
             metadata: Mutex::new(metadata),
             mods: RwLock::new(mods),
+            conflicts: RwLock::new(conflicts),
             game: Mutex::new(GameStatus::default()),
             process: Mutex::new(None),
             next_launch_token: Mutex::new(0),
@@ -75,6 +80,7 @@ impl AppState {
             secrets,
         };
         state.log("info", "app", "Rust 后端已初始化，本地模组扫描完成");
+        log_pak_diagnostics(&state, &scan.diagnostics);
         Ok(state)
     }
 
@@ -83,6 +89,7 @@ impl AppState {
         let client_mods_path = suggested_pak_dir(&settings.scum_install_path);
         LibrarySnapshot {
             mods: self.mods.read().unwrap().clone(),
+            conflicts: self.conflicts.read().unwrap().clone(),
             settings,
             game_status: self.game.lock().unwrap().clone(),
             last_deployed_at: self.last_deployed_at.lock().unwrap().clone(),
@@ -120,13 +127,17 @@ impl AppState {
 
         let mut metadata = self.metadata.lock().unwrap();
         let deployed = deployed_file_names(&self.paths);
-        let mut mods = scan_local_mods(&self.paths, &mut metadata, &deployed)?;
+        let scan = scan_local_mods_with_diagnostics(&self.paths, &mut metadata, &deployed)?;
+        let mut mods = scan.mods;
         let named = cloud::apply_catalog_names(&self.paths, &mut metadata, &mut mods);
+        let conflicts = refresh_conflicts(&mut metadata, &mut mods);
         metadata::save_metadata(&self.paths, &metadata)?;
         let count = mods.len();
         *self.mods.write().unwrap() = mods;
+        *self.conflicts.write().unwrap() = conflicts;
         *self.last_scanned_at.lock().unwrap() = Some(Utc::now().to_rfc3339());
         drop(metadata);
+        log_pak_diagnostics(self, &scan.diagnostics);
         if named > 0 {
             self.log(
                 "info",
@@ -145,11 +156,15 @@ impl AppState {
     pub fn refresh_files(&self) -> Result<LibrarySnapshot> {
         let mut metadata = self.metadata.lock().unwrap();
         let deployed = deployed_file_names(&self.paths);
-        let mut mods = scan_local_mods(&self.paths, &mut metadata, &deployed)?;
+        let scan = scan_local_mods_with_diagnostics(&self.paths, &mut metadata, &deployed)?;
+        let mut mods = scan.mods;
         let named = cloud::apply_catalog_names(&self.paths, &mut metadata, &mut mods);
+        let conflicts = refresh_conflicts(&mut metadata, &mut mods);
         metadata::save_metadata(&self.paths, &metadata)?;
         *self.mods.write().unwrap() = mods;
+        *self.conflicts.write().unwrap() = conflicts;
         *self.last_scanned_at.lock().unwrap() = Some(Utc::now().to_rfc3339());
+        log_pak_diagnostics(self, &scan.diagnostics);
         if named > 0 {
             self.log(
                 "info",
@@ -164,18 +179,22 @@ impl AppState {
         if self.process_running() {
             anyhow::bail!("游戏运行期间不能更改模组启用状态");
         }
-        let mut mods = self.mods.write().unwrap();
-        let item = mods
-            .iter_mut()
-            .find(|item| item.id == id)
-            .context("找不到指定模组")?;
-        item.enabled = enabled;
-        let mods_snapshot = mods.clone();
-        drop(mods);
+        let mut mods_snapshot = {
+            let mut mods = self.mods.write().unwrap();
+            let item = mods
+                .iter_mut()
+                .find(|item| item.id == id)
+                .context("找不到指定模组")?;
+            item.enabled = enabled;
+            mods.clone()
+        };
         let mut metadata = self.metadata.lock().unwrap();
         metadata.entry_mut(id).enabled = enabled;
+        let conflicts = refresh_conflicts(&mut metadata, &mut mods_snapshot);
         metadata::save_metadata(&self.paths, &metadata)?;
         drop(metadata);
+        *self.mods.write().unwrap() = mods_snapshot.clone();
+        *self.conflicts.write().unwrap() = conflicts;
         if let Err(error) = sync_ue4ss_state(&self.paths, &mods_snapshot) {
             self.log("warn", "ue4ss", &format!("同步 mods.txt 失败：{error:#}"));
         }
@@ -183,30 +202,57 @@ impl AppState {
     }
 
     pub fn reorder_mods(&self, ids: &[String]) -> Result<LibrarySnapshot> {
-        let mut ordered = Vec::new();
-        let mut mods = self.mods.write().unwrap();
-        let mut by_id: HashMap<String, ModEntry> =
-            mods.drain(..).map(|item| (item.id.clone(), item)).collect();
-        for id in ids {
-            if let Some(item) = by_id.remove(id) {
-                ordered.push(item);
+        let mut ordered = {
+            let mut mods = self.mods.write().unwrap();
+            let mut by_id: HashMap<String, ModEntry> =
+                mods.drain(..).map(|item| (item.id.clone(), item)).collect();
+            let mut ordered = Vec::new();
+            for id in ids {
+                if let Some(item) = by_id.remove(id) {
+                    ordered.push(item);
+                }
             }
-        }
-        let mut remaining: Vec<ModEntry> = by_id.into_values().collect();
-        remaining.sort_by_key(|item| item.load_order);
-        ordered.extend(remaining);
-        for (index, item) in ordered.iter_mut().enumerate() {
-            item.load_order = index;
-        }
+            let mut remaining: Vec<ModEntry> = by_id.into_values().collect();
+            remaining.sort_by_key(|item| item.load_order);
+            ordered.extend(remaining);
+            for (index, item) in ordered.iter_mut().enumerate() {
+                item.load_order = index;
+            }
+            ordered
+        };
         let order = ordered
             .iter()
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
-        *mods = ordered;
-        drop(mods);
         let mut metadata = self.metadata.lock().unwrap();
+        let conflicts = refresh_conflicts(&mut metadata, &mut ordered);
         metadata.order = order;
         metadata::save_metadata(&self.paths, &metadata)?;
+        drop(metadata);
+        *self.mods.write().unwrap() = ordered;
+        *self.conflicts.write().unwrap() = conflicts;
+        Ok(self.snapshot())
+    }
+
+    pub fn save_conflict_winners(
+        &self,
+        winners: BTreeMap<String, String>,
+    ) -> Result<LibrarySnapshot> {
+        let mut mods = self.mods.read().unwrap().clone();
+        let mut metadata = self.metadata.lock().unwrap();
+        let analysis = crate::mods::analyze_conflicts(&metadata, &mods);
+        crate::mods::validate_conflict_winners(&analysis.groups, &winners)?;
+        let previous_metadata = metadata.clone();
+        metadata.conflict_winners = winners;
+        let conflicts = refresh_conflicts(&mut metadata, &mut mods);
+        if let Err(error) = metadata::save_metadata(&self.paths, &metadata) {
+            *metadata = previous_metadata;
+            return Err(error);
+        }
+        drop(metadata);
+        *self.mods.write().unwrap() = mods;
+        *self.conflicts.write().unwrap() = conflicts;
+        self.log("info", "conflict", "冲突覆盖选择已保存");
         Ok(self.snapshot())
     }
 
@@ -232,6 +278,121 @@ impl AppState {
         Ok(self.snapshot())
     }
 
+    pub fn delete_mod(&self, id: &str) -> Result<LibrarySnapshot> {
+        ensure_deletion_allowed(self.process_running())?;
+
+        let item = self
+            .mods
+            .read()
+            .unwrap()
+            .iter()
+            .find(|item| item.id == id)
+            .cloned()
+            .context("找不到指定模组")?;
+        let mut sources = Vec::new();
+        let source = PathBuf::from(&item.file_path);
+        sources.push(source.clone());
+        for alias in &item.duplicate_aliases {
+            let alias = PathBuf::from(alias);
+            if alias.exists() {
+                sources.push(alias);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        sources.retain(|path| {
+            seen.insert(
+                std::path::absolute(path)
+                    .unwrap_or_else(|_| path.clone())
+                    .to_string_lossy()
+                    .to_ascii_lowercase(),
+            )
+        });
+
+        for path in &sources {
+            let is_pak = is_direct_child(path, &self.paths.local_mods) && path.is_file();
+            let is_ue4ss = is_direct_child(path, &self.paths.ue4ss_mods) && path.is_dir();
+            if !is_pak && !is_ue4ss {
+                anyhow::bail!("拒绝删除模组库之外的路径或不受支持的文件");
+            }
+        }
+
+        let deleted_dir = self.paths.backups_dir.join("deleted");
+        std::fs::create_dir_all(&deleted_dir)
+            .with_context(|| format!("无法创建删除备份目录 {}", deleted_dir.display()))?;
+        let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%3f");
+        let file_name = source
+            .file_name()
+            .context("模组路径缺少文件名")?
+            .to_string_lossy();
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for (index, path) in sources.iter().enumerate() {
+            let name = path
+                .file_name()
+                .context("模组路径缺少文件名")?
+                .to_string_lossy();
+            let backup = deleted_dir.join(format!(
+                "{timestamp}-{index}-{}",
+                safe_disk_name(&name, &safe_disk_name(&file_name, "mod"))
+            ));
+            if let Err(error) = move_entry(path, &backup) {
+                for (original, moved_to) in moved.iter().rev() {
+                    let _ = move_entry(moved_to, original);
+                }
+                return Err(error);
+            }
+            moved.push((path.clone(), backup));
+        }
+
+        let metadata_result = (|| -> Result<()> {
+            let mut metadata = self.metadata.lock().unwrap();
+            let previous = metadata.clone();
+            metadata.entries.remove(id);
+            metadata.order.retain(|entry| entry != id);
+            if let Err(error) = metadata::save_metadata(&self.paths, &metadata) {
+                *metadata = previous;
+                return Err(error);
+            }
+            Ok(())
+        })();
+        if let Err(error) = metadata_result {
+            let mut rollback_errors = Vec::new();
+            for (original, moved_to) in moved.iter().rev() {
+                if let Err(rollback_error) = move_entry(moved_to, original) {
+                    rollback_errors.push(rollback_error.to_string());
+                }
+            }
+            return Err(if rollback_errors.is_empty() {
+                error.context("删除模组元数据失败，已恢复原文件")
+            } else {
+                error.context(format!(
+                    "删除模组元数据失败，且部分文件无法恢复：{}",
+                    rollback_errors.join("；")
+                ))
+            });
+        }
+
+        self.log(
+            "info",
+            "library",
+            &format!(
+                "已将模组 {} 的 {} 个文件移入 backups/deleted",
+                item.name,
+                moved.len()
+            ),
+        );
+        match self.refresh_files() {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                self.log(
+                    "warn",
+                    "library",
+                    &format!("模组已移入备份，但刷新列表失败：{error:#}"),
+                );
+                Ok(self.snapshot())
+            }
+        }
+    }
+
     pub fn save_settings(&self, settings: AppSettings) -> Result<AppSettings> {
         config::save_settings(&self.paths, &settings)?;
         let saved = config::load_settings(&self.paths)?;
@@ -245,6 +406,15 @@ impl AppState {
         }
         let mut settings = self.settings.lock().unwrap();
         settings.theme = theme.to_string();
+        config::save_settings(&self.paths, &settings)
+    }
+
+    pub fn set_language(&self, language: &str) -> Result<()> {
+        if language != "zh-CN" && language != "en-US" {
+            anyhow::bail!("无效语言");
+        }
+        let mut settings = self.settings.lock().unwrap();
+        settings.language = language.to_string();
         config::save_settings(&self.paths, &settings)
     }
 
@@ -372,6 +542,19 @@ impl AppState {
     }
 }
 
+fn log_pak_diagnostics(state: &AppState, diagnostics: &[crate::mods::PakScanDiagnostic]) {
+    for diagnostic in diagnostics {
+        state.log(
+            "warn",
+            "pak",
+            &format!(
+                "PAK 清单扫描失败：{}（{}），已保留旧缓存或使用空清单：{}",
+                diagnostic.file_name, diagnostic.mod_id, diagnostic.message
+            ),
+        );
+    }
+}
+
 fn suggested_pak_dir(install: &str) -> String {
     if install.trim().is_empty() {
         return String::new();
@@ -383,10 +566,41 @@ fn suggested_pak_dir(install: &str) -> String {
         .into_owned()
 }
 
+fn is_direct_child(path: &Path, root: &Path) -> bool {
+    is_within(path, root)
+        && path.parent().is_some_and(|parent| is_within(parent, root))
+        && path
+            .parent()
+            .is_some_and(|parent| normalize_path(parent) == normalize_path(root))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn move_entry(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::rename(source, destination).with_context(|| {
+        format!(
+            "无法将 {} 移动到 {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+fn ensure_deletion_allowed(running: bool) -> Result<()> {
+    if running {
+        anyhow::bail!("游戏运行期间不能删除模组");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AppState;
+    use super::{ensure_deletion_allowed, is_direct_child, AppState};
+    use crate::models::ModEntry;
     use crate::test_support::TempRoot;
+    use std::collections::BTreeMap;
     use std::fs;
 
     #[test]
@@ -491,7 +705,208 @@ mod tests {
             settings.cloud.active_base_url,
             "https://primary.example.test"
         );
-        let saved = fs::read_to_string(paths.config_file).unwrap();
+        let saved = fs::read_to_string(&paths.config_file).unwrap();
         assert!(saved.contains("https://primary.example.test"));
+    }
+
+    #[test]
+    fn moves_deleted_mod_to_backup_and_clears_metadata() {
+        let temp = TempRoot::new("state-delete-backup");
+        let paths = temp.paths();
+        fs::write(paths.local_mods.join("Alpha.pak"), b"alpha").unwrap();
+        fs::write(paths.local_mods.join("Beta.pak"), b"beta").unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        let initial = state.scan(false).unwrap();
+        let alpha = initial
+            .mods
+            .iter()
+            .find(|item| item.file_name == "Alpha.pak")
+            .unwrap()
+            .id
+            .clone();
+
+        let snapshot = state.delete_mod(&alpha).unwrap();
+
+        assert!(!paths.local_mods.join("Alpha.pak").exists());
+        assert!(snapshot.mods.iter().all(|item| item.id != alpha));
+        assert!(fs::read_dir(paths.backups_dir.join("deleted"))
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with("-Alpha.pak")));
+        assert!(!state.metadata.lock().unwrap().entries.contains_key(&alpha));
+    }
+
+    #[test]
+    fn deleting_a_merged_mod_moves_all_identical_copies_to_backup() {
+        let temp = TempRoot::new("state-delete-identical-copies");
+        let paths = temp.paths();
+        fs::write(paths.local_mods.join("Alpha.pak"), b"same-content").unwrap();
+        fs::write(paths.local_mods.join("Alpha Copy.pak"), b"same-content").unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        let initial = state.scan(false).unwrap();
+
+        assert_eq!(initial.mods.len(), 1);
+        assert_eq!(initial.mods[0].duplicate_count, 1);
+        let id = initial.mods[0].id.clone();
+
+        let snapshot = state.delete_mod(&id).unwrap();
+
+        assert!(snapshot.mods.is_empty());
+        assert!(!paths.local_mods.join("Alpha.pak").exists());
+        assert!(!paths.local_mods.join("Alpha Copy.pak").exists());
+        let backups = fs::read_dir(paths.backups_dir.join("deleted"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 2);
+        assert!(backups.iter().any(|name| name.ends_with("-Alpha.pak")));
+        assert!(backups.iter().any(|name| name.ends_with("-Alpha Copy.pak")));
+    }
+
+    #[test]
+    fn moves_ue4ss_directory_to_backup_as_a_whole() {
+        let temp = TempRoot::new("state-delete-ue4ss");
+        let paths = temp.paths();
+        let module = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(module.join("Scripts")).unwrap();
+        fs::write(module.join("Scripts").join("main.lua"), b"print('ok')").unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        let initial = state.scan(false).unwrap();
+        let id = initial
+            .mods
+            .iter()
+            .find(|item| item.file_name == "BetterAI")
+            .unwrap()
+            .id
+            .clone();
+
+        let snapshot = state.delete_mod(&id).unwrap();
+
+        assert!(!module.exists());
+        assert!(snapshot.mods.iter().all(|item| item.id != id));
+        assert!(fs::read_dir(paths.backups_dir.join("deleted"))
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.path().join("Scripts/main.lua").is_file()));
+    }
+
+    #[test]
+    fn deletion_requires_a_direct_child_of_a_mod_root() {
+        let temp = TempRoot::new("state-delete-containment");
+        let paths = temp.paths();
+        let escaped = temp.path().join("outside").join("Escape.pak");
+        fs::create_dir_all(escaped.parent().unwrap()).unwrap();
+        fs::write(&escaped, b"keep").unwrap();
+
+        assert!(is_direct_child(
+            &paths.local_mods.join("Alpha.pak"),
+            &paths.local_mods
+        ));
+        assert!(is_direct_child(
+            &paths.ue4ss_mods.join("BetterAI"),
+            &paths.ue4ss_mods
+        ));
+        assert!(!is_direct_child(&escaped, &paths.local_mods));
+        assert!(!is_direct_child(
+            &paths
+                .local_mods
+                .join("..")
+                .join("outside")
+                .join("Escape.pak"),
+            &paths.local_mods
+        ));
+        assert!(!is_direct_child(&paths.local_mods, &paths.local_mods));
+    }
+
+    #[test]
+    fn deletion_is_rejected_while_a_game_process_is_running() {
+        let error = ensure_deletion_allowed(true).unwrap_err();
+        assert!(error.to_string().contains("游戏运行期间"));
+        assert!(ensure_deletion_allowed(false).is_ok());
+    }
+
+    #[test]
+    fn persists_the_interface_language() {
+        let temp = TempRoot::new("state-language");
+        let paths = temp.paths();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+
+        state.set_language("en-US").unwrap();
+        let saved = fs::read_to_string(&paths.config_file).unwrap();
+        assert!(saved.contains("\"language\": \"en-US\""));
+
+        let reloaded = AppState::from_paths(paths).unwrap();
+        assert_eq!(reloaded.settings.lock().unwrap().language, "en-US");
+    }
+
+    #[test]
+    fn saves_conflict_winners_and_refreshes_override_statistics() {
+        let temp = TempRoot::new("state-conflict-winners");
+        let paths = temp.paths();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        {
+            let mut metadata = state.metadata.lock().unwrap();
+            metadata.entry_mut("alpha").pak_entries =
+                vec!["SCUM/Content/Shared.uasset".to_string()];
+            metadata.entry_mut("beta").pak_entries = vec!["SCUM/Content/Shared.uasset".to_string()];
+        }
+        *state.mods.write().unwrap() = vec![
+            ModEntry {
+                id: "alpha".to_string(),
+                name: "Alpha".to_string(),
+                enabled: true,
+                mod_type: "clientPak".to_string(),
+                load_order: 0,
+                ..ModEntry::default()
+            },
+            ModEntry {
+                id: "beta".to_string(),
+                name: "Beta".to_string(),
+                enabled: true,
+                mod_type: "clientPak".to_string(),
+                load_order: 1,
+                ..ModEntry::default()
+            },
+        ];
+        let mut winners = BTreeMap::new();
+        winners.insert("scum/content/shared".to_string(), "alpha".to_string());
+
+        let snapshot = state.save_conflict_winners(winners).unwrap();
+
+        assert_eq!(snapshot.conflicts.len(), 1);
+        assert_eq!(snapshot.conflicts[0].default_winner_id, "beta");
+        assert_eq!(snapshot.conflicts[0].winner_id, "alpha");
+        assert_eq!(
+            snapshot.conflicts[0].selected_winner_id.as_deref(),
+            Some("alpha")
+        );
+        let alpha = snapshot
+            .mods
+            .iter()
+            .find(|item| item.id == "alpha")
+            .unwrap();
+        let beta = snapshot.mods.iter().find(|item| item.id == "beta").unwrap();
+        assert_eq!(alpha.overriding_file_count, 1);
+        assert_eq!(beta.overridden_file_count, 1);
+        assert!(beta.fully_overridden);
+        let saved = crate::metadata::load_metadata(&paths).unwrap();
+        assert_eq!(
+            saved.conflict_winners["scum/content/shared"],
+            "alpha".to_string()
+        );
+
+        let mut invalid = BTreeMap::new();
+        invalid.insert("scum/content/shared".to_string(), "missing".to_string());
+        assert!(state.save_conflict_winners(invalid).is_err());
+        assert_eq!(
+            state.metadata.lock().unwrap().conflict_winners["scum/content/shared"],
+            "alpha"
+        );
+
+        let cleared = state.save_conflict_winners(BTreeMap::new()).unwrap();
+        assert_eq!(cleared.conflicts[0].winner_id, "beta");
+        assert_eq!(cleared.conflicts[0].selected_winner_id, None);
+        assert!(state.metadata.lock().unwrap().conflict_winners.is_empty());
     }
 }

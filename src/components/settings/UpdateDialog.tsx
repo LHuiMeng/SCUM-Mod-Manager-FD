@@ -1,4 +1,5 @@
 import type { AppUpdateInfo, AppUpdatePhase, AppUpdateProgress } from "../../types";
+import { useI18n } from "../../i18n";
 import { formatBytes, formatDate } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
@@ -21,6 +22,7 @@ export function UpdateDialog({
   onClose,
   onInstall,
 }: UpdateDialogProps) {
+  const { t, language } = useI18n();
   const busy = phase === "downloading" || phase === "verifying" || phase === "installing";
   const percent =
     progress?.total && progress.total > 0
@@ -32,13 +34,13 @@ export function UpdateDialog({
   return (
     <Modal
       wide
-      title={`发现新版本 ${info.version ?? ""}`}
-      description="安装包将先完成签名校验，再交给 Windows 安装器。"
+      title={t("update.dialog.title", { version: info.version ?? "" })}
+      description={t("update.dialog.description")}
       onClose={busy ? () => undefined : onClose}
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={busy}>
-            稍后
+            {t("update.dialog.later")}
           </Button>
           <Button
             variant="primary"
@@ -47,12 +49,12 @@ export function UpdateDialog({
             disabled={busy}
           >
             {phase === "downloading"
-              ? "正在下载"
+              ? t("update.dialog.downloading")
               : phase === "verifying"
-                ? "正在校验"
+                ? t("update.dialog.verifying")
                 : phase === "installing"
-                  ? "正在安装"
-                  : "下载并安装"}
+                  ? t("update.dialog.installing")
+                  : t("update.dialog.install")}
           </Button>
         </>
       }
@@ -65,25 +67,27 @@ export function UpdateDialog({
 
       <div className="update-facts">
         <div>
-          <span>文件大小</span>
-          <b>{info.size ? formatBytes(info.size) : "下载时确认"}</b>
+          <span>{t("update.dialog.fileSize")}</span>
+          <b>
+            {info.size ? formatBytes(info.size) : t("update.dialog.confirmOnDownload")}
+          </b>
         </div>
         <div>
-          <span>发布日期</span>
-          <b>{formatDate(info.publishedAt)}</b>
+          <span>{t("update.dialog.publishedAt")}</span>
+          <b>{formatDate(info.publishedAt, language)}</b>
         </div>
         <div>
-          <span>安全校验</span>
+          <span>{t("update.dialog.security")}</span>
           <b className="is-safe">
             <Icon name="lock" size={13} />
-            Tauri 签名
+            {t("update.dialog.signature")}
           </b>
         </div>
       </div>
 
       <section className="update-notes">
-        <span>本次更新</span>
-        <p>{info.notes || "此版本包含稳定性与使用体验改进。"}</p>
+        <span>{t("update.dialog.notes")}</span>
+        <p>{info.notes || t("update.dialog.notesFallback")}</p>
       </section>
 
       {busy ? (
@@ -91,20 +95,20 @@ export function UpdateDialog({
           <div>
             <span>
               {phase === "downloading"
-                ? "正在下载安装包"
+                ? t("update.status.downloading")
                 : phase === "verifying"
-                  ? "正在验证发布签名"
-                  : "安装器已启动"}
+                  ? t("update.dialog.verifyingSignature")
+                  : t("update.dialog.installerStarted")}
             </span>
-            <b>{percent !== null ? `${percent}%` : "自动校验"}</b>
+            <b>{percent !== null ? `${percent}%` : t("update.dialog.autoVerify")}</b>
           </div>
           <i>
             <span style={{ width: percent !== null ? `${percent}%` : "42%" }} />
           </i>
           <small>
             {phase === "installing"
-              ? "应用会退出，安装完成后自动重新打开。"
-              : "请不要关闭窗口。下载与验签全部在 Rust 后端完成。"}
+              ? t("update.dialog.restartHint")
+              : t("update.dialog.keepOpen")}
           </small>
         </div>
       ) : null}
@@ -114,7 +118,7 @@ export function UpdateDialog({
       <div className="update-safety-note">
         <Icon name="lock" size={15} />
         <span>
-          只会安装版本号与签名同时匹配的安装包。任何下载中断、文件被替换或版本回退都会被拒绝。
+          {t("update.dialog.safety")}
         </span>
       </div>
     </Modal>

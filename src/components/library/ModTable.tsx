@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { ModEntry } from "../../types";
-import { formatClock } from "../../lib/format";
+import { useI18n } from "../../i18n";
+import { formatTimestamp } from "../../lib/format";
 import { EmptyState } from "../ui/EmptyState";
 import { ModRow } from "./ModRow";
 
@@ -15,6 +16,7 @@ interface ModTableProps {
   locked: boolean;
   lastDeployedAt: string | null;
   conflictCount: number;
+  removingId: string | null;
   onSelect: (id: string) => void;
   onToggle: (id: string, enabled: boolean) => void;
   onReorder: (ids: string[]) => void;
@@ -31,11 +33,13 @@ export function ModTable({
   locked,
   lastDeployedAt,
   conflictCount,
+  removingId,
   onSelect,
   onToggle,
   onReorder,
   onVisibleChange,
 }: ModTableProps) {
+  const { t, language } = useI18n();
   const [filter, setFilter] = useState<FilterId>("all");
   const [sortMode, setSortMode] = useState<SortMode>("load");
   const [dragId, setDragId] = useState<string | null>(null);
@@ -68,14 +72,14 @@ export function ModTable({
       })
       .sort((left, right) => {
         if (sortMode === "name") {
-          return left.name.localeCompare(right.name, "zh-CN");
+          return left.name.localeCompare(right.name, language);
         }
         if (sortMode === "size") {
           return right.fileSize - left.fileSize;
         }
         return left.loadOrder - right.loadOrder;
       });
-  }, [filter, mods, search, sortMode]);
+  }, [filter, language, mods, search, sortMode]);
 
   // 把可见条目交回上层，检查器据此判断当前选中项是否还在列表里。
   const visibleKeyRef = useRef<string>("");
@@ -98,17 +102,17 @@ export function ModTable({
 
   const canDrag = sortMode === "load" && filter === "all" && !search.trim();
   const dragHint = canDrag
-    ? "拖拽行或 Alt+↑/↓ 调整加载顺序"
+    ? t("library.dragHint.active")
     : sortMode !== "load"
-      ? "切回「按加载顺序」后可排序"
+      ? t("library.dragHint.loadOrder")
       : search.trim()
-        ? "清空搜索后可排序"
-        : "切回「全部」筛选后可排序";
+        ? t("library.dragHint.search")
+        : t("library.dragHint.filter");
 
   const sortLabel = {
-    load: "按加载顺序",
-    name: "按名称",
-    size: "按文件大小",
+    load: t("library.sort.load"),
+    name: t("library.sort.name"),
+    size: t("library.sort.size"),
   }[sortMode];
 
   function cycleSortMode() {
@@ -211,14 +215,14 @@ export function ModTable({
   }
 
   return (
-    <section className="table-card" aria-label="本地模组列表">
+    <section className="table-card" aria-label={t("library.table.listLabel")}>
       <div className="table-toolbar">
         {(
           [
-            ["all", "全部", counts.all],
-            ["client", "客户端 PAK", counts.client],
-            ["ue4ss", "UE4SS", counts.ue4ss],
-            ["updates", "有更新", counts.updates],
+            ["all", t("library.filter.all"), counts.all],
+            ["client", t("library.filter.client"), counts.client],
+            ["ue4ss", t("library.filter.ue4ss"), counts.ue4ss],
+            ["updates", t("library.filter.updates"), counts.updates],
           ] as const
         ).map(([id, label, count]) => (
           <button
@@ -235,8 +239,8 @@ export function ModTable({
           <button
             type="button"
             className="tiny-tool"
-            aria-label="切换排序方式"
-            title="切换排序方式"
+            aria-label={t("library.sort.toggle")}
+            title={t("library.sort.toggle")}
             onClick={cycleSortMode}
           >
             <span>↕</span>
@@ -245,22 +249,23 @@ export function ModTable({
       </div>
       <div className="table-head" aria-hidden="true">
         <span />
-        <span>模组</span>
-        <span>类型</span>
-        <span>大小</span>
-        <span>启用</span>
+        <span>{t("library.table.mod")}</span>
+        <span>{t("library.table.type")}</span>
+        <span>{t("library.table.size")}</span>
+        <span>{t("library.table.enabled")}</span>
+        <span />
       </div>
       <div
         className={`mod-rows ${dragId ? "is-sorting" : ""}`}
         ref={listRef}
         role="listbox"
-        aria-label="本地模组列表"
+        aria-label={t("library.table.listLabel")}
       >
         {filtered.length === 0 ? (
           <EmptyState
             icon="box"
-            title="没有符合条件的模组"
-            description="换一个关键词或筛选条件，也可以把 .pak、.zip 或 UE4SS 文件夹拖进窗口导入。"
+            title={t("library.empty.title")}
+            description={t("library.empty.description")}
           />
         ) : (
           filtered.map((mod) => (
@@ -273,6 +278,7 @@ export function ModTable({
               locked={locked}
               dragging={dragId === mod.id}
               dragOver={dragOverId === mod.id}
+              removing={removingId === mod.id}
               onSelect={() => {
                 if (suppressClickRef.current) return;
                 onSelect(mod.id);
@@ -286,11 +292,18 @@ export function ModTable({
       </div>
       <div className="table-foot">
         <span>
-          显示 {filtered.length} / {mods.length} · <b>{dragHint}</b>
+          {t("library.foot.showing", { shown: filtered.length, total: mods.length })} ·{" "}
+          <b>{dragHint}</b>
         </span>
         <span>
-          上次部署 {formatClock(lastDeployedAt)}
-          {conflictCount > 0 ? ` · ${conflictCount} 个资源冲突` : " · 无资源冲突"}
+          {lastDeployedAt
+            ? t("library.foot.deployed", {
+                time: formatTimestamp(lastDeployedAt, language),
+              })
+            : t("library.foot.neverDeployed")}
+          {conflictCount > 0
+            ? t("library.foot.conflicts", { count: conflictCount })
+            : t("library.foot.noConflicts")}
         </span>
       </div>
     </section>

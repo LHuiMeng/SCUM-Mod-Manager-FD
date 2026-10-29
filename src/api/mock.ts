@@ -2,8 +2,11 @@ import type {
   AppInfo,
   AppSettings,
   AppUpdateInfo,
+  ConflictGroup,
   GameStatus,
+  Language,
   LibrarySnapshot,
+  LocaleBundle,
   ModEntry,
   RemoteFile,
   RemoteMod,
@@ -12,10 +15,22 @@ import type {
 
 const now = Date.now();
 
+function mockCover(kind: "weapons" | "vehicles" | "storage" | "weather") {
+  const themes = {
+    weapons: { sky: "#5c3b2c", ground: "#b06a42", accent: "#d18a5f" },
+    vehicles: { sky: "#405d59", ground: "#8b9b76", accent: "#d9a35f" },
+    storage: { sky: "#5a5247", ground: "#a78358", accent: "#d9b26f" },
+    weather: { sky: "#4b5862", ground: "#84919a", accent: "#d7c5a2" },
+  }[kind];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360"><rect width="640" height="360" fill="${themes.sky}"/><circle cx="510" cy="92" r="58" fill="${themes.accent}" opacity=".34"/><path d="M0 270 150 170l105 67 120-104 265 147v80H0z" fill="${themes.ground}"/><path d="M0 304 185 225l105 51 188-82 162 84v82H0z" fill="${themes.accent}" opacity=".24"/><text x="34" y="315" fill="#f7f0e5" font-family="sans-serif" font-size="28" font-weight="600">SCUM MOD</text></svg>`;
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
 const sampleMods: ModEntry[] = [
   {
     id: "scum_weaponpack_elite",
     name: "SCUM_WeaponPack_Elite",
+    author: "RuinDream",
     fileName: "SCUM_WeaponPack_Elite.pak",
     filePath: "~mods/SCUM_WeaponPack_Elite.pak",
     fileSize: 1374389535,
@@ -30,6 +45,13 @@ const sampleMods: ModEntry[] = [
     deployed: false,
     description: "武器与战斗平衡扩展",
     conflictCount: 0,
+    fileCount: 18,
+    overriddenFileCount: 0,
+    overridingFileCount: 0,
+    fullyOverridden: false,
+    coverUrl: mockCover("weapons"),
+    duplicateCount: 1,
+    duplicateAliases: ["~mods/SCUM_WeaponPack_Elite Copy.pak"],
   },
   {
     id: "vehicleoverhaul_v3",
@@ -48,6 +70,11 @@ const sampleMods: ModEntry[] = [
     deployed: false,
     description: "载具操控与外观重制",
     conflictCount: 0,
+    fileCount: 1,
+    overriddenFileCount: 0,
+    overridingFileCount: 0,
+    fullyOverridden: false,
+    coverUrl: mockCover("vehicles"),
   },
   {
     id: "lootbalance_plus",
@@ -66,6 +93,10 @@ const sampleMods: ModEntry[] = [
     deployed: false,
     description: "物资刷新与生存平衡",
     conflictCount: 0,
+    fileCount: 9,
+    overriddenFileCount: 0,
+    overridingFileCount: 0,
+    fullyOverridden: false,
   },
   {
     id: "mapextensions_north",
@@ -84,6 +115,10 @@ const sampleMods: ModEntry[] = [
     deployed: false,
     description: "北部岛屿地图扩展",
     conflictCount: 0,
+    fileCount: 20,
+    overriddenFileCount: 0,
+    overridingFileCount: 0,
+    fullyOverridden: false,
   },
   {
     id: "hd_character_textures",
@@ -102,6 +137,10 @@ const sampleMods: ModEntry[] = [
     deployed: false,
     description: "角色材质高清重制",
     conflictCount: 0,
+    fileCount: 12,
+    overriddenFileCount: 0,
+    overridingFileCount: 0,
+    fullyOverridden: false,
     updateVersion: "2.4.1",
   },
   {
@@ -121,6 +160,11 @@ const sampleMods: ModEntry[] = [
     deployed: false,
     description: "AI 行为与感知优化",
     conflictCount: 0,
+    fileCount: 0,
+    overriddenFileCount: 0,
+    overridingFileCount: 0,
+    fullyOverridden: false,
+    coverUrl: mockCover("storage"),
   },
   {
     id: "ui_cleanhud",
@@ -139,14 +183,117 @@ const sampleMods: ModEntry[] = [
     deployed: false,
     description: "精简 HUD 与界面元素",
     conflictCount: 0,
+    fileCount: 3,
+    overriddenFileCount: 0,
+    overridingFileCount: 0,
+    fullyOverridden: false,
   },
 ];
 
 let mods = structuredClone(sampleMods);
+let conflictWinners = new Map<string, string>();
+let conflicts: ConflictGroup[] = [];
+
+const mockConflictDefinitions = [
+  {
+    key: "scum/content/assets/weapons/shared",
+    paths: [
+      "SCUM/Content/Assets/Weapons/Shared.uasset",
+      "SCUM/Content/Assets/Weapons/Shared.uexp",
+    ],
+    ownerIds: ["scum_weaponpack_elite", "lootbalance_plus"],
+  },
+  {
+    key: "scum/content/assets/vehicles/wheel",
+    paths: ["SCUM/Content/Assets/Vehicles/Wheel.uasset"],
+    ownerIds: ["vehicleoverhaul_v3", "mapextensions_north"],
+  },
+];
+
+function recomputeMockConflicts() {
+  mods = mods.map((mod) => ({
+    ...mod,
+    conflictCount: 0,
+    overriddenFileCount: 0,
+    overridingFileCount: 0,
+    fullyOverridden: false,
+  }));
+  conflicts = mockConflictDefinitions.flatMap((definition) => {
+    const owners = definition.ownerIds
+      .map((id) => mods.find((mod) => mod.id === id))
+      .filter(
+        (mod): mod is ModEntry =>
+          Boolean(mod && mod.enabled && mod.type === "clientPak"),
+      )
+      .sort(
+        (left, right) =>
+          left.loadOrder - right.loadOrder || left.id.localeCompare(right.id),
+      );
+    if (owners.length < 2) {
+      conflictWinners.delete(definition.key);
+      return [];
+    }
+    const defaultWinner = owners[owners.length - 1];
+    const selectedCandidate = conflictWinners.get(definition.key);
+    const selectedOwner = selectedCandidate
+      ? owners.find((owner) => owner.id === selectedCandidate)
+      : undefined;
+    if (selectedCandidate && !selectedOwner) {
+      conflictWinners.delete(definition.key);
+    }
+    const selected = selectedOwner?.id;
+    const winner = selectedOwner || defaultWinner;
+    if (!winner) return [];
+    return [
+      {
+        key: definition.key,
+        paths: [...definition.paths],
+        owners: owners.map((owner) => ({
+          id: owner.id,
+          name: owner.name,
+          loadOrder: owner.loadOrder,
+          type: owner.type,
+        })),
+        defaultWinnerId: defaultWinner.id,
+        winnerId: winner.id,
+        selectedWinnerId: selected ?? null,
+      },
+    ];
+  });
+  const stats = new Map<
+    string,
+    { overridden: number; overriding: number }
+  >();
+  for (const group of conflicts) {
+    for (const owner of group.owners) {
+      const current = stats.get(owner.id) ?? { overridden: 0, overriding: 0 };
+      if (owner.id === group.winnerId) {
+        current.overriding += group.paths.length;
+      } else {
+        current.overridden += group.paths.length;
+      }
+      stats.set(owner.id, current);
+    }
+  }
+  mods = mods.map((mod) => {
+    const current = stats.get(mod.id) ?? { overridden: 0, overriding: 0 };
+    return {
+      ...mod,
+      overriddenFileCount: current.overridden,
+      overridingFileCount: current.overriding,
+      conflictCount: current.overridden + current.overriding,
+      fullyOverridden:
+        mod.type === "clientPak" &&
+        mod.fileCount > 0 &&
+        current.overridden === mod.fileCount,
+    };
+  });
+}
 let settings: AppSettings = {
   scumInstallPath: "X:/SteamLibrary/steamapps/common/SCUM",
   serverInstallPath: "X:/SteamLibrary/steamapps/common/SCUM Server",
   theme: "light",
+  language: "zh-CN",
   launchOptions: {
     log: false,
     fileOpenLog: true,
@@ -207,6 +354,7 @@ const remoteMods: RemoteMod[] = [
     updatedAt: new Date(now - 86400000).toISOString(),
     type: "clientPak",
     installed: false,
+    coverUrl: mockCover("storage"),
   },
   {
     id: "vehicle-overhaul",
@@ -221,6 +369,7 @@ const remoteMods: RemoteMod[] = [
     updatedAt: new Date(now - 3 * 86400000).toISOString(),
     type: "clientPak",
     installed: true,
+    coverUrl: mockCover("vehicles"),
   },
   {
     id: "fog-weather-pack",
@@ -235,6 +384,7 @@ const remoteMods: RemoteMod[] = [
     updatedAt: new Date(now - 6 * 86400000).toISOString(),
     type: "clientPak",
     installed: false,
+    coverUrl: mockCover("weather"),
   },
 ];
 
@@ -245,8 +395,10 @@ const remoteFiles: RemoteFile[] = [
 ];
 
 export function mockSnapshot(): LibrarySnapshot {
+  recomputeMockConflicts();
   return structuredClone({
     mods,
+    conflicts,
     settings,
     gameStatus,
     lastDeployedAt: null,
@@ -274,6 +426,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       const id = String(args?.id ?? "");
       const enabled = Boolean(args?.enabled);
       mods = mods.map((mod) => (mod.id === id ? { ...mod, enabled } : mod));
+      recomputeMockConflicts();
       return mockSnapshot() as T;
     }
     case "reorder_mods": {
@@ -285,6 +438,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
           return mod ? { ...mod, loadOrder: index } : null;
         })
         .filter((mod): mod is ModEntry => mod !== null);
+      recomputeMockConflicts();
       return mockSnapshot() as T;
     }
     case "update_mod_metadata": {
@@ -294,9 +448,75 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       mods = mods.map((mod) => (mod.id === id ? { ...mod, tags, notes } : mod));
       return mockSnapshot() as T;
     }
+    case "delete_mod": {
+      if (gameStatus.running) {
+        throw new Error("游戏运行期间不能删除模组");
+      }
+      const id = String(args?.id ?? "");
+      const target = mods.find((mod) => mod.id === id);
+      if (!target) throw new Error("找不到指定模组");
+      mods = mods
+        .filter((mod) => mod.id !== id)
+        .map((mod, index) => ({ ...mod, loadOrder: index }));
+      recomputeMockConflicts();
+      runtimeLogs.unshift({
+        id: Date.now(),
+        timestamp: new Date().toISOString(),
+        level: "info",
+        target: "library",
+        message: `已将模组 ${target.name} 移入删除备份`,
+      });
+      return mockSnapshot() as T;
+    }
+    case "save_conflict_winners": {
+      const winners = (args?.winners as Record<string, string> | undefined) ?? {};
+      for (const [key, winner] of Object.entries(winners)) {
+        const definition = mockConflictDefinitions.find(
+          (item) => item.key === key,
+        );
+        if (!definition) throw new Error(`冲突组不存在：${key}`);
+        const enabledOwners = definition.ownerIds.filter((id) => {
+          const mod = mods.find((item) => item.id === id);
+          return Boolean(mod?.enabled && mod.type === "clientPak");
+        });
+        if (enabledOwners.length < 2 || !enabledOwners.includes(winner)) {
+          throw new Error(`所选模组不属于冲突组 ${key}`);
+        }
+      }
+      conflictWinners = new Map(Object.entries(winners));
+      recomputeMockConflicts();
+      return mockSnapshot() as T;
+    }
     case "save_settings":
       settings = structuredClone(args?.settings as AppSettings);
       return settings as T;
+    case "set_theme": {
+      settings = { ...settings, theme: String(args?.theme ?? "light") as AppSettings["theme"] };
+      return undefined as T;
+    }
+    case "set_language": {
+      const language = (args?.language === "en-US" ? "en-US" : "zh-CN") as Language;
+      settings = { ...settings, language };
+      return undefined as T;
+    }
+    case "get_locale": {
+      const language = (args?.language === "en-US" ? "en-US" : "zh-CN") as Language;
+      return {
+        language,
+        messages: {},
+        source: "bundled",
+        localeDirectory: "W:/hermes/SCUM_Mod_Desk_v3/app-data/locales",
+        warnings: [],
+      } as LocaleBundle as T;
+    }
+    case "get_locales":
+      return (["zh-CN", "en-US"] as Language[]).map((language) => ({
+        language,
+        messages: {},
+        source: "bundled",
+        localeDirectory: "W:/hermes/SCUM_Mod_Desk_v3/app-data/locales",
+        warnings: [],
+      })) as T;
     case "detect_paths":
       return {
         scumInstallPath: "X:/SteamLibrary/steamapps/common/SCUM",

@@ -6,10 +6,13 @@ import type {
   ModEntry,
   NavSection,
 } from "../../types";
+import { useI18n } from "../../i18n";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
+import { Modal } from "../ui/Modal";
 import { SearchField } from "../ui/SearchField";
 import { LaunchStrip } from "./LaunchStrip";
+import { ConflictResolutionPanel } from "./ConflictResolutionPanel";
 import { ModEditPanel } from "./ModEditPanel";
 import { ModInspector } from "./ModInspector";
 import { ModTable } from "./ModTable";
@@ -23,6 +26,8 @@ interface LibraryScreenProps {
   onToggle: (id: string, enabled: boolean) => void;
   onReorder: (ids: string[]) => void;
   onEdit: (id: string, tags: string[], notes: string) => void;
+  onDelete: (id: string) => Promise<boolean>;
+  onSaveConflictWinners: (winners: Record<string, string>) => Promise<boolean>;
   onLaunch: () => void;
   onKill: () => void;
   onOpenFolder: (id: string) => void;
@@ -43,6 +48,8 @@ export function LibraryScreen({
   onToggle,
   onReorder,
   onEdit,
+  onDelete,
+  onSaveConflictWinners,
   onLaunch,
   onKill,
   onOpenFolder,
@@ -53,9 +60,15 @@ export function LibraryScreen({
   onSelect,
   fileDragActive,
 }: LibraryScreenProps) {
+  const { t } = useI18n();
   const [editing, setEditing] = useState<ModEntry | null>(null);
+  const [deleting, setDeleting] = useState<ModEntry | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [conflictsOpen, setConflictsOpen] = useState(false);
   const [visibleIds, setVisibleIds] = useState<string[] | null>(null);
   const mods = snapshot.mods;
+  const conflictGroups = snapshot.conflicts ?? [];
 
   useEffect(() => {
     if (!selectedId && mods.length > 0) {
@@ -69,33 +82,40 @@ export function LibraryScreen({
   // 列表被搜索或筛选清空时，右侧不该继续展示一个已经不在结果里的模组。
   const visibleSelected =
     selected && (!visibleIds || visibleIds.includes(selected.id)) ? selected : null;
+
+  useEffect(() => {
+    if (!visibleSelected || visibleSelected.conflictCount === 0) {
+      setConflictsOpen(false);
+    }
+  }, [visibleSelected]);
+
   const summary = useMemo(() => {
     const enabled = mods.filter((mod) => mod.enabled);
     const totalBytes = enabled.reduce((sum, mod) => sum + mod.fileSize, 0);
-    const conflicts = mods.reduce((sum, mod) => sum + mod.conflictCount, 0);
+    const conflicts = snapshot.conflicts.length;
     const updates = mods.filter((mod) => mod.updateVersion).length;
     return { enabled, totalBytes, conflicts, updates };
-  }, [mods]);
+  }, [mods, snapshot.conflicts.length]);
 
   return (
     <div className="library-layout">
       <section className="library-main">
         <div className="page-heading">
           <div>
-            <h1>模组库</h1>
-            <p>拖入 .pak、.zip 或 UE4SS 文件夹即可导入，排序决定加载优先级。</p>
+            <h1>{t("library.title")}</h1>
+            <p>{t("library.subtitle")}</p>
           </div>
           <div className="heading-tools">
             <SearchField
               value={search}
               onChange={onSearchChange}
-              placeholder="搜索模组、标签或备注"
+              placeholder={t("library.searchPlaceholder")}
             />
             <Button icon="folder" onClick={onScan}>
-              扫描
+              {t("library.scan")}
             </Button>
             <Button icon="plus" onClick={onImport}>
-              导入
+              {t("library.import")}
             </Button>
           </div>
         </div>
@@ -118,6 +138,7 @@ export function LibraryScreen({
           locked={gameStatus.running}
           lastDeployedAt={snapshot.lastDeployedAt}
           conflictCount={summary.conflicts}
+          removingId={removingId}
           onSelect={onSelect}
           onToggle={(id, enabled) => onToggle(id, enabled)}
           onReorder={onReorder}
@@ -128,8 +149,20 @@ export function LibraryScreen({
       <ModInspector
         mod={visibleSelected}
         onEdit={() => visibleSelected && setEditing(visibleSelected)}
+        onDelete={() => visibleSelected && setDeleting(visibleSelected)}
         onOpenFolder={() => visibleSelected && onOpenFolder(visibleSelected.id)}
+        onOpenConflicts={() => visibleSelected && setConflictsOpen(true)}
       />
+
+      {conflictsOpen && visibleSelected ? (
+        <ConflictResolutionPanel
+          key={visibleSelected.id}
+          mod={visibleSelected}
+          groups={conflictGroups}
+          onClose={() => setConflictsOpen(false)}
+          onSave={onSaveConflictWinners}
+        />
+      ) : null}
 
       {editing ? (
         <ModEditPanel
@@ -139,14 +172,71 @@ export function LibraryScreen({
         />
       ) : null}
 
+      {deleting ? (
+        <Modal
+          title={t("inspector.deleteTitle")}
+          description={t(
+            deleting.duplicateCount
+              ? "inspector.deleteDescriptionDuplicates"
+              : "inspector.deleteDescription",
+            {
+              name: deleting.name,
+              count: deleting.duplicateCount ?? 0,
+            },
+          )}
+          onClose={() => {
+            if (!deleteBusy) setDeleting(null);
+          }}
+          footer={
+            <>
+              <Button
+                disabled={deleteBusy}
+                onClick={() => {
+                  if (!deleteBusy) setDeleting(null);
+                }}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                variant="danger"
+                disabled={deleteBusy || gameStatus.running}
+                onClick={() => {
+                  if (deleteBusy || gameStatus.running) return;
+                  void (async () => {
+                    setDeleteBusy(true);
+                    setRemovingId(deleting.id);
+                    try {
+                      await new Promise((resolve) => window.setTimeout(resolve, 180));
+                      const deleted = await onDelete(deleting.id);
+                      if (deleted) setDeleting(null);
+                    } finally {
+                      setDeleteBusy(false);
+                      setRemovingId(null);
+                    }
+                  })();
+                }}
+              >
+                {deleteBusy ? t("common.working") : t("inspector.deleteConfirm")}
+              </Button>
+            </>
+          }
+        >
+          <p className="delete-confirm-note">
+            {gameStatus.running
+              ? t("inspector.deleteRunning")
+              : t("inspector.deleteBackupNote")}
+          </p>
+        </Modal>
+      ) : null}
+
       {fileDragActive ? (
         <div className="library-drop-overlay" role="status" aria-live="polite">
           <div className="library-drop-card">
             <span className="library-drop-icon">
               <Icon name="plus" size={22} />
             </span>
-            <b>松开以导入模组</b>
-            <span>支持 .pak、.zip 和 UE4SS 模组文件夹</span>
+            <b>{t("library.drop.release")}</b>
+            <span>{t("library.drop.detail")}</span>
           </div>
         </div>
       ) : null}

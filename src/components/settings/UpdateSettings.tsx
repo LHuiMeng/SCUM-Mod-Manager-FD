@@ -1,4 +1,5 @@
 import type { AppUpdateInfo, AppUpdatePhase, AppUpdateProgress } from "../../types";
+import { useI18n, type Translator } from "../../i18n";
 import { formatBytes, formatDate } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
@@ -20,6 +21,7 @@ export function UpdateSettings({
   onCheck,
   onShowDetails,
 }: UpdateSettingsProps) {
+  const { t, language } = useI18n();
   const checking = phase === "checking";
   const busy = checking || phase === "downloading" || phase === "verifying" || phase === "installing";
   const percent =
@@ -30,8 +32,8 @@ export function UpdateSettings({
   return (
     <section className="settings-group">
       <div className="section-title">
-        <span>软件更新</span>
-        <b>稳定通道 · 安装包签名校验</b>
+        <span>{t("update.sectionTitle")}</span>
+        <b>{t("update.channel")}</b>
       </div>
       <div className="update-overview">
         <span className={`update-mark ${phase === "available" ? "is-available" : ""}`}>
@@ -42,14 +44,14 @@ export function UpdateSettings({
             SCUM Mod Desk {info?.currentVersion ?? ""}
             {phase === "available" && info?.version ? ` → ${info.version}` : ""}
           </b>
-          <span>{statusText(info, phase, error)}</span>
+          <span>{statusText(info, phase, error, t)}</span>
         </div>
         <div className="update-actions">
           {phase === "available" ? (
-            <Button onClick={onShowDetails}>查看更新</Button>
+            <Button onClick={onShowDetails}>{t("update.view")}</Button>
           ) : (
             <Button icon="refresh" onClick={onCheck} disabled={busy}>
-              {checking ? "正在检查" : "检查更新"}
+              {checking ? t("update.checking") : t("update.check")}
             </Button>
           )}
         </div>
@@ -58,8 +60,8 @@ export function UpdateSettings({
       {busy && phase !== "checking" ? (
         <div className="update-inline-progress">
           <div>
-            <span>{progressLabel(phase)}</span>
-            <b>{percent !== null ? `${percent}%` : "校验中"}</b>
+            <span>{progressLabel(phase, t)}</span>
+            <b>{percent !== null ? `${percent}%` : t("update.verifyingShort")}</b>
           </div>
           <i>
             <span style={{ width: percent !== null ? `${percent}%` : "36%" }} />
@@ -69,38 +71,49 @@ export function UpdateSettings({
 
       {phase === "available" && info ? (
         <div className="update-available-meta">
-          <span>{info.size ? formatBytes(info.size) : "安装包大小以下载页为准"}</span>
-          <span>发布于 {formatDate(info.publishedAt)}</span>
+          <span>
+            {info.size ? formatBytes(info.size) : t("update.sizeFromPage")}
+          </span>
+          <span>
+            {t("update.publishedAt", {
+              date: formatDate(info.publishedAt, language),
+            })}
+          </span>
           <span>
             <Icon name="lock" size={12} />
-            仅安装签名匹配的版本
+            {t("update.signedOnly")}
           </span>
         </div>
       ) : null}
 
       <p className="settings-note update-note">
-        安装包会校验签名后再启动系统安装程序，安装期间请保持应用关闭。
+        {t("update.note")}
       </p>
     </section>
   );
 }
 
-function statusText(info: AppUpdateInfo | null, phase: AppUpdatePhase, error: string | null) {
-  if (phase === "checking") return "正在读取签名更新清单";
-  if (phase === "unconfigured") return "当前构建未配置更新通道，发布版会自动启用";
-  if (phase === "error") return error ?? "检查更新失败";
-  if (phase === "up-to-date") return "已是最新版本";
-  if (phase === "downloading") return "正在下载安装包";
-  if (phase === "verifying") return "下载完成，正在校验签名";
-  if (phase === "installing") return "安装器已启动，应用即将重启";
+function statusText(
+  info: AppUpdateInfo | null,
+  phase: AppUpdatePhase,
+  error: string | null,
+  t: Translator,
+) {
+  if (phase === "checking") return t("update.status.checking");
+  if (phase === "unconfigured") return t("update.status.unconfigured");
+  if (phase === "error") return error ?? t("update.status.errorFallback");
+  if (phase === "up-to-date") return t("update.status.upToDate");
+  if (phase === "downloading") return t("update.status.downloading");
+  if (phase === "verifying") return t("update.status.verifying");
+  if (phase === "installing") return t("update.status.installing");
   if (phase === "available" && info?.version) {
-    return `新版本 ${info.version} 可以安装`;
+    return t("update.status.available", { version: info.version });
   }
-  return "检查是否有新的稳定版本";
+  return t("update.status.idle");
 }
 
-function progressLabel(phase: AppUpdatePhase) {
-  if (phase === "verifying") return "正在校验安装包签名";
-  if (phase === "installing") return "正在启动安装器";
-  return "下载进度";
+function progressLabel(phase: AppUpdatePhase, t: Translator) {
+  if (phase === "verifying") return t("update.progress.verifying");
+  if (phase === "installing") return t("update.progress.installing");
+  return t("update.progress.download");
 }

@@ -1,12 +1,13 @@
 import type { GameStatus, NavSection, ThemeMode } from "../../types";
+import { useI18n } from "../../i18n";
 import { Icon } from "../ui/Icon";
 
-const titles: Record<NavSection, string> = {
-  library: "模组库",
-  cloud: "云端目录",
-  server: "远程服务器",
-  logs: "运行日志",
-  settings: "设置",
+const titleKeys: Record<NavSection, "page.library" | "page.cloud" | "page.server" | "page.logs" | "page.settings"> = {
+  library: "page.library",
+  cloud: "page.cloud",
+  server: "page.server",
+  logs: "page.logs",
+  settings: "page.settings",
 };
 
 interface TitleBarProps {
@@ -42,18 +43,21 @@ export function TitleBar({
   onMaximize,
   onClose,
 }: TitleBarProps) {
+  const { t } = useI18n();
   return (
     <header className="titlebar" data-tauri-drag-region>
       <div className="crumb" data-tauri-drag-region>
-        <span>SCUM MOD DESK</span>
+        <span>{t("app.name")}</span>
         <i>/</i>
-        <b>{titles[section]}</b>
+        <b>{t(titleKeys[section])}</b>
       </div>
       <div className="title-status" data-tauri-drag-region>
         {updateAvailable ? (
           <button type="button" className="update-notice" onClick={onOpenUpdate}>
             <i />
-            {updateVersion ? `${updateVersion} 可用` : "有更新"}
+            {updateVersion
+              ? t("title.updateVersionAvailable", { version: updateVersion })
+              : t("title.updateAvailable")}
           </button>
         ) : null}
         <span
@@ -61,36 +65,36 @@ export function TitleBar({
           data-tauri-drag-region
         >
           {gameStatus.running
-            ? "游戏运行中"
+            ? t("title.gameRunning")
             : hasClientPath
-              ? "客户端已定位"
-              : "未设置客户端路径"}
+              ? t("title.clientLocated")
+              : t("title.clientMissing")}
         </span>
         <span className="title-deployed" data-tauri-drag-region>
-          {enabledCount} 个启用 · {deployedSize}
+          {t("title.enabledDeployed", { count: enabledCount, size: deployedSize })}
         </span>
         <span className="title-checked" data-tauri-drag-region>
-          上次检查 {lastChecked}
+          {t("title.lastChecked", { time: lastChecked })}
         </span>
         <button
           type="button"
           className="theme-switch"
           onClick={onToggleTheme}
-          aria-label={theme === "dark" ? "切换到亮色主题" : "切换到暗色主题"}
-          title={theme === "dark" ? "切换到亮色主题" : "切换到暗色主题"}
+          aria-label={t(theme === "dark" ? "title.switchToLight" : "title.switchToDark")}
+          title={t(theme === "dark" ? "title.switchToLight" : "title.switchToDark")}
         >
           <Icon name={theme === "dark" ? "sun" : "moon"} size={13} />
-          <span>{theme === "dark" ? "亮色" : "暗色"}</span>
+          <span>{t(theme === "dark" ? "title.light" : "title.dark")}</span>
         </button>
       </div>
       <div className="window-actions">
-        <button type="button" onClick={onMinimize} aria-label="最小化">
+        <button type="button" onClick={onMinimize} aria-label={t("title.minimize")}>
           <Icon name="minimize" size={12} />
         </button>
-        <button type="button" onClick={onMaximize} aria-label="最大化">
+        <button type="button" onClick={onMaximize} aria-label={t("title.maximize")}>
           <Icon name="maximize" size={11} />
         </button>
-        <button type="button" className="window-close" onClick={onClose} aria-label="关闭">
+        <button type="button" className="window-close" onClick={onClose} aria-label={t("title.close")}>
           <Icon name="close" size={12} />
         </button>
       </div>

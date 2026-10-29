@@ -8,11 +8,11 @@ import WebSocket from "ws";
 const root = path.resolve(import.meta.dirname, "..");
 const outDir = path.join(root, "test-artifacts", "native-regression");
 const buildDir = path.join(outDir, "cargo-target");
-const runRoot = path.join(outDir, "app-data");
+const executable = path.join(buildDir, "release", "scum-mod-manager.exe");
+const runRoot = path.join(path.dirname(executable), "app-data");
 const webviewRoot = path.join(outDir, "webview-data");
 const inputsRoot = path.join(outDir, "inputs");
 const testConfig = path.join(outDir, "tauri.e2e.conf.json");
-const executable = path.join(buildDir, "release", "scum-mod-manager.exe");
 const defaultBrowserArgs =
   "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
 const debugPort = Number(process.env.SCUM_MM_NATIVE_DEBUG_PORT ?? 19222);
@@ -298,8 +298,22 @@ async function connect(url) {
   await test("原生标题栏、窗口尺寸与截图", async () => {
     const info = await evaluate(`(() => {
       const labels = ["最小化", "最大化", "关闭"];
+      const frame = document.querySelector(".app-frame")?.getBoundingClientRect();
       return {
         viewport: { width: innerWidth, height: innerHeight },
+        frame: frame
+          ? {
+              left: frame.left,
+              top: frame.top,
+              right: frame.right,
+              bottom: frame.bottom,
+            }
+          : null,
+        frameShadow:
+          getComputedStyle(document.querySelector(".app-frame"))
+            .getPropertyValue("box-shadow")
+            .trim(),
+        resizeHandles: document.querySelectorAll(".window-resize-handle").length,
         dragRegion:
           document.querySelector(".title-status")?.hasAttribute("data-tauri-drag-region") ??
           false,
@@ -321,6 +335,16 @@ async function connect(url) {
     }
     assert(info.dragRegion, "title status drag region is missing");
     assert(info.themeSwitchDrag === "no-drag", "title bar button lost its no-drag region");
+    assert(
+      info.frame &&
+        Math.abs(info.frame.left) < 1 &&
+        Math.abs(info.frame.top) < 1 &&
+        Math.abs(info.frame.right - info.viewport.width) < 1 &&
+        Math.abs(info.frame.bottom - info.viewport.height) < 1,
+      `window frame does not fill viewport: ${JSON.stringify(info.frame)}`,
+    );
+    assert(info.frameShadow === "none", `unexpected outer frame shadow: ${info.frameShadow}`);
+    assert(info.resizeHandles === 8, `resize handle count is ${info.resizeHandles}`);
     assert(!info.overflow, "native page has horizontal overflow");
     return { info, screenshot: await screenshot("native-library-after-drop") };
   });

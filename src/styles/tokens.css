@@ -1,3 +1,5 @@
+@import "./mod-types.css";
+
 :root {
   font-family: "Archivo", "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
   font-synthesis: none;
@@ -20,6 +22,14 @@
   --accent-strong: #c95531;
   --accent-soft: rgba(217, 101, 61, 0.13);
   --accent-ink: #fff8f0;
+  --mod-type-client-pak: #2a6365;
+  --mod-type-server-pak: #475b74;
+  --mod-type-ue4ss-mod: #526437;
+  --mod-type-config-file: #705326;
+  --mod-type-script: #824835;
+  --mod-type-other: #60605c;
+  --toggle-off-track: rgba(30, 33, 29, 0.16);
+  --toggle-off-knob: #f7f3ea;
   --good: #668b6c;
   --good-soft: rgba(102, 139, 108, 0.12);
   --warn: #a66a42;
@@ -61,6 +71,15 @@
   --accent-strong: #ef805a;
   --accent-soft: rgba(225, 114, 75, 0.14);
   --accent-ink: #1b120f;
+  --mod-type-client-pak: #8ab7b8;
+  --mod-type-server-pak: #9eb1c8;
+  --mod-type-ue4ss-mod: #b1bd89;
+  --mod-type-config-file: #d2b570;
+  --mod-type-script: #d89578;
+  --mod-type-other: #b0aea6;
+  /* 暗色关闭态：轨道提亮、滑块保持浅色，滑块才像"手柄"而不是一个洞 */
+  --toggle-off-track: rgba(255, 255, 255, 0.18);
+  --toggle-off-knob: #ece9e1;
   --good: #93b89a;
   --good-soft: rgba(147, 184, 154, 0.1);
   --warn: #e1a170;

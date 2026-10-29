@@ -31,6 +31,12 @@ pub struct ModMetadata {
 pub struct MetadataFile {
     #[serde(rename = "__order__", default, skip_serializing_if = "Vec::is_empty")]
     pub order: Vec<String>,
+    #[serde(
+        rename = "__conflict_winners__",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub conflict_winners: BTreeMap<String, String>,
     #[serde(flatten)]
     pub entries: BTreeMap<String, ModMetadata>,
 }
@@ -82,6 +88,9 @@ mod tests {
             order: vec!["second".to_string(), "first".to_string()],
             ..MetadataFile::default()
         };
+        metadata
+            .conflict_winners
+            .insert("scum/content/shared".to_string(), "second".to_string());
         let second = metadata.entry_mut("second");
         second.enabled = false;
         second.tags = vec!["server".to_string(), "balance".to_string()];
@@ -95,6 +104,10 @@ mod tests {
         let loaded = load_metadata(&paths).unwrap();
 
         assert_eq!(loaded.order, vec!["second", "first"]);
+        assert_eq!(
+            loaded.conflict_winners["scum/content/shared"],
+            "second".to_string()
+        );
         assert!(!loaded.entries["second"].enabled);
         assert_eq!(loaded.entries["second"].tags, vec!["server", "balance"]);
         assert_eq!(loaded.entries["second"].notes, "测试备注");
@@ -116,5 +129,26 @@ mod tests {
         let loaded = load_metadata(&paths).unwrap();
 
         assert!(loaded.entries["demo"].enabled);
+    }
+
+    #[test]
+    fn conflict_winners_use_the_reserved_metadata_key() {
+        let temp = TempRoot::new("metadata-conflict-winners");
+        let paths = temp.paths();
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut("demo");
+        metadata
+            .conflict_winners
+            .insert("scum/content/demo".to_string(), "demo".to_string());
+
+        save_metadata(&paths, &metadata).unwrap();
+        let text = std::fs::read_to_string(&paths.metadata_file).unwrap();
+        assert!(text.contains("\"__conflict_winners__\""));
+        assert!(!text.contains("\"conflictWinners\""));
+
+        let loaded = load_metadata(&paths).unwrap();
+        assert_eq!(loaded.conflict_winners["scum/content/demo"], "demo");
+        assert!(loaded.entries.contains_key("demo"));
+        assert!(!loaded.entries.contains_key("__conflict_winners__"));
     }
 }

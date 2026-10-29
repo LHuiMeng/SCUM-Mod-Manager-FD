@@ -7,7 +7,9 @@ import type {
   AppUpdatePhase,
   AppUpdateProgress,
   CloudDownloadProgress,
+  Language,
   LibrarySnapshot,
+  LocaleBundle,
   NavSection,
   RemoteFile,
   RemoteMod,
@@ -17,6 +19,15 @@ import type {
   ToastMessage,
 } from "./types";
 import { formatClock, formatBytes } from "./lib/format";
+import {
+  I18nProvider,
+  normalizeLanguage,
+  readStoredLanguage,
+  storeLanguage,
+  SUPPORTED_LANGUAGES,
+  translate,
+  type Translator,
+} from "./i18n";
 import { resolveFileDrop } from "./lib/fileDrop";
 import { cloudDownloadIsActive } from "./lib/cloudDownload";
 import { AppShell } from "./components/shell/AppShell";
@@ -41,6 +52,15 @@ function applyTheme(theme: ThemeMode) {
 }
 
 export default function App() {
+  return <LocalizedApp />;
+}
+
+function LocalizedApp() {
+  const initialLanguage = useRef<Language>(readStoredLanguage() ?? "zh-CN");
+  const [language, setLanguageState] = useState<Language>(initialLanguage.current);
+  const [localeMessages, setLocaleMessages] = useState<Record<string, string>>({});
+  const languageRef = useRef(language);
+  languageRef.current = language;
   const [snapshot, setSnapshot] = useState<LibrarySnapshot | null>(null);
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [section, setSection] = useState<NavSection>("library");
@@ -75,7 +95,16 @@ export default function App() {
   const sectionRef = useRef<NavSection>("library");
   const launchSettingsRevision = useRef(0);
   const launchSettingsQueue = useRef<Promise<void>>(Promise.resolve());
+  const toggleRevisions = useRef(new Map<string, number>());
   const activeCloudDownloads = useRef(new Set<string>());
+  const localeRequest = useRef(0);
+  const languageSaveRevision = useRef(0);
+  const languageSaveQueue = useRef<Promise<void>>(Promise.resolve());
+
+  const t = useCallback<Translator>(
+    (key, variables) => translate(language, localeMessages, key, variables),
+    [language, localeMessages],
+  );
 
   const notify = useCallback(
     (title: string, detail?: string, tone: ToastMessage["tone"] = "default") => {
@@ -92,15 +121,19 @@ export default function App() {
     async (paths: string[]) => {
       if (paths.length === 0) return;
       if (!snapshot) {
-        notify("模组库仍在加载", "请稍后重新拖入。", "default");
+        notify(t("toast.libraryLoading.title"), t("toast.libraryLoading.detail"), "default");
         return;
       }
       if (busy) {
-        notify("正在处理上一项任务", "请稍后再拖放模组。");
+        notify(t("toast.busy.title"), t("toast.busy.detail"));
         return;
       }
       setBusy(true);
-      notify("正在导入拖放内容", `${paths.length} 个文件或文件夹`, "default");
+      notify(
+        t("toast.importing.title"),
+        t("common.filesAndFolders", { count: paths.length }),
+        "default",
+      );
       try {
         const result = await api.importMods(paths);
         const next = await api.getSnapshot();
@@ -108,14 +141,105 @@ export default function App() {
         setSelectedId((current) =>
           next.mods.some((mod) => mod.id === current) ? current : next.mods[0]?.id ?? null,
         );
-        notify("导入完成", result.message, "success");
+        notify(t("toast.importDone.title"), result.message, "success");
       } catch (error) {
-        notify("导入失败", String(error), "error");
+        notify(t("toast.importFailed.title"), String(error), "error");
       } finally {
         setBusy(false);
       }
     },
-    [busy, notify, snapshot],
+    [busy, notify, snapshot, t],
+  );
+
+  const loadLocale = useCallback(
+    async (nextLanguage: Language): Promise<LocaleBundle> => {
+      const request = ++localeRequest.current;
+      const bundle = await api.getLocale(nextLanguage);
+      if (request === localeRequest.current) {
+        setLocaleMessages(bundle.messages ?? {});
+        if (bundle.warnings.length > 0) {
+          notify(
+            translate(nextLanguage, null, "toast.localeReadFailed.title"),
+            translate(nextLanguage, null, "toast.localeReadFailed.detail", {
+              error: bundle.warnings[0],
+            }),
+            "error",
+          );
+        }
+      }
+      return bundle;
+    },
+    [notify],
+  );
+
+  const changeLanguage = useCallback(
+    async (nextLanguage: Language, persist = true) => {
+      const normalized = normalizeLanguage(nextLanguage);
+      const previous = languageRef.current;
+      if (normalized === previous) {
+        void loadLocale(normalized).catch(() => undefined);
+        return;
+      }
+      const revision = ++languageSaveRevision.current;
+      setLanguageState(normalized);
+      languageRef.current = normalized;
+      setToasts([]);
+      storeLanguage(normalized);
+      try {
+        await loadLocale(normalized);
+      } catch (error) {
+        // Built-in dictionaries remain usable when the optional locale command fails.
+        setLocaleMessages({});
+        if (persist) {
+          notify(
+            translate(normalized, null, "toast.localeReadFailed.title"),
+            translate(normalized, null, "toast.localeReadFailed.detail", {
+              error: String(error),
+            }),
+            "error",
+          );
+        }
+      }
+      if (!persist) return;
+      if (revision !== languageSaveRevision.current) return;
+      const saveTask = languageSaveQueue.current
+        .catch(() => undefined)
+        .then(async () => {
+          if (revision !== languageSaveRevision.current) return;
+          const current = snapshot;
+          if (!current) return;
+          await api.setLanguage(normalized);
+          if (revision !== languageSaveRevision.current) return;
+          setSnapshot((value) =>
+            value
+              ? { ...value, settings: { ...value.settings, language: normalized } }
+              : value,
+          );
+        });
+      languageSaveQueue.current = saveTask.catch(() => undefined);
+      try {
+        await saveTask;
+      } catch (error) {
+        if (revision !== languageSaveRevision.current) return;
+        setLanguageState(previous);
+        languageRef.current = previous;
+        storeLanguage(previous);
+        if (snapshot) {
+          void loadLocale(previous).catch(() => setLocaleMessages({}));
+        }
+        notify(
+          translate(previous, null, "toast.localeSaveFailed.title"),
+          translate(previous, null, "toast.localeSaveFailed.detail", {
+            language:
+              SUPPORTED_LANGUAGES.find((item) => item.id === previous)?.label ??
+              previous,
+            error: String(error),
+          }),
+          "error",
+        );
+      }
+    },
+    [loadLocale, notify, snapshot],
   );
 
   useEffect(() => {
@@ -127,6 +251,10 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    document.documentElement.lang = language;
+  }, [language]);
+
+  useEffect(() => {
     let cancelled = false;
     Promise.all([api.getSnapshot(), api.getAppInfo()])
       .then(([next, info]) => {
@@ -136,17 +264,33 @@ export default function App() {
         const savedTheme =
           (localStorage.getItem("scum-theme") as ThemeMode | null) ?? next.settings.theme;
         setThemeState(savedTheme);
+        const savedLanguage =
+          readStoredLanguage() ??
+          normalizeLanguage(next.settings.language);
+        setLanguageState(savedLanguage);
+        languageRef.current = savedLanguage;
+        storeLanguage(savedLanguage);
+        void loadLocale(savedLanguage).catch((error) => {
+          if (cancelled) return;
+          notify(
+            translate(savedLanguage, null, "toast.localeReadFailed.title"),
+            translate(savedLanguage, null, "toast.localeReadFailed.detail", {
+              error: String(error),
+            }),
+            "error",
+          );
+        });
         setSelectedId(
           [...next.mods].sort((a, b) => a.loadOrder - b.loadOrder)[0]?.id ?? null,
         );
       })
       .catch((error) => {
-        notify("无法加载本地数据", String(error), "error");
+        notify(t("toast.loadFailed.title"), String(error), "error");
       });
     return () => {
       cancelled = true;
     };
-  }, [notify]);
+  }, [loadLocale, notify]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -257,7 +401,7 @@ export default function App() {
           if (result.paths.length > 0) {
             void importPathsRef.current(result.paths);
           } else if (result.requiresLibrary) {
-            notify("请先打开模组库", "将 PAK、ZIP 或 UE4SS 文件夹拖到模组列表即可导入。");
+            notify(t("toast.openLibrary.title"), t("toast.openLibrary.detail"));
           }
         }),
       )
@@ -266,13 +410,13 @@ export default function App() {
         else unlisten = stop;
       })
       .catch((error) => {
-        if (!disposed) notify("拖放导入初始化失败", String(error), "error");
+        if (!disposed) notify(t("toast.dragInitFailed.title"), String(error), "error");
       });
     return () => {
       disposed = true;
       unlisten?.();
     };
-  }, [notify]);
+  }, [notify, t]);
 
   useEffect(() => {
     sectionRef.current = section;
@@ -306,9 +450,9 @@ export default function App() {
     try {
       setLogs(await api.getLogs());
     } catch (error) {
-      notify("日志读取失败", String(error), "error");
+      notify(t("toast.logsReadFailed.title"), String(error), "error");
     }
-  }, [notify]);
+  }, [notify, t]);
 
   const checkForUpdate = useCallback(
     async (silent = false) => {
@@ -320,7 +464,10 @@ export default function App() {
         if (!result.configured) {
           setUpdatePhase("unconfigured");
           if (!silent) {
-            notify("更新通道尚未配置", "开发构建不会连接公开更新服务器。");
+            notify(
+              t("toast.updateUnconfigured.title"),
+              t("toast.updateUnconfigured.detail"),
+            );
           }
           return;
         }
@@ -331,16 +478,20 @@ export default function App() {
         }
         setUpdatePhase("up-to-date");
         if (!silent) {
-          notify("已是最新版本", `当前版本 ${result.currentVersion}`, "success");
+          notify(
+            t("toast.upToDate.title"),
+            t("toast.upToDate.detail", { version: result.currentVersion }),
+            "success",
+          );
         }
       } catch (error) {
         const message = String(error);
         setUpdateError(message);
         setUpdatePhase("error");
-        if (!silent) notify("检查更新失败", message, "error");
+        if (!silent) notify(t("toast.updateCheckFailed.title"), message, "error");
       }
     },
-    [notify],
+    [notify, t],
   );
 
   useEffect(() => {
@@ -353,10 +504,19 @@ export default function App() {
     if (section === "logs") void refreshLogs();
   }, [refreshLogs, section]);
 
+  // 云源线路一改，上一份目录就不再是"当前目录"：清空它，避免旧条数继续挂在横幅上。
+  const cloudSourcesKey = snapshot?.settings.cloud.baseUrls.join("\n") ?? "";
+  useEffect(() => {
+    setCloudMods([]);
+    setCloudLoaded(false);
+    setCloudError(null);
+  }, [cloudSourcesKey]);
+
   const refreshCloud = useCallback(
     async (force = false) => {
       if (!snapshot) return;
       if (snapshot.settings.cloud.baseUrls.length === 0) {
+        setCloudMods([]);
         setCloudError(null);
         setCloudLoaded(true);
         return;
@@ -384,6 +544,11 @@ export default function App() {
   function changeTheme(nextTheme: ThemeMode) {
     setThemeState(nextTheme);
     applyTheme(nextTheme);
+    setSnapshot((current) =>
+      current
+        ? { ...current, settings: { ...current.settings, theme: nextTheme } }
+        : current,
+    );
     void api.setTheme(nextTheme).catch(() => undefined);
   }
 
@@ -396,9 +561,13 @@ export default function App() {
       setSelectedId((current) =>
         next.mods.some((mod) => mod.id === current) ? current : next.mods[0]?.id ?? null,
       );
-      notify("扫描完成", `发现 ${next.mods.length} 个本地模组`, "success");
+      notify(
+        t("toast.scanDone.title"),
+        t("toast.scanDone.detail", { count: next.mods.length }),
+        "success",
+      );
     } catch (error) {
-      notify("扫描失败", String(error), "error");
+      notify(t("toast.scanFailed.title"), String(error), "error");
     } finally {
       setBusy(false);
     }
@@ -408,7 +577,7 @@ export default function App() {
     const paths = await chooseFiles();
     if (paths.length === 0) {
       if (!isTauri()) {
-        notify("浏览器预览不读取文件系统", "请在桌面版中选择或拖入模组。");
+        notify(t("toast.browserPreview.title"), t("toast.browserPreview.detail"));
       }
       return;
     }
@@ -417,16 +586,37 @@ export default function App() {
 
   async function handleToggle(id: string, enabled: boolean) {
     if (!snapshot) return;
-    const optimistic = {
-      ...snapshot,
-      mods: snapshot.mods.map((mod) => (mod.id === id ? { ...mod, enabled } : mod)),
-    };
-    setSnapshot(optimistic);
+    const revision = (toggleRevisions.current.get(id) ?? 0) + 1;
+    toggleRevisions.current.set(id, revision);
+    setSnapshot((current) =>
+      current
+        ? {
+            ...current,
+            mods: current.mods.map((mod) =>
+              mod.id === id ? { ...mod, enabled } : mod,
+            ),
+          }
+        : current,
+    );
     try {
-      setSnapshot(await api.setModEnabled(id, enabled));
+      const next = await api.setModEnabled(id, enabled);
+      if (toggleRevisions.current.get(id) === revision) {
+        setSnapshot(next);
+      }
     } catch (error) {
-      setSnapshot(snapshot);
-      notify("状态保存失败", String(error), "error");
+      if (toggleRevisions.current.get(id) === revision) {
+        setSnapshot((current) =>
+          current
+            ? {
+                ...current,
+                mods: current.mods.map((mod) =>
+                  mod.id === id ? { ...mod, enabled: !enabled } : mod,
+                ),
+              }
+            : current,
+        );
+        notify(t("toast.statusSaveFailed.title"), String(error), "error");
+      }
     }
   }
 
@@ -445,23 +635,71 @@ export default function App() {
       setSnapshot(await api.reorderMods(ids));
     } catch (error) {
       setSnapshot(snapshot);
-      notify("加载顺序保存失败", String(error), "error");
+      notify(t("toast.orderSaveFailed.title"), String(error), "error");
     }
   }
 
   async function handleEdit(id: string, tags: string[], notes: string) {
     try {
       setSnapshot(await api.updateModMetadata(id, tags, notes));
-      notify("模组信息已保存", undefined, "success");
+      notify(t("toast.metadataSaved.title"), undefined, "success");
     } catch (error) {
-      notify("保存失败", String(error), "error");
+      notify(t("toast.saveFailed.title"), String(error), "error");
+    }
+  }
+
+  async function handleDelete(id: string): Promise<boolean> {
+    const target = snapshot?.mods.find((mod) => mod.id === id);
+    if (!snapshot || !target) return false;
+    if (snapshot.gameStatus.running) {
+      notify(t("inspector.deleteRunning"), undefined, "error");
+      return false;
+    }
+    try {
+      const next = await api.deleteMod(id);
+      setSnapshot(next);
+      setSelectedId((current) =>
+        next.mods.some((mod) => mod.id === current)
+          ? current
+          : [...next.mods].sort((a, b) => a.loadOrder - b.loadOrder)[0]?.id ?? null,
+      );
+      notify(
+        t("inspector.deleteSuccessTitle"),
+        t("inspector.deleteSuccessDetail", { name: target.name }),
+        "success",
+      );
+      return true;
+    } catch (error) {
+      notify(t("inspector.deleteErrorTitle"), String(error), "error");
+      return false;
+    }
+  }
+
+  async function handleSaveConflictWinners(
+    winners: Record<string, string>,
+  ): Promise<boolean> {
+    try {
+      setSnapshot(await api.saveConflictWinners(winners));
+      notify(
+        t("toast.conflictSaved.title"),
+        t("toast.conflictSaved.detail"),
+        "success",
+      );
+      return true;
+    } catch (error) {
+      notify(t("toast.conflictSaveFailed.title"), String(error), "error");
+      return false;
     }
   }
 
   async function handleLaunch() {
     if (!snapshot || snapshot.gameStatus.running) return;
     if (!snapshot.settings.scumInstallPath.trim()) {
-      notify("尚未设置客户端路径", "请先在设置中定位 SCUM 安装目录。", "error");
+      notify(
+        t("toast.clientPathMissing.title"),
+        t("toast.clientPathMissing.detail"),
+        "error",
+      );
       setSection("settings");
       return;
     }
@@ -471,9 +709,9 @@ export default function App() {
       setSnapshot((current) =>
         current ? { ...current, gameStatus: status } : current,
       );
-      notify("游戏已启动", "启用模组已完成部署", "success");
+      notify(t("toast.gameStarted.title"), t("toast.gameStarted.detail"), "success");
     } catch (error) {
-      notify("启动失败", String(error), "error");
+      notify(t("toast.launchFailed.title"), String(error), "error");
     } finally {
       setBusy(false);
     }
@@ -485,9 +723,9 @@ export default function App() {
     try {
       const status = await api.killGame();
       setSnapshot(await api.getSnapshot().then((next) => ({ ...next, gameStatus: status })));
-      notify("游戏已关闭", "本次部署的模组已回收", "success");
+      notify(t("toast.gameClosed.title"), t("toast.gameClosed.detail"), "success");
     } catch (error) {
-      notify("关闭失败", String(error), "error");
+      notify(t("toast.closeFailed.title"), String(error), "error");
     } finally {
       setBusy(false);
     }
@@ -499,9 +737,15 @@ export default function App() {
       setSnapshot((current) => (current ? { ...current, settings: saved } : current));
       setThemeState(saved.theme);
       applyTheme(saved.theme);
-      notify("设置已保存", undefined, "success");
+      if (saved.language !== languageRef.current) {
+        setLanguageState(saved.language);
+        languageRef.current = saved.language;
+        storeLanguage(saved.language);
+        void loadLocale(saved.language).catch(() => setLocaleMessages({}));
+      }
+      notify(t("toast.settingsSaved.title"), undefined, "success");
     } catch (error) {
-      notify("设置保存失败", String(error), "error");
+      notify(t("toast.settingsSaveFailed.title"), String(error), "error");
     }
   }
 
@@ -531,7 +775,7 @@ export default function App() {
       })
       .catch(async (error) => {
         if (revision !== launchSettingsRevision.current) return;
-        notify("启动选项保存失败", String(error), "error");
+        notify(t("toast.launchOptionsSaveFailed.title"), String(error), "error");
         try {
           const next = await api.getSnapshot();
           if (revision === launchSettingsRevision.current) setSnapshot(next);
@@ -553,12 +797,12 @@ export default function App() {
     try {
       const result = await api.installAppUpdate();
       setUpdatePhase("installing");
-      notify("安装程序已启动", result.message, "success");
+      notify(t("toast.installerStarted.title"), result.message, "success");
     } catch (error) {
       const message = String(error);
       setUpdateError(message);
       setUpdatePhase("error");
-      notify("安装更新失败", message, "error");
+      notify(t("toast.installUpdateFailed.title"), message, "error");
     }
   }
 
@@ -566,7 +810,7 @@ export default function App() {
     try {
       return await api.detectPaths();
     } catch (error) {
-      notify("路径检测失败", String(error), "error");
+      notify(t("toast.pathDetectFailed.title"), String(error), "error");
       return null;
     }
   }
@@ -594,7 +838,7 @@ export default function App() {
     }));
     try {
       const result = await api.downloadRemoteMod(id);
-      notify("下载完成", result.message, "success");
+      notify(t("toast.downloadDone.title"), result.message, "success");
       setCloudDownloads((downloads) => {
         const latest = downloads[id];
         const completedTotal = latest?.total ?? total;
@@ -615,11 +859,11 @@ export default function App() {
       try {
         setSnapshot(await api.getSnapshot());
       } catch (error) {
-        notify("模组库刷新失败", String(error), "error");
+        notify(t("toast.libraryRefreshFailed.title"), String(error), "error");
       }
     } catch (error) {
       const message = String(error);
-      notify("下载失败", message, "error");
+      notify(t("toast.downloadFailed.title"), message, "error");
       setCloudDownloads((downloads) => {
         const latest = downloads[id];
         return {
@@ -647,10 +891,10 @@ export default function App() {
       const next = await api.saveSftpAccount(account, password);
       setSnapshot(next);
       setSftpTrustPrompt(null);
-      notify("SFTP 账户已安全保存", "密码已交由 Rust 后端加密存储", "success");
+      notify(t("toast.sftpSaved.title"), t("toast.sftpSaved.detail"), "success");
     } catch (error) {
       setServerError(String(error));
-      notify("账户保存失败", String(error), "error");
+      notify(t("toast.accountSaveFailed.title"), String(error), "error");
     }
   }
 
@@ -664,18 +908,21 @@ export default function App() {
           fingerprint: result.hostKeyFingerprint,
           message: result.message,
         });
-        notify("需要确认服务器主机指纹", "核对指纹后才能发送密码并建立连接。");
+        notify(
+          t("toast.hostTrustRequired.title"),
+          t("toast.hostTrustRequired.detail"),
+        );
         return;
       }
       setSftpTrustPrompt(null);
       if (!result.ok) throw new Error(result.message);
-      notify("连接成功", result.message, "success");
+      notify(t("toast.connectionDone.title"), result.message, "success");
       if (result.detectedModsPath) {
         await handleLoadRemoteFiles(result.detectedModsPath);
       }
     } catch (error) {
       setServerError(String(error));
-      notify("SFTP 连接失败", String(error), "error");
+      notify(t("toast.sftpFailed.title"), String(error), "error");
     }
   }
 
@@ -686,11 +933,11 @@ export default function App() {
       await api.trustSftpHost(sftpTrustPrompt.accountId, sftpTrustPrompt.fingerprint);
       const accountId = sftpTrustPrompt.accountId;
       setSftpTrustPrompt(null);
-      notify("主机密钥已信任", "正在重新验证账户与远端目录", "success");
+      notify(t("toast.hostTrusted.title"), t("toast.hostTrusted.detail"), "success");
       await handleTestSftp(accountId);
     } catch (error) {
       setServerError(String(error));
-      notify("主机密钥保存失败", String(error), "error");
+      notify(t("toast.hostTrustSaveFailed.title"), String(error), "error");
     }
   }
 
@@ -709,18 +956,18 @@ export default function App() {
   async function handleUpload(accountId: string, paths: string[]) {
     const selected = paths.length > 0 ? paths : await chooseFiles();
     if (selected.length === 0) {
-      notify("没有选择服务器模组", "浏览器预览下不会读取真实文件系统。");
+      notify(t("toast.noServerMods.title"), t("toast.noServerMods.detail"));
       return;
     }
     setBusy(true);
     try {
       const result = await api.uploadServerMods(accountId, selected);
-      notify("上传完成", result.message, "success");
+      notify(t("toast.uploadDone.title"), result.message, "success");
       const account = snapshot?.settings.sftpAccounts.find((item) => item.id === accountId);
       if (account) await handleLoadRemoteFiles(account.modsPath);
     } catch (error) {
       setServerError(String(error));
-      notify("上传失败", String(error), "error");
+      notify(t("toast.uploadFailed.title"), String(error), "error");
     } finally {
       setBusy(false);
     }
@@ -729,7 +976,12 @@ export default function App() {
   async function handleChooseDirectory(kind: "client" | "server") {
     const path = await chooseDirectory();
     if (!path) {
-      notify("未选择目录", `请在 Tauri 桌面版中选择${kind === "client" ? "客户端" : "服务端"}目录。`);
+      notify(
+        t("toast.directoryNotSelected.title"),
+        t("toast.directoryNotSelected.detail", {
+          kind: t(kind === "client" ? "common.client" : "common.server"),
+        }),
+      );
     }
     return path;
   }
@@ -740,7 +992,7 @@ export default function App() {
         <span className="boot-mark">SM</span>
         <div>
           <b>SCUM MOD DESK</b>
-          <span>正在读取本地模组数据</span>
+          <span>{t("app.loadingData")}</span>
         </div>
         <i />
       </div>
@@ -751,7 +1003,11 @@ export default function App() {
   const deployedBytes = enabled.reduce((sum, mod) => sum + mod.fileSize, 0);
 
   return (
-    <>
+    <I18nProvider
+      language={language}
+      overrides={localeMessages}
+      onLanguageChange={(next) => void changeLanguage(next)}
+    >
       <AppShell
         section={section}
         theme={theme}
@@ -759,7 +1015,7 @@ export default function App() {
         hasClientPath={Boolean(snapshot.settings.scumInstallPath.trim())}
         enabledCount={enabled.length}
         deployedSize={formatBytes(deployedBytes)}
-        lastChecked={formatClock(snapshot.lastScannedAt)}
+        lastChecked={formatClock(snapshot.lastScannedAt, language)}
         updateAvailable={updatePhase === "available"}
         updateVersion={updateInfo?.version ?? null}
         maximized={windowMaximized}
@@ -784,6 +1040,8 @@ export default function App() {
               onToggle={handleToggle}
               onReorder={handleReorder}
               onEdit={handleEdit}
+              onDelete={handleDelete}
+              onSaveConflictWinners={handleSaveConflictWinners}
               onLaunch={handleLaunch}
               onKill={handleKill}
               onOpenFolder={(id) => void api.openModFolder(id)}
@@ -841,11 +1099,13 @@ export default function App() {
             <SettingsScreen
               settings={snapshot.settings}
               theme={theme}
+              language={language}
               edition={appInfo?.edition ?? "public"}
               onSave={(settings) => void handleSaveSettings(settings)}
               onDetectPaths={handleDetectPaths}
               onLaunchOptionsChange={handleLaunchOptionsChange}
               onThemePreview={changeTheme}
+              onLanguagePreview={(next) => void changeLanguage(next)}
               onChooseDirectory={handleChooseDirectory}
               updateInfo={updateInfo}
               updatePhase={updatePhase}
@@ -871,6 +1131,6 @@ export default function App() {
         messages={toasts}
         onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))}
       />
-    </>
+    </I18nProvider>
   );
 }

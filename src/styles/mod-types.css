@@ -1,0 +1,104 @@
+/* Mod type accents stay local to badges and identity marks. */
+:where(.mod-row, .inspector, .remote-card)[data-mod-type="clientPak"] {
+  --mod-type-color: var(--mod-type-client-pak);
+}
+
+:where(.mod-row, .inspector, .remote-card)[data-mod-type="serverPak"] {
+  --mod-type-color: var(--mod-type-server-pak);
+}
+
+:where(.mod-row, .inspector, .remote-card)[data-mod-type="ue4ssMod"] {
+  --mod-type-color: var(--mod-type-ue4ss-mod);
+}
+
+:where(.mod-row, .inspector, .remote-card)[data-mod-type="configFile"] {
+  --mod-type-color: var(--mod-type-config-file);
+}
+
+:where(.mod-row, .inspector, .remote-card)[data-mod-type="script"] {
+  --mod-type-color: var(--mod-type-script);
+}
+
+:where(.mod-row, .inspector, .remote-card)[data-mod-type="other"] {
+  --mod-type-color: var(--mod-type-other);
+}
+
+:where(.mod-row, .inspector, .remote-card)[data-mod-type] {
+  --mod-type-tint: color-mix(
+    in srgb,
+    var(--mod-type-color) 7%,
+    var(--paper-hi)
+  );
+  --mod-type-border: color-mix(
+    in srgb,
+    var(--mod-type-color) 30%,
+    transparent
+  );
+}
+
+.mod-row[data-mod-type] .mod-type,
+.remote-card[data-mod-type] .remote-state {
+  box-sizing: border-box;
+  max-width: 100%;
+  border: 1px solid var(--mod-type-border);
+  border-radius: 999px;
+  color: var(--mod-type-color);
+  background: var(--mod-type-tint);
+}
+
+.mod-row[data-mod-type] .mod-type {
+  min-width: 0;
+  padding: 2px 7px;
+  line-height: 1.45;
+}
+
+@media (min-width: 1241px) {
+  .mod-row[data-mod-type] .mod-type {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    justify-self: start;
+  }
+}
+
+.mod-row[data-mod-type] .mod-type::before {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: currentColor;
+  content: "";
+}
+
+.remote-card[data-mod-type] .remote-state {
+  display: inline-block;
+  overflow: hidden;
+  padding: 2px 7px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+}
+
+.mod-row[data-mod-type] .mod-thumb,
+.remote-card[data-mod-type] .remote-mark {
+  color: var(--mod-type-color);
+  background: var(--mod-type-tint);
+  box-shadow: inset 0 0 0 1px var(--mod-type-border);
+}
+
+.inspector[data-mod-type] .inspector-kicker {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  color: var(--mod-type-color);
+}
+
+.inspector[data-mod-type] .inspector-kicker::before {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border: 1px solid var(--mod-type-border);
+  border-radius: 50%;
+  background: var(--mod-type-tint);
+  content: "";
+}
