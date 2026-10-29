@@ -119,6 +119,7 @@ pub struct AppSettings {
     pub launch_options: LaunchOptions,
     #[serde(alias = "cloud", alias = "cloud_sources")]
     pub cloud: CloudSettings,
+    pub keep_deployed_mods_on_exit: bool,
     #[serde(alias = "sftpAccounts", alias = "sftp_accounts")]
     pub sftp_accounts: Vec<SftpAccount>,
     #[serde(
@@ -138,6 +139,7 @@ impl Default for AppSettings {
             language: default_language(),
             launch_options: LaunchOptions::default(),
             cloud: CloudSettings::default(),
+            keep_deployed_mods_on_exit: false,
             sftp_accounts: Vec::new(),
             active_sftp_account_id: None,
         }

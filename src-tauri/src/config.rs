@@ -348,6 +348,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_config_keeps_deployed_mods_cleanup_enabled_by_default() {
+        let temp = TempRoot::new("config-legacy-deployment-retention");
+        let paths = temp.paths();
+        fs::write(
+            &paths.config_file,
+            serde_json::to_vec_pretty(&json!({
+                "theme": "light"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let settings = load_settings(&paths).unwrap();
+        let saved = fs::read_to_string(&paths.config_file).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(settings)
+                .unwrap()
+                .get("keepDeployedModsOnExit")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(saved.contains("\"keepDeployedModsOnExit\": false"));
+    }
+
+    #[test]
     fn injects_packaged_cloud_sources_when_config_is_missing_or_empty() {
         let temp = TempRoot::new("config-default-cloud-sources");
         let paths = temp.paths();

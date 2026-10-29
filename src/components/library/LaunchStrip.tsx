@@ -9,6 +9,7 @@ interface LaunchStripProps {
   enabledCount: number;
   totalBytes: number;
   running: boolean;
+  keepDeployedModsOnExit: boolean;
   launchOptions: LaunchOptions;
   onLaunch: () => void;
   onKill: () => void;
@@ -20,6 +21,7 @@ export function LaunchStrip({
   enabledCount,
   totalBytes,
   running,
+  keepDeployedModsOnExit,
   launchOptions,
   onLaunch,
   onKill,
@@ -57,7 +59,19 @@ export function LaunchStrip({
         <span className={`strip-dot ${running ? "is-running" : ""}`} />
         <div>
           <b>{running ? t("launch.runningTitle") : t("launch.readyTitle")}</b>
-          <span>{running ? t("launch.runningDetail") : t("launch.readyDetail")}</span>
+          <span>
+            {running
+              ? t(
+                  keepDeployedModsOnExit
+                    ? "launch.runningDetailKeep"
+                    : "launch.runningDetail",
+                )
+              : t(
+                  keepDeployedModsOnExit
+                    ? "launch.readyDetailKeep"
+                    : "launch.readyDetail",
+                )}
+          </span>
         </div>
       </div>
       <div className="strip-facts">

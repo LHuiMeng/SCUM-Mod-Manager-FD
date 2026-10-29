@@ -111,24 +111,22 @@ pub fn stop(state: &AppState) -> Result<GameStatus> {
         let _ = managed.child.kill();
         let _ = managed.child.wait();
     }
-    let reclaimed = match reclaim_mods(&state.paths) {
-        Ok(reclaimed) => reclaimed,
-        Err(error) => {
-            state.log(
-                "error",
-                "launcher",
-                &format!("游戏已关闭，但部署文件回收失败：{error:#}"),
-            );
-            0
-        }
-    };
+    let reclaimed = state.reclaim_deployments_after_exit();
     let status = GameStatus::default();
     *state.game.lock().unwrap() = status.clone();
-    state.log(
-        "info",
-        "launcher",
-        &format!("游戏已关闭，回收 {reclaimed} 个部署文件"),
-    );
+    match reclaimed {
+        Ok(Some(reclaimed)) => state.log(
+            "info",
+            "launcher",
+            &format!("游戏已关闭，回收 {reclaimed} 个部署文件"),
+        ),
+        Ok(None) => state.log("info", "launcher", "游戏已关闭，按设置保留部署文件"),
+        Err(error) => state.log(
+            "error",
+            "launcher",
+            &format!("游戏已关闭，但部署文件回收失败：{error:#}"),
+        ),
+    }
     Ok(status)
 }
 
@@ -170,24 +168,26 @@ fn monitor_process(app: AppHandle, state: &AppState, token: u64, pid: u32) {
         };
         if exited {
             let _ = state.process.lock().unwrap().take();
-            let reclaimed = match reclaim_mods(&state.paths) {
-                Ok(reclaimed) => reclaimed,
-                Err(error) => {
-                    state.log(
-                        "error",
-                        "launcher",
-                        &format!("检测到游戏退出，但部署文件回收失败：{error:#}"),
-                    );
-                    0
-                }
-            };
+            let reclaimed = state.reclaim_deployments_after_exit();
             let status = GameStatus::default();
             *state.game.lock().unwrap() = status.clone();
-            state.log(
-                "info",
-                "launcher",
-                &format!("检测到游戏退出（PID {pid}），回收 {reclaimed} 个部署文件"),
-            );
+            match reclaimed {
+                Ok(Some(reclaimed)) => state.log(
+                    "info",
+                    "launcher",
+                    &format!("检测到游戏退出（PID {pid}），回收 {reclaimed} 个部署文件"),
+                ),
+                Ok(None) => state.log(
+                    "info",
+                    "launcher",
+                    &format!("检测到游戏退出（PID {pid}），按设置保留部署文件"),
+                ),
+                Err(error) => state.log(
+                    "error",
+                    "launcher",
+                    &format!("检测到游戏退出，但部署文件回收失败：{error:#}"),
+                ),
+            }
             let _ = app.emit("game-status-changed", &status);
             return;
         }

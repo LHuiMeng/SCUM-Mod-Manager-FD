@@ -815,6 +815,56 @@ mod tests {
     }
 
     #[test]
+    fn redeploys_after_reclaiming_when_retention_is_enabled() {
+        let temp = TempRoot::new("deploy-retained-redeploy");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let first = paths.local_mods.join("First.pak");
+        let second = paths.local_mods.join("Second.pak");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            keep_deployed_mods_on_exit: true,
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&first, true, "clientPak")],
+            false,
+        )
+        .unwrap()
+        .expect("first deployment should be created");
+        let first_target = pak_dir.join("000_First.pak");
+        assert!(first_target.exists());
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&second, true, "clientPak")],
+            false,
+        )
+        .unwrap()
+        .expect("second deployment should be created");
+
+        assert!(!first_target.exists());
+        assert_eq!(fs::read(pak_dir.join("000_Second.pak")).unwrap(), b"second");
+        let manifest = read_manifest(&paths).unwrap();
+        assert!(!manifest
+            .files
+            .iter()
+            .any(|path| path.ends_with("000_First.pak")));
+    }
+
+    #[test]
     fn deploys_only_the_canonical_entry_for_identical_pak_hashes() {
         let temp = TempRoot::new("deploy-duplicate-paks");
         let paths = temp.paths();

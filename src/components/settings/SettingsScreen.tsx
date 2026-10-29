@@ -238,6 +238,17 @@ export function SettingsScreen({
             </label>
             <label>
               <span>
+                <b>{t("settings.startup.keepDeployed")}</b>
+                <small>{t("settings.startup.keepDeployedDetail")}</small>
+              </span>
+              <Toggle
+                checked={draft.keepDeployedModsOnExit}
+                onChange={(keepDeployedModsOnExit) => update({ keepDeployedModsOnExit })}
+                label={t("settings.startup.keepDeployed")}
+              />
+            </label>
+            <label>
+              <span>
                 <b>{t("settings.startup.port")}</b>
                 <small>{t("settings.startup.portDetail")}</small>
               </span>

@@ -43,6 +43,10 @@ runtime-secrets/
 *.env.local
 *_token*
 
+# Generated GitHub cloud payloads are published to LHuiMeng/SCUM-Mod-Desk-Cloud.
+/cloud/mods
+/cloud/paks/*.pak
+
 # IDE / OS
 .idea/
 .vscode/

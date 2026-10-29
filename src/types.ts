@@ -82,6 +82,7 @@ export interface AppSettings {
   serverInstallPath: string;
   theme: ThemeMode;
   language: Language;
+  keepDeployedModsOnExit: boolean;
   launchOptions: LaunchOptions;
   cloud: CloudSettings;
   sftpAccounts: SftpAccount[];

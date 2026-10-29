@@ -295,6 +295,7 @@ let settings: AppSettings = {
   serverInstallPath: "X:/SteamLibrary/steamapps/common/SCUM Server",
   theme: "light",
   language: "zh-CN",
+  keepDeployedModsOnExit: false,
   launchOptions: {
     log: false,
     fileOpenLog: true,

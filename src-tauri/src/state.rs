@@ -52,6 +52,9 @@ impl AppState {
                 config::apply_default_cloud_sources(&mut settings, &secrets.cloud_base_urls);
                 settings
             });
+        if !settings.keep_deployed_mods_on_exit {
+            let _ = reclaim_mods(&paths);
+        }
         let mut metadata = metadata::load_metadata(&paths).unwrap_or_else(|error| {
             eprintln!("读取模组元数据失败，使用默认值：{error:#}");
             MetadataFile::default()
@@ -115,13 +118,14 @@ impl AppState {
                     );
                 }
             }
-            let reclaimed = reclaim_mods(&self.paths)?;
-            if reclaimed > 0 {
-                self.log(
-                    "info",
-                    "library",
-                    &format!("回收 {reclaimed} 个上次部署的文件"),
-                );
+            if let Some(reclaimed) = self.reclaim_deployments_after_exit()? {
+                if reclaimed > 0 {
+                    self.log(
+                        "info",
+                        "library",
+                        &format!("回收 {reclaimed} 个上次部署的文件"),
+                    );
+                }
             }
         }
 
@@ -533,11 +537,20 @@ impl AppState {
         }
     }
 
+    pub fn reclaim_deployments_after_exit(&self) -> Result<Option<usize>> {
+        if self.settings.lock().unwrap().keep_deployed_mods_on_exit {
+            return Ok(None);
+        }
+        let reclaimed = reclaim_mods(&self.paths)?;
+        *self.last_deployed_at.lock().unwrap() = None;
+        Ok(Some(reclaimed))
+    }
+
     pub fn shutdown_cleanup(&self) {
         if self.process.lock().unwrap().is_some() {
             let _ = crate::launcher::stop(self);
         } else {
-            let _ = reclaim_mods(&self.paths);
+            let _ = self.reclaim_deployments_after_exit();
         }
     }
 }
@@ -599,9 +612,136 @@ fn ensure_deletion_allowed(running: bool) -> Result<()> {
 mod tests {
     use super::{ensure_deletion_allowed, is_direct_child, AppState};
     use crate::models::ModEntry;
+    use crate::paths::{path_string, AppPaths};
     use crate::test_support::TempRoot;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::PathBuf;
+
+    fn write_retained_deployment(paths: &AppPaths) -> (PathBuf, PathBuf) {
+        let install = paths.root.join("fake-scum");
+        let deployed = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods")
+            .join("000_Alpha.pak");
+        fs::create_dir_all(deployed.parent().unwrap()).unwrap();
+        fs::write(&deployed, b"deployed").unwrap();
+        let manifest = serde_json::json!({
+            "deployedAt": "2026-10-29T00:00:00Z",
+            "roots": [path_string(&install)],
+            "files": [path_string(&deployed)],
+            "directories": [path_string(deployed.parent().unwrap())],
+            "backups": []
+        });
+        fs::write(
+            &paths.deployment_manifest,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        (deployed, paths.deployment_manifest.clone())
+    }
+
+    fn write_retention_config(paths: &AppPaths, keep: bool) {
+        fs::write(
+            &paths.config_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "keepDeployedModsOnExit": keep
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn startup_scan_preserves_retained_deployment_when_setting_is_enabled() {
+        let temp = TempRoot::new("state-retained-startup");
+        let paths = temp.paths();
+        write_retention_config(&paths, true);
+        let (deployed, manifest) = write_retained_deployment(&paths);
+        let manifest_before = fs::read(&manifest).unwrap();
+
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        state.scan(false).unwrap();
+
+        assert!(deployed.exists());
+        assert!(manifest.exists());
+        assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
+    }
+
+    #[test]
+    fn startup_reclaims_existing_deployment_when_setting_is_disabled() {
+        let temp = TempRoot::new("state-cleanup-startup");
+        let paths = temp.paths();
+        write_retention_config(&paths, false);
+        let (deployed, manifest) = write_retained_deployment(&paths);
+
+        let _state = AppState::from_paths(paths.clone()).unwrap();
+
+        assert!(!deployed.exists());
+        assert!(!manifest.exists());
+    }
+
+    #[test]
+    fn scan_reclaims_existing_deployment_when_setting_is_disabled() {
+        let temp = TempRoot::new("state-cleanup-disabled");
+        let paths = temp.paths();
+        write_retention_config(&paths, false);
+        let (deployed, manifest) = write_retained_deployment(&paths);
+
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        state.scan(false).unwrap();
+
+        assert!(!deployed.exists());
+        assert!(!manifest.exists());
+    }
+
+    #[test]
+    fn shutdown_preserves_deployment_when_setting_is_enabled() {
+        let temp = TempRoot::new("state-retained-shutdown");
+        let paths = temp.paths();
+        write_retention_config(&paths, true);
+        let (deployed, manifest) = write_retained_deployment(&paths);
+        let manifest_before = fs::read(&manifest).unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+
+        state.shutdown_cleanup();
+
+        assert!(deployed.exists());
+        assert!(manifest.exists());
+        assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
+    }
+
+    #[test]
+    fn manual_stop_preserves_deployment_when_setting_is_enabled() {
+        let temp = TempRoot::new("state-retained-stop");
+        let paths = temp.paths();
+        write_retention_config(&paths, true);
+        let (deployed, manifest) = write_retained_deployment(&paths);
+        let manifest_before = fs::read(&manifest).unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+
+        crate::launcher::stop(&state).unwrap();
+
+        assert!(deployed.exists());
+        assert!(manifest.exists());
+        assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
+    }
+
+    #[test]
+    fn manual_stop_reclaims_deployment_when_setting_is_disabled() {
+        let temp = TempRoot::new("state-cleanup-stop");
+        let paths = temp.paths();
+        write_retention_config(&paths, false);
+        let (deployed, manifest) = write_retained_deployment(&paths);
+        let state = AppState::from_paths(paths.clone()).unwrap();
+
+        crate::launcher::stop(&state).unwrap();
+
+        assert!(!deployed.exists());
+        assert!(!manifest.exists());
+    }
 
     #[test]
     fn persists_mod_order_tags_notes_and_enabled_state() {

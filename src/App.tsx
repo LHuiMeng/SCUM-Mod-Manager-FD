@@ -774,7 +774,15 @@ function LocalizedApp() {
     try {
       const status = await api.killGame();
       setSnapshot(await api.getSnapshot().then((next) => ({ ...next, gameStatus: status })));
-      notify(t("toast.gameClosed.title"), t("toast.gameClosed.detail"), "success");
+      notify(
+        t("toast.gameClosed.title"),
+        t(
+          snapshot.settings.keepDeployedModsOnExit
+            ? "toast.gameClosed.keptDetail"
+            : "toast.gameClosed.detail",
+        ),
+        "success",
+      );
     } catch (error) {
       notify(t("toast.closeFailed.title"), String(error), "error");
     } finally {
