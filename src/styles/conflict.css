@@ -546,6 +546,81 @@
   line-height: 1.6;
 }
 
+.import-conflict-list {
+  display: grid;
+  gap: 8px;
+}
+
+.import-conflict-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper-lo);
+  animation: motion-conflict-in 180ms ease-out backwards;
+}
+
+.import-conflict-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+
+.import-conflict-copy {
+  min-width: 0;
+}
+
+.import-conflict-copy b,
+.import-conflict-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-conflict-copy b {
+  color: var(--ink);
+  font-size: var(--type-body-strong);
+  font-weight: 600;
+}
+
+.import-conflict-copy small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+
+.import-conflict-action {
+  padding: 3px 7px;
+  border: 1px solid color-mix(in srgb, var(--warn) 34%, var(--line));
+  border-radius: 999px;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  white-space: nowrap;
+}
+
+.import-conflict-note {
+  margin: 12px 0 0;
+  padding: 9px 11px;
+  border-left: 2px solid var(--warn);
+  border-radius: 0 7px 7px 0;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  font-size: var(--type-label);
+  line-height: 1.55;
+}
+
 @media (max-width: 760px) {
   .mod-row-meta,
   .mod-update-pill {
@@ -588,5 +663,14 @@
     max-width: none;
     justify-content: flex-start;
     padding-left: 24px;
+  }
+
+  .import-conflict-row {
+    grid-template-columns: 28px minmax(0, 1fr);
+  }
+
+  .import-conflict-action {
+    grid-column: 2;
+    justify-self: start;
   }
 }

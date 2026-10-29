@@ -295,6 +295,57 @@ async function connect(url) {
     return { rows: await evaluate("document.querySelectorAll('.mod-row').length") };
   });
 
+  await test("同名拖放触发覆盖确认并备份旧文件", async () => {
+    const dragPath = path.join(inputsRoot, "NativeWeapon.pak");
+    const beforeRows = await evaluate("document.querySelectorAll('.mod-row').length");
+    await invoke("plugin:event|emit", {
+      event: "tauri://drag-drop",
+      payload: { paths: [dragPath], position: { x: 600, y: 300 } },
+    });
+    await waitFor(
+      "document.querySelector('#modal-title')?.innerText === '发现同名模组'",
+    );
+    await wait(260);
+    const modal = await evaluate(`(() => ({
+      text: document.querySelector(".modal-card")?.innerText ?? "",
+      rows: document.querySelectorAll(".mod-row").length,
+    }))()`);
+    assert(modal.rows === beforeRows, "同名导入确认前不应改变模组数量");
+    assert(modal.text.includes("NativeWeapon.pak"), "覆盖确认未列出同名文件");
+    assert(modal.text.includes("backups/imports"), "覆盖确认未说明备份位置");
+    const screenshotPath = await screenshot("native-import-conflict");
+
+    const clicked = await evaluate(`(() => {
+      const button = [...document.querySelectorAll(".modal-foot button")]
+        .find(item => item.innerText.includes("覆盖并导入"));
+      if (!button) return false;
+      button.click();
+      return true;
+    })()`);
+    assert(clicked, "找不到覆盖并导入按钮");
+    await waitFor("document.querySelector('.modal-card') === null");
+    await waitFor("document.body.innerText.includes('导入完成')");
+    assert(
+      (await evaluate("document.querySelectorAll('.mod-row').length")) === beforeRows,
+      "覆盖导入后出现了重复模组行",
+    );
+
+    const backupDir = path.join(runRoot, "backups", "imports");
+    const deadline = Date.now() + 8000;
+    let backups = [];
+    while (Date.now() < deadline) {
+      try {
+        backups = fs.readdirSync(backupDir);
+      } catch {
+        backups = [];
+      }
+      if (backups.length > 0) break;
+      await wait(100);
+    }
+    assert(backups.length > 0, "覆盖导入未在 backups/imports 中留下备份");
+    return { beforeRows, modal: modal.text.slice(0, 220), screenshotPath, backups };
+  });
+
   await test("原生标题栏、窗口尺寸与截图", async () => {
     const info = await evaluate(`(() => {
       const labels = ["最小化", "最大化", "关闭"];

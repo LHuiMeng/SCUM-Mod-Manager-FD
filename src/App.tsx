@@ -11,6 +11,7 @@ import type {
   LibrarySnapshot,
   LocaleBundle,
   NavSection,
+  ImportConflict,
   RemoteFile,
   RemoteMod,
   RuntimeLog,
@@ -32,6 +33,7 @@ import { resolveFileDrop } from "./lib/fileDrop";
 import { cloudDownloadIsActive } from "./lib/cloudDownload";
 import { AppShell } from "./components/shell/AppShell";
 import { LibraryScreen } from "./components/library/LibraryScreen";
+import { ImportConflictDialog } from "./components/library/ImportConflictDialog";
 import { CloudScreen } from "./components/cloud/CloudScreen";
 import { ServerScreen } from "./components/server/ServerScreen";
 import { LogScreen } from "./components/logs/LogScreen";
@@ -43,6 +45,11 @@ interface SftpTrustPrompt {
   accountId: string;
   fingerprint: string;
   message: string;
+}
+
+interface PendingImport {
+  paths: string[];
+  conflicts: ImportConflict[];
 }
 
 function applyTheme(theme: ThemeMode) {
@@ -89,6 +96,7 @@ function LocalizedApp() {
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [fileDragActive, setFileDragActive] = useState(false);
+  const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
   const bootUpdateChecked = useRef(false);
   const importPathsRef = useRef<(paths: string[]) => Promise<void>>(async () => undefined);
@@ -117,6 +125,22 @@ function LocalizedApp() {
     [],
   );
 
+  const completeImport = useCallback(
+    async (paths: string[], replaceExisting: boolean) => {
+      const result = await api.importMods(paths, replaceExisting);
+      const next = await api.getSnapshot();
+      setSnapshot(next);
+      setSelectedId((current) =>
+        next.mods.some((mod) => mod.id === current)
+          ? current
+          : next.mods[0]?.id ?? null,
+      );
+      notify(t("toast.importDone.title"), result.message, "success");
+      return result;
+    },
+    [notify, t],
+  );
+
   const importPaths = useCallback(
     async (paths: string[]) => {
       if (paths.length === 0) return;
@@ -129,27 +153,54 @@ function LocalizedApp() {
         return;
       }
       setBusy(true);
-      notify(
-        t("toast.importing.title"),
-        t("common.filesAndFolders", { count: paths.length }),
-        "default",
-      );
       try {
-        const result = await api.importMods(paths);
-        const next = await api.getSnapshot();
-        setSnapshot(next);
-        setSelectedId((current) =>
-          next.mods.some((mod) => mod.id === current) ? current : next.mods[0]?.id ?? null,
+        const conflicts = await api.inspectModImport(paths);
+        if (conflicts.length > 0) {
+          setPendingImport({ paths, conflicts });
+          return;
+        }
+        notify(
+          t("toast.importing.title"),
+          t("common.filesAndFolders", { count: paths.length }),
+          "default",
         );
-        notify(t("toast.importDone.title"), result.message, "success");
+        await completeImport(paths, false);
       } catch (error) {
         notify(t("toast.importFailed.title"), String(error), "error");
       } finally {
         setBusy(false);
       }
     },
-    [busy, notify, snapshot, t],
+    [busy, completeImport, notify, snapshot, t],
   );
+
+  async function handleReplaceImport() {
+    if (!pendingImport || busy) return;
+    setBusy(true);
+    notify(
+      t("toast.importing.title"),
+      t("common.filesAndFolders", { count: pendingImport.paths.length }),
+      "default",
+    );
+    try {
+      await completeImport(pendingImport.paths, true);
+      setPendingImport(null);
+    } catch (error) {
+      notify(t("toast.importFailed.title"), String(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleKeepExistingImport() {
+    if (busy) return;
+    setPendingImport(null);
+    notify(
+      t("toast.importKept.title"),
+      t("toast.importKept.detail"),
+      "default",
+    );
+  }
 
   const loadLocale = useCallback(
     async (nextLanguage: Language): Promise<LocaleBundle> => {
@@ -1117,6 +1168,14 @@ function LocalizedApp() {
           ) : null}
         </div>
       </AppShell>
+      {pendingImport ? (
+        <ImportConflictDialog
+          conflicts={pendingImport.conflicts}
+          busy={busy}
+          onClose={handleKeepExistingImport}
+          onConfirm={() => void handleReplaceImport()}
+        />
+      ) : null}
       {updateDialogOpen && updateInfo?.available ? (
         <UpdateDialog
           info={updateInfo}

@@ -6,6 +6,7 @@
 ## 功能
 
 - 扫描、导入和启用本地 `~mods/*.pak`
+- 拖入同名 PAK、ZIP 内容或 UE4SS 目录时先确认覆盖，旧文件备份到 `backups/imports/`
 - 读取 PAK 内部资源清单，检测已启用模组之间覆盖同一资源的冲突
 - 按完整 SHA-256 合并重复 PAK，并只部署一个主条目
 - 支持 PAK / UE4SS 模组封面与展示说明，模板见 `templates/mod-presentation/`

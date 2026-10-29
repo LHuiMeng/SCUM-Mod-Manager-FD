@@ -4,6 +4,7 @@ import type {
   AppUpdateInfo,
   ConflictGroup,
   GameStatus,
+  ImportConflict,
   Language,
   LibrarySnapshot,
   LocaleBundle,
@@ -604,8 +605,45 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
     }
     case "upload_server_mods":
       return { uploaded: 0, message: "演示环境未执行上传" } as T;
-    case "import_mods":
-      return { imported: 0, skipped: 0, message: "演示环境不执行真实文件导入" } as T;
+    case "inspect_mod_import": {
+      const paths = (args?.paths as string[] | undefined) ?? [];
+      const conflicts = paths.flatMap((sourcePath) => {
+        const fileName = sourcePath.split(/[\\/]/).pop() ?? sourcePath;
+        const existing = mods.find(
+          (mod) => mod.fileName.toLowerCase() === fileName.toLowerCase(),
+        );
+        return existing
+          ? [{
+              sourcePath,
+              fileName,
+              targetPath: existing.filePath,
+            } satisfies ImportConflict]
+          : [];
+      });
+      return conflicts as T;
+    }
+    case "import_mods": {
+      const paths = (args?.paths as string[] | undefined) ?? [];
+      const replaceExisting = Boolean(args?.replaceExisting);
+      if (!replaceExisting) {
+        return { imported: 0, skipped: paths.length, message: "演示环境不执行真实文件导入" } as T;
+      }
+      const names = new Set(
+        paths.map((sourcePath) => (sourcePath.split(/[\\/]/).pop() ?? "").toLowerCase()),
+      );
+      let replaced = 0;
+      mods = mods.map((mod) => {
+        if (!names.has(mod.fileName.toLowerCase())) return mod;
+        replaced += 1;
+        return { ...mod, lastModified: new Date().toISOString() };
+      });
+      recomputeMockConflicts();
+      return {
+        imported: replaced,
+        skipped: 0,
+        message: `演示环境已覆盖 ${replaced} 个同名条目`,
+      } as T;
+    }
     case "open_path":
     case "open_mod_folder":
     case "window_minimize":

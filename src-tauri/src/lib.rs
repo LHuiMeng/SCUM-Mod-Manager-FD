@@ -48,6 +48,7 @@ pub fn run() {
             commands::detect_paths,
             commands::launch_game,
             commands::kill_game,
+            commands::inspect_mod_import,
             commands::import_mods,
             commands::open_path,
             commands::open_mod_folder,

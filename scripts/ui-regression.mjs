@@ -379,6 +379,7 @@ async function connect(url, appUrl) {
         shifted: shifted.map(row => ({
           id: row.dataset.modId,
           transform: getComputedStyle(row).transform,
+          transitionDuration: getComputedStyle(row).transitionDuration,
         })),
         indicatorText: indicator?.innerText ?? "",
         markerTop: indicator?.style.getPropertyValue("--drop-marker-top") ?? "",
@@ -391,11 +392,27 @@ async function connect(url, appUrl) {
     if (preview.shifted.some(item => item.transform === "none")) {
       throw new Error(`让位行缺少过渡位移：${JSON.stringify(preview)}`);
     }
+    if (!preview.shifted.some(item => item.transitionDuration.includes("0.32s"))) {
+      throw new Error(`让位过渡时长不足：${JSON.stringify(preview.shifted)}`);
+    }
     if (!preview.markerTop || !preview.indicatorText.includes("释放到第")) {
       throw new Error(`插入槽位提示缺失：${JSON.stringify(preview)}`);
     }
     if (!preview.footText.includes("释放到第 03 位") || preview.live !== "polite") {
       throw new Error(`拖拽状态反馈异常：${JSON.stringify(preview)}`);
+    }
+    const transitionSamples = [];
+    for (const delay of [0, 90, 320]) {
+      if (delay > 0) await wait(delay);
+      transitionSamples.push(
+        await evaluate(`getComputedStyle(
+          document.querySelector(".mod-row.is-drag-shift-up, .mod-row.is-drag-shift-down")
+        ).transform`),
+      );
+    }
+    if (transitionSamples[0] === transitionSamples[2] ||
+        transitionSamples[1] === transitionSamples[2]) {
+      throw new Error(`让位过程没有连续过渡：${JSON.stringify(transitionSamples)}`);
     }
     screenshots.push(await screenshot("1440-light-drag-preview"));
 
@@ -422,6 +439,7 @@ async function connect(url, appUrl) {
     return {
       names: setup.names,
       preview,
+      transitionSamples,
       finalFirst: await evaluate(
         "document.querySelector('.mod-row .mod-row-main > b')?.innerText",
       ),

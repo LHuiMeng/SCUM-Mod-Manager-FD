@@ -170,6 +170,12 @@ export interface ImportResult {
   message: string;
 }
 
+export interface ImportConflict {
+  sourcePath: string;
+  fileName: string;
+  targetPath: string;
+}
+
 export interface AppInfo {
   version: string;
   dataRoot: string;

@@ -4,6 +4,7 @@ import type {
   AppInfo,
   AppSettings,
   AppUpdateInfo,
+  ImportConflict,
   ImportResult,
   Language,
   LibrarySnapshot,
@@ -48,7 +49,10 @@ export const api = {
   launchGame: (mode: "client" | "server") =>
     call<LibrarySnapshot["gameStatus"]>("launch_game", { mode }),
   killGame: () => call<LibrarySnapshot["gameStatus"]>("kill_game"),
-  importMods: (paths: string[]) => call<ImportResult>("import_mods", { paths }),
+  inspectModImport: (paths: string[]) =>
+    call<ImportConflict[]>("inspect_mod_import", { paths }),
+  importMods: (paths: string[], replaceExisting = false) =>
+    call<ImportResult>("import_mods", { paths, replaceExisting }),
   openPath: (path: string) => call<void>("open_path", { path }),
   openModFolder: (id: string) => call<void>("open_mod_folder", { id }),
   getLogs: () => call<RuntimeLog[]>("get_logs"),

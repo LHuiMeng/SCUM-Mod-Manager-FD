@@ -1,5 +1,5 @@
 use crate::metadata::MetadataFile;
-use crate::models::{ConflictGroup, ImportResult, ModEntry};
+use crate::models::{ConflictGroup, ImportConflict, ImportResult, ModEntry};
 use crate::paths::{path_string, safe_disk_name, AppPaths};
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -478,7 +478,143 @@ pub fn compute_sha256(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-pub fn import_paths(paths: &AppPaths, sources: &[String]) -> Result<ImportResult> {
+pub fn inspect_import_conflicts(
+    paths: &AppPaths,
+    sources: &[String],
+) -> Result<Vec<ImportConflict>> {
+    let mut conflicts = Vec::new();
+    let mut seen_targets = HashSet::new();
+    for source in sources {
+        let source = PathBuf::from(source);
+        if !source.exists() {
+            continue;
+        }
+        if source.is_dir() {
+            let Some(file_name) = source.file_name() else {
+                continue;
+            };
+            let target = paths.ue4ss_mods.join(file_name);
+            push_import_conflict(
+                &mut conflicts,
+                &mut seen_targets,
+                &source,
+                &target,
+                file_name.to_string_lossy().as_ref(),
+            );
+            continue;
+        }
+        match source
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pak" => {
+                let Some(file_name) = source.file_name() else {
+                    continue;
+                };
+                let target = paths.local_mods.join(file_name);
+                push_import_conflict(
+                    &mut conflicts,
+                    &mut seen_targets,
+                    &source,
+                    &target,
+                    file_name.to_string_lossy().as_ref(),
+                );
+            }
+            "zip" => {
+                for (target, file_name) in zip_import_targets(paths, &source)? {
+                    if target.exists() {
+                        push_import_conflict(
+                            &mut conflicts,
+                            &mut seen_targets,
+                            &source,
+                            &target,
+                            &file_name,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(conflicts)
+}
+
+fn push_import_conflict(
+    conflicts: &mut Vec<ImportConflict>,
+    seen_targets: &mut HashSet<String>,
+    source: &Path,
+    target: &Path,
+    file_name: &str,
+) {
+    if !target.exists() || same_import_path(source, target) {
+        return;
+    }
+    let target_key = target.to_string_lossy().to_ascii_lowercase();
+    if !seen_targets.insert(target_key) {
+        return;
+    }
+    conflicts.push(ImportConflict {
+        source_path: path_string(source),
+        file_name: file_name.to_string(),
+        target_path: path_string(target),
+    });
+}
+
+fn zip_import_targets(paths: &AppPaths, source: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let file = File::open(source)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut contains_pak = false;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        if entry.name().to_ascii_lowercase().ends_with(".pak") {
+            contains_pak = true;
+            break;
+        }
+    }
+    if contains_pak {
+        let mut targets = Vec::new();
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index)?;
+            if entry.is_dir() || !is_pak_import_asset(entry.name()) {
+                continue;
+            }
+            let Some(relative) = entry.enclosed_name() else {
+                continue;
+            };
+            let Some(file_name) = relative.file_name() else {
+                continue;
+            };
+            targets.push((
+                paths.local_mods.join(file_name),
+                file_name.to_string_lossy().into_owned(),
+            ));
+        }
+        return Ok(targets);
+    }
+
+    let wrapper = zip_wrapper_directory(&mut archive)?;
+    let raw_name = wrapper
+        .or_else(|| {
+            source
+                .file_stem()
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "mod".to_string());
+    let folder_name = safe_disk_name(&raw_name, "mod");
+    Ok(vec![(paths.ue4ss_mods.join(&folder_name), folder_name)])
+}
+
+fn same_import_path(left: &Path, right: &Path) -> bool {
+    let left = std::path::absolute(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::path::absolute(right).unwrap_or_else(|_| right.to_path_buf());
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+pub fn import_paths(paths: &AppPaths, sources: &[String], replace: bool) -> Result<ImportResult> {
     let mut imported = 0;
     let mut skipped = 0;
     for source in sources {
@@ -492,10 +628,14 @@ pub fn import_paths(paths: &AppPaths, sources: &[String]) -> Result<ImportResult
                 .ue4ss_mods
                 .join(source.file_name().unwrap_or_default());
             if destination.exists() {
-                skipped += 1;
-                continue;
+                if !replace || same_import_path(&source, &destination) {
+                    skipped += 1;
+                    continue;
+                }
+                replace_imported_directory(paths, &source, &destination)?;
+            } else {
+                copy_tree(&source, &destination)?;
             }
-            copy_tree(&source, &destination)?;
             imported += 1;
             continue;
         }
@@ -512,14 +652,18 @@ pub fn import_paths(paths: &AppPaths, sources: &[String]) -> Result<ImportResult
                     .local_mods
                     .join(source.file_name().context("导入文件缺少文件名")?);
                 if destination.exists() {
-                    skipped += 1;
-                    continue;
+                    if !replace || same_import_path(&source, &destination) {
+                        skipped += 1;
+                        continue;
+                    }
+                    replace_imported_file(paths, &source, &destination)?;
+                } else {
+                    std::fs::copy(&source, &destination)?;
                 }
-                std::fs::copy(&source, &destination)?;
                 imported += 1;
             }
             "zip" => {
-                let result = import_zip(paths, &source)?;
+                let result = import_zip(paths, &source, replace)?;
                 imported += result.0;
                 skipped += result.1;
             }
@@ -533,8 +677,49 @@ pub fn import_paths(paths: &AppPaths, sources: &[String]) -> Result<ImportResult
     })
 }
 
-fn import_zip(paths: &AppPaths, source: &Path) -> Result<(usize, usize)> {
-    install_ue4ss_zip(paths, source, None, false)
+fn import_zip(paths: &AppPaths, source: &Path, replace: bool) -> Result<(usize, usize)> {
+    install_ue4ss_zip(paths, source, None, replace)
+}
+
+fn import_backup_path(paths: &AppPaths, file_name: &str) -> Result<PathBuf> {
+    let directory = paths.backups_dir.join("imports");
+    std::fs::create_dir_all(&directory)?;
+    Ok(directory.join(format!(
+        "{}-{}",
+        uuid::Uuid::new_v4(),
+        safe_disk_name(file_name, "mod")
+    )))
+}
+
+fn replace_imported_file(paths: &AppPaths, source: &Path, destination: &Path) -> Result<()> {
+    let file_name = destination
+        .file_name()
+        .context("导入目标缺少文件名")?
+        .to_string_lossy();
+    let backup = import_backup_path(paths, &file_name)?;
+    std::fs::rename(destination, &backup)
+        .with_context(|| format!("无法备份已存在的模组文件 {}", destination.display()))?;
+    if let Err(error) = std::fs::copy(source, destination) {
+        let _ = std::fs::rename(&backup, destination);
+        return Err(error).with_context(|| format!("无法覆盖模组文件 {}", destination.display()));
+    }
+    Ok(())
+}
+
+fn replace_imported_directory(paths: &AppPaths, source: &Path, destination: &Path) -> Result<()> {
+    let directory_name = destination
+        .file_name()
+        .context("导入目标缺少目录名")?
+        .to_string_lossy();
+    let backup = import_backup_path(paths, &directory_name)?;
+    std::fs::rename(destination, &backup)
+        .with_context(|| format!("无法备份已存在的模组目录 {}", destination.display()))?;
+    if let Err(error) = copy_tree(source, destination) {
+        let _ = std::fs::remove_dir_all(destination);
+        let _ = std::fs::rename(&backup, destination);
+        return Err(error).with_context(|| format!("无法覆盖模组目录 {}", destination.display()));
+    }
+    Ok(())
 }
 
 /// 安装一个 ZIP 形态的模组包：含 `.pak` 的包只提取 PAK 到本地模组库，
@@ -712,12 +897,10 @@ where
                 continue;
             }
             // 与直接落盘的 PAK 一致：覆盖前留一份可回收的备份。
-            std::fs::create_dir_all(&paths.backups_dir)?;
-            let backup = paths.backups_dir.join(format!(
-                "{}.bak",
-                output.file_name().unwrap_or_default().to_string_lossy()
-            ));
-            let _ = std::fs::remove_file(&backup);
+            let backup = import_backup_path(
+                paths,
+                &output.file_name().unwrap_or_default().to_string_lossy(),
+            )?;
             std::fs::rename(&output, &backup)
                 .with_context(|| format!("无法备份已存在的模组文件 {}", output.display()))?;
         }
@@ -846,8 +1029,8 @@ fn epoch_millis(time: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_zip_file, import_paths, install_ue4ss_zip, refresh_conflicts, scan_local_mods,
-        stable_id,
+        extract_zip_file, import_paths, inspect_import_conflicts, install_ue4ss_zip,
+        refresh_conflicts, scan_local_mods, stable_id,
     };
     use crate::models::ModEntry;
     use crate::paths::AppPaths;
@@ -1088,7 +1271,7 @@ mod tests {
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::write(&source, b"pak-content").unwrap();
 
-        let result = import_paths(&paths, &[source.to_string_lossy().into_owned()]).unwrap();
+        let result = import_paths(&paths, &[source.to_string_lossy().into_owned()], false).unwrap();
 
         assert_eq!(result.imported, 1);
         assert_eq!(result.skipped, 0);
@@ -1108,12 +1291,56 @@ mod tests {
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::write(&source, b"replacement").unwrap();
 
-        let result = import_paths(&paths, &[source.to_string_lossy().into_owned()]).unwrap();
+        let result = import_paths(&paths, &[source.to_string_lossy().into_owned()], false).unwrap();
 
         assert_eq!(result.imported, 0);
         assert_eq!(result.skipped, 1);
         assert_eq!(fs::read(existing).unwrap(), b"original");
         assert!(result.message.contains("跳过 1"));
+    }
+
+    #[test]
+    fn previews_and_backs_up_a_confirmed_same_name_pak_replacement() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        let existing = paths.local_mods.join("TestWeapon.pak");
+        fs::write(&existing, b"original").unwrap();
+        let source = temp.path().join("downloads").join("TestWeapon.pak");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"replacement").unwrap();
+        let sources = vec![source.to_string_lossy().into_owned()];
+
+        let conflicts = inspect_import_conflicts(&paths, &sources).unwrap();
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].file_name, "TestWeapon.pak");
+        assert_eq!(Path::new(&conflicts[0].target_path), existing);
+
+        let result = import_paths(&paths, &sources, true).unwrap();
+
+        assert_eq!(result.imported, 1);
+        assert_eq!(fs::read(existing).unwrap(), b"replacement");
+        let backups = fs::read_dir(paths.backups_dir.join("imports"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(backups[0].path()).unwrap(), b"original");
+    }
+
+    #[test]
+    fn previews_same_name_pak_inside_zip_archives() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        fs::write(paths.local_mods.join("SharedWeapon.pak"), b"original").unwrap();
+        let archive = temp.path().join("WeaponPack.zip");
+        write_zip(&archive, &[("nested/SharedWeapon.pak", b"replacement")]);
+
+        let conflicts =
+            inspect_import_conflicts(&paths, &[archive.to_string_lossy().into_owned()]).unwrap();
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].file_name, "SharedWeapon.pak");
     }
 
     #[test]
@@ -1124,7 +1351,7 @@ mod tests {
         fs::create_dir_all(source.join("Scripts")).unwrap();
         fs::write(source.join("Scripts").join("main.lua"), b"print('ok')").unwrap();
 
-        let result = import_paths(&paths, &[source.to_string_lossy().into_owned()]).unwrap();
+        let result = import_paths(&paths, &[source.to_string_lossy().into_owned()], false).unwrap();
 
         assert_eq!(result.imported, 1);
         assert_eq!(
@@ -1154,7 +1381,8 @@ mod tests {
         writer.write_all(b"print('zip')").unwrap();
         writer.finish().unwrap();
 
-        let result = import_paths(&paths, &[archive.to_string_lossy().into_owned()]).unwrap();
+        let result =
+            import_paths(&paths, &[archive.to_string_lossy().into_owned()], false).unwrap();
 
         assert_eq!(result.imported, 1);
         assert_eq!(
@@ -1182,7 +1410,8 @@ mod tests {
         writer.write_all(b"print('flat')").unwrap();
         writer.finish().unwrap();
 
-        let result = import_paths(&paths, &[archive.to_string_lossy().into_owned()]).unwrap();
+        let result =
+            import_paths(&paths, &[archive.to_string_lossy().into_owned()], false).unwrap();
 
         assert_eq!(result.imported, 1);
         assert_eq!(
@@ -1212,6 +1441,7 @@ mod tests {
                 unsupported.to_string_lossy().into_owned(),
                 missing.to_string_lossy().into_owned(),
             ],
+            false,
         )
         .unwrap();
 
@@ -1272,7 +1502,8 @@ mod tests {
         writer.write_all(b"replacement").unwrap();
         writer.finish().unwrap();
 
-        let result = import_paths(&paths, &[archive.to_string_lossy().into_owned()]).unwrap();
+        let result =
+            import_paths(&paths, &[archive.to_string_lossy().into_owned()], false).unwrap();
 
         assert_eq!(result.imported, 0);
         assert_eq!(result.skipped, 1);
@@ -1308,7 +1539,8 @@ mod tests {
             ],
         );
 
-        let result = import_paths(&paths, &[archive.to_string_lossy().into_owned()]).unwrap();
+        let result =
+            import_paths(&paths, &[archive.to_string_lossy().into_owned()], false).unwrap();
 
         assert_eq!(result.imported, 3);
         assert!(paths.local_mods.join("Weapon.pak").is_file());
@@ -1460,9 +1692,11 @@ mod tests {
             (1, 0)
         );
         assert_eq!(fs::read(&existing).unwrap(), b"new");
-        assert_eq!(
-            fs::read(paths.backups_dir.join("Weapon.pak.bak")).unwrap(),
-            b"old"
-        );
+        let imports = fs::read_dir(paths.backups_dir.join("imports"))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(fs::read(imports[0].path()).unwrap(), b"old");
     }
 }

@@ -3,8 +3,8 @@ use crate::cloud;
 use crate::launcher;
 use crate::models::{
     AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, DetectPathsResult, DownloadResult,
-    GameStatus, ImportResult, InstallUpdateResult, LibrarySnapshot, LocaleBundle, RemoteFile,
-    RemoteMod, RuntimeLog, SftpAccountInput, SftpConnectionResult, UploadResult,
+    GameStatus, ImportConflict, ImportResult, InstallUpdateResult, LibrarySnapshot, LocaleBundle,
+    RemoteFile, RemoteMod, RuntimeLog, SftpAccountInput, SftpConnectionResult, UploadResult,
 };
 use crate::paths::path_string;
 use crate::sftp;
@@ -170,10 +170,29 @@ pub async fn kill_game(app: AppHandle) -> Result<GameStatus, String> {
 }
 
 #[tauri::command]
-pub async fn import_mods(app: AppHandle, paths: Vec<String>) -> Result<ImportResult, String> {
+pub async fn inspect_mod_import(
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<ImportConflict>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let result = crate::mods::import_paths(&state.paths, &paths)?;
+        crate::mods::inspect_import_conflicts(&state.paths, &paths)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn import_mods(
+    app: AppHandle,
+    paths: Vec<String>,
+    replace_existing: Option<bool>,
+) -> Result<ImportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let result =
+            crate::mods::import_paths(&state.paths, &paths, replace_existing.unwrap_or(false))?;
         state.refresh_files()?;
         state.log(
             "info",
