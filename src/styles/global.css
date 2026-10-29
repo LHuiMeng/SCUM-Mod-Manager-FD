@@ -990,6 +990,7 @@ textarea:focus-visible,
 }
 
 .mod-rows {
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow: auto;
@@ -1004,6 +1005,7 @@ textarea:focus-visible,
 
 .mod-row {
   position: relative;
+  height: 64px;
   min-height: 64px;
   padding: 0 13px;
   border-top: 1px solid var(--line);

@@ -71,6 +71,8 @@
   "library.sort.size": "File size",
   "library.sort.toggle": "Change sort order",
   "library.dragHint.active": "Drag rows or press Alt+↑/↓ to change load order",
+  "library.dragHint.dropAt": "Drop at position {order}",
+  "library.dragHint.locked": "Load order cannot change while the game is running",
   "library.dragHint.loadOrder": "Switch back to load order to sort",
   "library.dragHint.search": "Clear search to sort",
   "library.dragHint.filter": "Switch back to All to sort",

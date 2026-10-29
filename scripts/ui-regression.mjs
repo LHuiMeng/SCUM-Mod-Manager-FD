@@ -328,6 +328,106 @@ async function connect(url, appUrl) {
     return { info, primary, resizeHandles };
   });
 
+  await test("拖拽排序实时显示插入槽位与其他模组让位", async () => {
+    const setup = await evaluate(`(() => {
+      const rows = [...document.querySelectorAll(".mod-row")];
+      if (rows.length < 3) return null;
+      const names = rows.map(row => row.querySelector(".mod-row-main > b")?.innerText ?? "");
+      const source = rows[0];
+      const target = rows[2];
+      const sourceRect = source.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      window.__dragPoint = {
+        x: sourceRect.left + Math.min(280, sourceRect.width * 0.48),
+        startY: sourceRect.top + sourceRect.height * 0.48,
+        targetY: targetRect.top + targetRect.height * 0.35,
+      };
+      source.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 41,
+        pointerType: "mouse",
+        isPrimary: true,
+        button: 0,
+        buttons: 1,
+        clientX: window.__dragPoint.x,
+        clientY: window.__dragPoint.startY,
+      }));
+      return { names, sourceRect: { top: sourceRect.top }, targetRect: { top: targetRect.top } };
+    })()`);
+    if (!setup) throw new Error("拖拽回归需要至少三个模组");
+
+    await evaluate(`window.dispatchEvent(new PointerEvent("pointermove", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 41,
+      pointerType: "mouse",
+      isPrimary: true,
+      buttons: 1,
+      clientX: window.__dragPoint.x,
+      clientY: window.__dragPoint.targetY,
+    }))`);
+    await waitFor("document.querySelector('.mod-row.is-dragging') !== null");
+    await waitFor("document.querySelector('.mod-drop-indicator') !== null");
+    const preview = await evaluate(`(() => {
+      const source = document.querySelector(".mod-row.is-dragging");
+      const shifted = [...document.querySelectorAll(".mod-row.is-drag-shift-up, .mod-row.is-drag-shift-down")];
+      const indicator = document.querySelector(".mod-drop-indicator");
+      const foot = document.querySelector(".table-foot b");
+      return {
+        sourceTransform: getComputedStyle(source).transform,
+        shifted: shifted.map(row => ({
+          id: row.dataset.modId,
+          transform: getComputedStyle(row).transform,
+        })),
+        indicatorText: indicator?.innerText ?? "",
+        markerTop: indicator?.style.getPropertyValue("--drop-marker-top") ?? "",
+        footText: foot?.innerText ?? "",
+        live: document.querySelector(".table-foot > span")?.getAttribute("aria-live"),
+      };
+    })()`);
+    if (preview.sourceTransform === "none") throw new Error(`拖动行未跟随指针：${JSON.stringify(preview)}`);
+    if (preview.shifted.length < 2) throw new Error(`其他模组没有让位：${JSON.stringify(preview)}`);
+    if (preview.shifted.some(item => item.transform === "none")) {
+      throw new Error(`让位行缺少过渡位移：${JSON.stringify(preview)}`);
+    }
+    if (!preview.markerTop || !preview.indicatorText.includes("释放到第")) {
+      throw new Error(`插入槽位提示缺失：${JSON.stringify(preview)}`);
+    }
+    if (!preview.footText.includes("释放到第 03 位") || preview.live !== "polite") {
+      throw new Error(`拖拽状态反馈异常：${JSON.stringify(preview)}`);
+    }
+    screenshots.push(await screenshot("1440-light-drag-preview"));
+
+    await evaluate(`window.dispatchEvent(new PointerEvent("pointerup", {
+      bubbles: true,
+      pointerId: 41,
+      pointerType: "mouse",
+      isPrimary: true,
+      button: 0,
+      buttons: 0,
+      clientX: window.__dragPoint.x,
+      clientY: window.__dragPoint.targetY,
+    }))`);
+    await waitFor("document.querySelector('.mod-row.is-dragging') === null");
+    await waitFor(
+      `document.querySelector(".mod-row .mod-row-main > b")?.innerText === ${JSON.stringify(setup.names[1])}`,
+      10000,
+    );
+    const settled = await evaluate(
+      "Boolean(document.querySelector('.mod-row.is-drop-settled'))",
+    );
+    if (!settled) throw new Error("拖放结束后缺少落位反馈");
+    await wait(420);
+    return {
+      names: setup.names,
+      preview,
+      finalFirst: await evaluate(
+        "document.querySelector('.mod-row .mod-row-main > b')?.innerText",
+      ),
+    };
+  });
+
   await test("搜索、清空与筛选", async () => {
     const before = await evaluate("document.querySelectorAll('.mod-row').length");
     await setInput("搜索模组、标签或备注", "WeaponPack");
@@ -336,10 +436,16 @@ async function connect(url, appUrl) {
     await waitFor(`document.querySelectorAll('.mod-row').length === ${before}`);
     await clickText("客户端 PAK");
     const clientRows = await evaluate("document.querySelectorAll('.mod-row').length");
+    const reflowing = await evaluate(`[...document.querySelectorAll(".mod-row")]
+      .some(row => row.getAnimations().some(animation => {
+        const timing = animation.effect?.getTiming();
+        return timing?.duration === 260;
+      }))`);
+    if (!reflowing) throw new Error("筛选后的列表重排动效未生效");
     await clickText("全部");
     const allRows = await evaluate("document.querySelectorAll('.mod-row').length");
     if (clientRows <= 0 || allRows !== before) throw new Error("筛选结果异常");
-    return { before, clientRows, allRows };
+    return { before, clientRows, allRows, reflowing };
   });
 
   await test("三种排序循环", async () => {
@@ -373,6 +479,23 @@ async function connect(url, appUrl) {
         before,
       )}`,
     );
+    const feedbackClass = before === "true" ? "is-toggle-off" : "is-toggle-on";
+    await waitFor(
+      `document.querySelector(${JSON.stringify(selector)})?.closest(".mod-row")?.classList.contains(${JSON.stringify(
+        feedbackClass,
+      )})`,
+    );
+    const toggleMotion = await evaluate(`(() => {
+      const row = document.querySelector(${JSON.stringify(selector)})?.closest(".mod-row");
+      return {
+        rowClass: row?.className ?? "",
+        stateAnimation: getComputedStyle(row?.querySelector(".mod-state-pill")).animationName,
+      };
+    })()`);
+    if (!toggleMotion.rowClass.includes(feedbackClass) ||
+        !toggleMotion.stateAnimation.includes("motion-state-change")) {
+      throw new Error(`启停动效未生效：${JSON.stringify(toggleMotion)}`);
+    }
     const after = await evaluate(
       `document.querySelector(${JSON.stringify(selector)})?.getAttribute("aria-checked")`,
     );
@@ -382,7 +505,7 @@ async function connect(url, appUrl) {
         before,
       )}`,
     );
-    return { before, after };
+    return { before, after, toggleMotion };
   });
 
   await test("冲突覆盖链、胜者保存与响应式弹层", async () => {
@@ -772,6 +895,13 @@ async function connect(url, appUrl) {
     }
     screenshots.push(await screenshot("1440-light-delete-confirm"));
     await clickText("移入备份", ".modal-foot button");
+    await waitFor("document.querySelector('.mod-row.is-removing') !== null");
+    const deleteMotion = await evaluate(
+      "getComputedStyle(document.querySelector('.mod-row.is-removing')).animationName",
+    );
+    if (!deleteMotion.includes("motion-row-out")) {
+      throw new Error(`删除收起动画未生效：${deleteMotion}`);
+    }
     await waitFor("document.querySelector('.modal-card') === null");
     await waitFor(`document.querySelectorAll('.mod-row').length === ${rowCount - 1}`);
     await waitFor("document.body.innerText.includes('模组已移入备份')");
@@ -779,7 +909,7 @@ async function connect(url, appUrl) {
       `![...document.querySelectorAll(".mod-row-main > b")].some(item => item.innerText === "SCUM_WeaponPack_Elite")`,
     );
     if (!removed) throw new Error("删除后模组仍留在列表中");
-    return { copy: copy.slice(0, 220), rowCountAfter: rowCount - 1 };
+    return { copy: copy.slice(0, 220), rowCountAfter: rowCount - 1, deleteMotion };
   });
 
   await test("中英文切换、持久化与英文窄窗布局", async () => {

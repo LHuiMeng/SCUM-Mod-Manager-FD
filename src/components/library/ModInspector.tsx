@@ -57,7 +57,10 @@ export function ModInspector({
                 })
               : t("common.disabled")}
           </span>
-          <span className={`preview-badge ${mod.conflictCount > 0 ? "is-warn" : ""}`}>
+          <span
+            key={`conflict-${mod.conflictCount}`}
+            className={`preview-badge ${mod.conflictCount > 0 ? "is-warn" : ""}`}
+          >
             {mod.conflictCount > 0
               ? t("common.conflictCount", { count: mod.conflictCount })
               : t("common.noConflict")}
@@ -108,7 +111,10 @@ export function ModInspector({
         <section className="inspector-section">
           <div className="section-title">
             <span>{t("inspector.overview")}</span>
-            <b className={mod.conflictCount > 0 ? "is-warn" : hasHash ? "is-good" : "is-muted"}>
+            <b
+              key={`conflict-overview-${mod.conflictCount}`}
+              className={mod.conflictCount > 0 ? "is-warn" : hasHash ? "is-good" : "is-muted"}
+            >
               {mod.conflictCount > 0
                 ? t("common.conflictCount", { count: mod.conflictCount })
                 : hasHash

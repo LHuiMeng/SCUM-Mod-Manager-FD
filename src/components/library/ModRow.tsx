@@ -1,4 +1,7 @@
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type {
+  CSSProperties,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 import type { ModEntry } from "../../types";
 import { useI18n } from "../../i18n";
 import { formatBytes, formatDate, modTypeKey } from "../../lib/format";
@@ -13,8 +16,12 @@ interface ModRowProps {
   showLoadOrder: boolean;
   locked: boolean;
   dragging: boolean;
-  dragOver: boolean;
+  dragShift: "up" | "down" | null;
+  dragOffsetY: number | null;
   removing: boolean;
+  entering: boolean;
+  toggleFeedback: "on" | "off" | null;
+  dropSettled: boolean;
   onSelect: () => void;
   onToggle: (enabled: boolean) => void;
   onMove: (delta: number) => void;
@@ -28,8 +35,12 @@ export function ModRow({
   showLoadOrder,
   locked,
   dragging,
-  dragOver,
+  dragShift,
+  dragOffsetY,
   removing,
+  entering,
+  toggleFeedback,
+  dropSettled,
   onSelect,
   onToggle,
   onMove,
@@ -58,9 +69,12 @@ export function ModRow({
     "mod-row",
     selected ? "is-selected" : "",
     mod.fullyOverridden ? "is-fully-overridden" : "",
-    dragOver ? "is-drag-over" : "",
+    dragShift ? `is-drag-shift-${dragShift}` : "",
     dragging ? "is-dragging" : "",
     removing ? "is-removing" : "",
+    entering ? "is-new" : "",
+    toggleFeedback ? `is-toggle-${toggleFeedback}` : "",
+    dropSettled ? "is-drop-settled" : "",
     sortable ? "is-sortable" : "",
     locked ? "is-locked" : "",
   ]
@@ -75,6 +89,13 @@ export function ModRow({
       tabIndex={0}
       data-mod-id={mod.id}
       data-mod-type={mod.type}
+      data-drag-shift={dragShift ?? undefined}
+      aria-grabbed={dragging || undefined}
+      style={
+        dragOffsetY === null
+          ? undefined
+          : ({ "--drag-offset-y": `${dragOffsetY}px` } as CSSProperties)
+      }
       onClick={onSelect}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
@@ -101,11 +122,15 @@ export function ModRow({
       <div className="mod-row-main">
         <b>{mod.name}</b>
         <span className="mod-row-subline">
-          <span className={`mod-state-pill ${mod.enabled ? "is-on" : "is-off"}`}>
+          <span
+            key={`state-${mod.enabled}`}
+            className={`mod-state-pill ${mod.enabled ? "is-on" : "is-off"}`}
+          >
             <i />
             {statusLabel}
           </span>
           <span
+            key={`conflict-${overriding}-${overridden}`}
             className={`mod-conflict-pill ${
               mod.fullyOverridden ? "is-full" : overriding + overridden > 0 ? "has-conflict" : ""
             }`}

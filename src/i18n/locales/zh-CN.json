@@ -67,6 +67,8 @@
   "library.sort.size": "按文件大小",
   "library.sort.toggle": "切换排序方式",
   "library.dragHint.active": "拖拽行或 Alt+↑/↓ 调整加载顺序",
+  "library.dragHint.dropAt": "释放到第 {order} 位",
+  "library.dragHint.locked": "游戏运行期间不能调整加载顺序",
   "library.dragHint.loadOrder": "切回「按加载顺序」后可排序",
   "library.dragHint.search": "清空搜索后可排序",
   "library.dragHint.filter": "切回「全部」筛选后可排序",

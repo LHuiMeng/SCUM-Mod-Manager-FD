@@ -49,6 +49,87 @@
   animation-delay: 84ms;
 }
 
+.mod-rows.is-sorting > .mod-row {
+  z-index: 1;
+  background: var(--paper-hi);
+}
+
+.mod-rows.is-sorting > .mod-row.is-drag-shift-up {
+  transform: translate3d(0, calc(-100% - 1px), 0);
+}
+
+.mod-rows.is-sorting > .mod-row.is-drag-shift-down {
+  transform: translate3d(0, calc(100% + 1px), 0);
+}
+
+.mod-drop-indicator {
+  position: absolute;
+  z-index: 9;
+  top: var(--drop-marker-top);
+  right: 13px;
+  left: 13px;
+  height: var(--drop-marker-height);
+  display: grid;
+  place-items: center;
+  border: 1px dashed color-mix(in srgb, var(--accent) 58%, var(--line));
+  border-radius: 8px;
+  color: var(--accent);
+  background:
+    repeating-linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent) 5%, transparent) 0 8px,
+      transparent 8px 16px
+    ),
+    color-mix(in srgb, var(--paper-hi) 16%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--paper-hi) 60%, transparent),
+    0 8px 22px color-mix(in srgb, var(--accent) 10%, transparent);
+  pointer-events: none;
+  animation: motion-drop-slot 180ms ease-out backwards;
+}
+
+.mod-drop-indicator::before,
+.mod-drop-indicator::after {
+  position: absolute;
+  top: 50%;
+  width: 7px;
+  height: 20px;
+  border-radius: 4px;
+  background: var(--accent);
+  content: "";
+  transform: translateY(-50%);
+}
+
+.mod-drop-indicator::before {
+  left: -3px;
+}
+
+.mod-drop-indicator::after {
+  right: -3px;
+}
+
+.mod-drop-indicator span {
+  position: relative;
+  z-index: 1;
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--line));
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--paper-hi);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+@keyframes motion-drop-slot {
+  from {
+    opacity: 0;
+    transform: scaleY(0.72);
+  }
+}
+
 @keyframes motion-row-in {
   from {
     opacity: 0;
@@ -62,32 +143,58 @@
 
 .mod-row.is-new {
   animation:
-    motion-row-in 240ms cubic-bezier(0.22, 1, 0.36, 1) backwards,
-    motion-row-spotlight 280ms ease-out;
+    motion-row-in 320ms cubic-bezier(0.22, 1, 0.36, 1) backwards,
+    motion-row-spotlight 780ms ease-out;
 }
 
 @keyframes motion-row-spotlight {
-  from {
+  0% {
     box-shadow:
       inset 0 0 0 1px var(--accent),
       inset 0 0 26px var(--accent-soft);
   }
 
-  to {
+  38% {
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--accent) 54%, transparent),
+      inset 0 0 16px var(--accent-soft);
+  }
+
+  100% {
     box-shadow: inset 0 0 0 1px transparent;
   }
 }
 
 .mod-row.is-removing {
+  position: relative;
+  z-index: 6;
+  overflow: hidden;
   pointer-events: none;
   user-select: none;
-  animation: motion-row-out 220ms cubic-bezier(0.4, 0, 1, 1) both;
+  animation: motion-row-out 260ms cubic-bezier(0.4, 0, 1, 1) both;
 }
 
 @keyframes motion-row-out {
-  to {
+  0% {
+    height: 64px;
+    min-height: 64px;
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+
+  48% {
     opacity: 0;
     transform: translateY(-3px) scale(0.996);
+  }
+
+  100% {
+    height: 0;
+    min-height: 0;
+    border-top-width: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    opacity: 0;
+    transform: translateY(-4px) scale(0.994);
   }
 }
 
@@ -103,45 +210,64 @@
   }
 }
 
-/* Drag lift and drop target */
-.mod-row.is-dragging {
-  z-index: 4;
-  opacity: 0.84;
+/* Drag lift, live insertion preview, and settle */
+.mod-rows.is-sorting > .mod-row.is-dragging {
+  z-index: 8;
+  opacity: 0.96;
   animation: none;
-  transform: translateY(-3px) rotate(-0.18deg) scale(0.998);
+  pointer-events: none;
+  background: var(--paper-hi);
+  transform:
+    translate3d(0, var(--drag-offset-y, 0px), 0)
+    rotate(-0.18deg)
+    scale(1.004);
   box-shadow:
-    0 12px 26px rgba(0, 0, 0, 0.18),
-    0 3px 8px rgba(0, 0, 0, 0.1);
+    0 18px 38px color-mix(in srgb, #000 24%, transparent),
+    0 4px 12px color-mix(in srgb, #000 14%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, var(--line));
+  outline: 1px dashed color-mix(in srgb, var(--accent) 42%, transparent);
+  outline-offset: -4px;
+  transition: none;
 }
 
-.mod-row.is-dragging.is-fully-overridden {
-  opacity: 0.84;
+.mod-rows.is-sorting > .mod-row.is-dragging.is-fully-overridden {
+  opacity: 0.96;
 }
 
-.mod-row.is-drag-over {
-  background-color: var(--accent-soft);
-  box-shadow:
-    inset 0 2px 0 var(--accent),
-    inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
-  animation: motion-drop-settle 180ms ease-out;
+.mod-row.is-drop-settled {
+  animation: motion-drop-settled 340ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-@keyframes motion-drop-settle {
-  from {
+@keyframes motion-drop-settled {
+  0% {
+    box-shadow:
+      inset 0 0 0 1px var(--accent),
+      inset 0 0 24px var(--accent-soft);
+  }
+
+  58% {
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, transparent),
+      inset 0 0 12px var(--accent-soft);
+  }
+
+  100% {
     box-shadow: inset 0 0 0 1px transparent;
   }
 }
 
 .mod-rows.is-sorting {
   user-select: none;
+  overscroll-behavior: contain;
 }
 
 .mod-rows.is-sorting .mod-row {
-  will-change: transform, box-shadow;
+  will-change: transform, box-shadow, background-color;
 }
 
 .mod-rows.is-sorting .row-drag {
   opacity: 0.74;
+  transform: rotate(4deg) scale(1.08);
 }
 
 .row-drag {
@@ -163,6 +289,66 @@
 .mod-row.is-fully-overridden:focus-within,
 .mod-row.is-fully-overridden.is-selected {
   opacity: 0.76;
+}
+
+.mod-row.is-toggle-on::after,
+.mod-row.is-toggle-off::after {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  border-radius: inherit;
+  content: "";
+  pointer-events: none;
+  animation: motion-toggle-feedback 480ms ease-out both;
+}
+
+.mod-row.is-toggle-on::after {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--good) 46%, transparent),
+    inset 0 0 28px var(--good-soft);
+}
+
+.mod-row.is-toggle-off::after {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--muted) 28%, transparent),
+    inset 0 0 22px color-mix(in srgb, var(--ink) 5%, transparent);
+}
+
+@keyframes motion-toggle-feedback {
+  0% {
+    opacity: 0.95;
+  }
+
+  100% {
+    opacity: 0;
+  }
+}
+
+.mod-state-pill {
+  transform-origin: left center;
+  animation: motion-state-change 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.mod-conflict-pill {
+  transform-origin: center;
+  animation: motion-counter-pop 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes motion-state-change {
+  from {
+    opacity: 0;
+    transform: translateX(-3px) scale(0.96);
+  }
+}
+
+@keyframes motion-counter-pop {
+  0% {
+    transform: scale(0.94);
+  }
+
+  58% {
+    transform: scale(1.045);
+  }
 }
 
 /* Toggle: spring-like knob and immediate track feedback */
@@ -256,6 +442,121 @@
   }
 }
 
+.filter-chip,
+.tiny-tool {
+  transition:
+    color 150ms ease,
+    background-color 180ms ease,
+    border-color 150ms ease,
+    box-shadow 160ms ease,
+    transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.filter-chip:active,
+.tiny-tool:active {
+  transform: scale(0.96);
+}
+
+.filter-chip.is-active {
+  animation: motion-chip-active 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes motion-chip-active {
+  from {
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  to {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.tiny-tool span {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tiny-tool:hover span {
+  transform: rotate(180deg);
+}
+
+.table-foot b {
+  transition:
+    color 160ms ease,
+    text-shadow 180ms ease;
+}
+
+.table-foot b.is-drop-status {
+  color: var(--accent);
+  text-shadow: 0 0 14px var(--accent-soft);
+  animation: motion-drop-status 180ms ease-out;
+}
+
+@keyframes motion-drop-status {
+  from {
+    opacity: 0.45;
+    transform: translateX(3px);
+  }
+}
+
+/* Inspector swaps fade through the selected mod instead of snapping. */
+.inspector {
+  animation: motion-inspector-in 220ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+.inspector-preview {
+  animation: motion-inspector-preview 240ms ease-out backwards;
+}
+
+.inspector-body > * {
+  animation: motion-inspector-detail 220ms ease-out backwards;
+}
+
+.inspector-body > :nth-child(2) {
+  animation-delay: 18ms;
+}
+
+.inspector-body > :nth-child(3) {
+  animation-delay: 32ms;
+}
+
+.inspector-body > :nth-child(4) {
+  animation-delay: 46ms;
+}
+
+.inspector-body > :nth-child(5) {
+  animation-delay: 58ms;
+}
+
+.inspector-body > :nth-child(n + 6) {
+  animation-delay: 68ms;
+}
+
+@keyframes motion-inspector-in {
+  from {
+    opacity: 0;
+    transform: translateX(5px);
+  }
+}
+
+@keyframes motion-inspector-preview {
+  from {
+    opacity: 0.5;
+    transform: scale(1.012);
+  }
+}
+
+@keyframes motion-inspector-detail {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+.preview-badge,
+.section-title b.is-warn {
+  animation: motion-counter-pop 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
 /* Existing dialog and toast entrances keep their shape; only timing is refined. */
 .modal-backdrop {
   animation-duration: 180ms;
@@ -287,13 +588,26 @@
   .mod-row.is-new,
   .mod-row.is-removing,
   .mod-row.is-selected::before,
-  .mod-row.is-drag-over,
+  .mod-row.is-toggle-on::after,
+  .mod-row.is-toggle-off::after,
+  .mod-row.is-drop-settled,
+  .mod-state-pill,
+  .mod-conflict-pill,
+  .mod-drop-indicator,
   .row-drag,
   .toggle,
   .toggle span,
   .button,
+  .filter-chip,
+  .tiny-tool,
   .mod-cover-image,
   .status-pill,
+  .table-foot b,
+  .inspector,
+  .inspector-preview,
+  .inspector-body > *,
+  .preview-badge,
+  .section-title b.is-warn,
   [class^="conflict-"]:not(.mod-row),
   [class*=" conflict-"]:not(.mod-row),
   .modal-backdrop,
@@ -304,9 +618,5 @@
     animation-iteration-count: 1 !important;
     transition-delay: 0ms !important;
     transition-duration: 0.01ms !important;
-  }
-
-  .mod-row.is-dragging {
-    transform: none !important;
   }
 }

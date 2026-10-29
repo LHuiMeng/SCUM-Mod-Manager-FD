@@ -147,6 +147,7 @@ export function LibraryScreen({
       </section>
 
       <ModInspector
+        key={visibleSelected?.id ?? "empty"}
         mod={visibleSelected}
         onEdit={() => visibleSelected && setEditing(visibleSelected)}
         onDelete={() => visibleSelected && setDeleting(visibleSelected)}
@@ -206,7 +207,14 @@ export function LibraryScreen({
                     setDeleteBusy(true);
                     setRemovingId(deleting.id);
                     try {
-                      await new Promise((resolve) => window.setTimeout(resolve, 180));
+                      const removeDelay = window.matchMedia(
+                        "(prefers-reduced-motion: reduce)",
+                      ).matches
+                        ? 0
+                        : 260;
+                      await new Promise((resolve) =>
+                        window.setTimeout(resolve, removeDelay),
+                      );
                       const deleted = await onDelete(deleting.id);
                       if (deleted) setDeleting(null);
                     } finally {
