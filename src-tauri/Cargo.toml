@@ -1,6 +1,6 @@
 [package]
 name = "scum-mod-manager"
-version = "3.0.0"
+version = "3.0.1"
 description = "SCUM Mod Desk rebuilt with Tauri and Rust"
 authors = ["LHuiMeng"]
 license = "MIT"
