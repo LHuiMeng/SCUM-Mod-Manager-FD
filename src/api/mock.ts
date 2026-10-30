@@ -590,6 +590,11 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       return { message: "演示环境已完成更新校验" } as T;
     case "list_remote_files":
       return structuredClone(remoteFiles) as T;
+    case "download_sftp_file":
+      return {
+        message: `演示环境已下载 ${String(args?.path ?? "").split("/").pop() ?? "文件"}`,
+        path: String(args?.localPath ?? ""),
+      } as T;
     case "test_sftp_connection":
       return {
         ok: true,
@@ -601,6 +606,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         ),
         ue4ssMods: structuredClone(remoteUe4ssMods),
         scannedDirectories: 9,
+        homePath: "/home/modder",
         hostKeyFingerprint: "SHA256:demo-fingerprint",
         requiresTrust: false,
       } as T;
@@ -613,6 +619,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         pakMods: [],
         ue4ssMods: [],
         scannedDirectories: 0,
+        homePath: null,
         hostKeyFingerprint: String(args?.fingerprint ?? "SHA256:demo-fingerprint"),
         requiresTrust: false,
       } as T;

@@ -1,8 +1,9 @@
 use crate::models::{
-    AppSettings, RemoteFile, SftpAccount, SftpConflictGroup, SftpConflictOwner, SftpConflictReport,
-    SftpConnectionResult, SftpOperationResult, UploadResult,
+    AppSettings, RemoteFile, SftpAccount, SftpConflictGroup, SftpConflictOwner,
+    SftpConflictProgress, SftpConflictReport, SftpConnectionResult, SftpOperationResult,
+    UploadResult,
 };
-use crate::paths::{safe_disk_name, AppPaths};
+use crate::paths::{safe_file_component, AppPaths};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::{TimeZone, Utc};
@@ -11,9 +12,12 @@ use sha2::{Digest, Sha256};
 use ssh2::{Session, Sftp};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs::File;
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -24,6 +28,13 @@ const MAX_REMOTE_TREE_ENTRIES: usize = 20_000;
 const MAX_REMOTE_CONFLICT_MODS: usize = 64;
 const MAX_REMOTE_CONFLICT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_REMOTE_NOTE_CHARS: usize = 20_000;
+const CONFLICT_DOWNLOAD_WORKERS: usize = 4;
+const CONFLICT_PARSE_WORKERS: usize = 4;
+const CONFLICT_DOWNLOAD_CHUNK_BYTES: usize = 512 * 1024;
+const CONFLICT_PROGRESS_INTERVAL: Duration = Duration::from_millis(140);
+const MAX_CONFLICT_ENTRIES_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+pub type SftpConflictProgressCallback = Arc<dyn Fn(SftpConflictProgress) + Send + Sync>;
 
 pub fn active_account<'a>(
     settings: &'a AppSettings,
@@ -77,6 +88,7 @@ pub fn test_connection(
                 pak_mods: Vec::new(),
                 ue4ss_mods: Vec::new(),
                 scanned_directories: 0,
+                home_path: None,
                 host_key_fingerprint: Some(fingerprint),
                 requires_trust: true,
             });
@@ -84,6 +96,10 @@ pub fn test_connection(
     }
     authenticate_session(paths, &session, account)?;
     let sftp = session.sftp().context("无法建立 SFTP 通道")?;
+    let home_path = sftp
+        .realpath(Path::new("."))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
     let detected = detect_server_paths(&sftp, account);
     let pak_mods = detected
         .pak_mods_path
@@ -122,6 +138,7 @@ pub fn test_connection(
         pak_mods,
         ue4ss_mods,
         scanned_directories: detected.scanned_directories,
+        home_path,
         host_key_fingerprint: Some(fingerprint),
         requires_trust: false,
     })
@@ -161,6 +178,7 @@ pub fn trust_host(
         pak_mods: Vec::new(),
         ue4ss_mods: Vec::new(),
         scanned_directories: 0,
+        home_path: None,
         host_key_fingerprint: Some(fingerprint),
         requires_trust: false,
     })
@@ -178,6 +196,64 @@ pub fn list_files(
         remote_path.trim()
     };
     with_sftp(paths, account, |sftp| Ok(read_remote_files(sftp, path)))
+}
+
+pub fn download_file(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+    local_path: &str,
+) -> Result<SftpOperationResult> {
+    let account = active_account(settings, Some(account_id))?;
+    let remote_path = normalize_remote_path(remote_path);
+    if !is_clean_remote_path(&remote_path) {
+        bail!("远端文件路径无效");
+    }
+    let local_path = PathBuf::from(local_path);
+    if local_path.as_os_str().is_empty() {
+        bail!("本地保存路径无效");
+    }
+    let name = entry_name(&remote_path);
+    with_sftp(paths, account, |sftp| {
+        let stat = sftp
+            .stat(Path::new(&remote_path))
+            .with_context(|| format!("无法读取远端文件 {remote_path}"))?;
+        if stat.is_dir() {
+            bail!("不能把远端目录下载为单个文件");
+        }
+        let file_name = local_path
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".to_string());
+        let partial = local_path.with_file_name(format!(".{file_name}.{}.part", Uuid::new_v4()));
+        let download = (|| -> Result<()> {
+            let mut remote = sftp
+                .open(Path::new(&remote_path))
+                .with_context(|| format!("无法读取远端文件 {remote_path}"))?;
+            let mut output = File::create(&partial)
+                .with_context(|| format!("无法创建本地文件 {}", partial.display()))?;
+            std::io::copy(&mut remote, &mut output)
+                .with_context(|| format!("无法下载远端文件 {remote_path}"))?;
+            output.flush()?;
+            if local_path.exists() {
+                std::fs::remove_file(&local_path)
+                    .with_context(|| format!("无法覆盖本地文件 {}", local_path.display()))?;
+            }
+            std::fs::rename(&partial, &local_path)
+                .with_context(|| format!("无法提交本地文件 {}", local_path.display()))?;
+            Ok(())
+        })();
+        if download.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        download?;
+        Ok(())
+    })?;
+    Ok(SftpOperationResult {
+        message: format!("已下载远端文件 {name}"),
+        path: local_path.to_string_lossy().into_owned(),
+    })
 }
 
 pub fn upload_files(
@@ -341,20 +417,57 @@ pub fn analyze_remote_conflicts(
     paths: &AppPaths,
     settings: &AppSettings,
     account_id: &str,
+    progress: SftpConflictProgressCallback,
 ) -> Result<SftpConflictReport> {
     let account = active_account(settings, Some(account_id))?;
     if account.mods_path.trim().is_empty() {
         bail!("尚未定位远端 PAK 模组目录");
     }
-    let temp = paths
+    let cache_dir = paths
         .root
-        .join("downloads")
-        .join(format!("sftp-conflicts-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&temp)
-        .with_context(|| format!("无法创建冲突分析缓存 {}", temp.display()))?;
-    let result = analyze_remote_conflicts_inner(paths, account, &temp);
-    let _ = std::fs::remove_dir_all(&temp);
-    result
+        .join("cache")
+        .join("sftp_conflicts")
+        .join(safe_file_component(account_id));
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("无法创建冲突分析缓存 {}", cache_dir.display()))?;
+    send_conflict_progress(
+        &progress,
+        "preparing",
+        0,
+        0,
+        0,
+        0,
+        None,
+        "正在读取远端 PAK 列表",
+    );
+    match analyze_remote_conflicts_inner(paths, account, &cache_dir, &progress) {
+        Ok(report) => {
+            send_conflict_progress(
+                &progress,
+                "completed",
+                report.analyzed_mods,
+                report.analyzed_mods + report.skipped_mods,
+                0,
+                0,
+                None,
+                &report.message,
+            );
+            Ok(report)
+        }
+        Err(error) => {
+            send_conflict_progress(
+                &progress,
+                "error",
+                0,
+                0,
+                0,
+                0,
+                None,
+                &format!("冲突分析失败：{error:#}"),
+            );
+            Err(error)
+        }
+    }
 }
 
 fn upload_pak_files(
@@ -969,63 +1082,312 @@ fn remove_remote_notes_under(paths: &AppPaths, account_id: &str, remote_path: &s
     Ok(())
 }
 
+#[derive(Clone)]
+struct ConflictDownloadTask {
+    file: RemoteFile,
+    local: PathBuf,
+    cache_name: String,
+}
+
 fn analyze_remote_conflicts_inner(
     paths: &AppPaths,
     account: &SftpAccount,
-    temp: &Path,
+    cache_dir: &Path,
+    progress: &SftpConflictProgressCallback,
 ) -> Result<SftpConflictReport> {
-    let mut downloaded: Vec<(RemoteFile, PathBuf)> = Vec::new();
+    let pak_files = with_sftp(paths, account, |sftp| {
+        Ok(list_pak_mods(sftp, &account.mods_path))
+    })?;
+    let mut accepted = Vec::new();
     let mut skipped_mods = 0usize;
     let mut total_bytes = 0u64;
-    with_sftp(paths, account, |sftp| {
-        let pak_files = list_pak_mods(sftp, &account.mods_path);
-        for (index, file) in pak_files.into_iter().enumerate() {
-            if downloaded.len() >= MAX_REMOTE_CONFLICT_MODS {
-                skipped_mods += 1;
-                continue;
-            }
-            if total_bytes.saturating_add(file.size) > MAX_REMOTE_CONFLICT_BYTES {
-                skipped_mods += 1;
-                continue;
-            }
-            let stem = Path::new(&file.name)
-                .file_stem()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "mod".to_string());
-            let local = temp.join(format!("{index:03}-{}.pak", safe_disk_name(&stem, "mod")));
-            let downloaded_file = (|| -> Result<()> {
-                let mut remote = sftp
-                    .open(Path::new(&file.path))
-                    .with_context(|| format!("无法读取远端 PAK {}", file.path))?;
-                let mut output = File::create(&local)
-                    .with_context(|| format!("无法创建冲突分析缓存 {}", local.display()))?;
-                std::io::copy(&mut remote, &mut output)?;
-                Ok(())
-            })();
-            if downloaded_file.is_err() {
-                skipped_mods += 1;
-                let _ = std::fs::remove_file(&local);
-                continue;
-            }
-            total_bytes = total_bytes.saturating_add(file.size);
-            downloaded.push((file, local));
+    for file in pak_files {
+        if accepted.len() >= MAX_REMOTE_CONFLICT_MODS
+            || total_bytes.saturating_add(file.size) > MAX_REMOTE_CONFLICT_BYTES
+        {
+            skipped_mods += 1;
+            continue;
         }
-        Ok(())
-    })?;
+        total_bytes = total_bytes.saturating_add(file.size);
+        accepted.push(file);
+    }
+    let total_files = accepted.len();
+
+    let mut downloaded = Vec::new();
+    let mut preparsed = Vec::new();
+    let mut pending = Vec::new();
+    let mut keep_names = HashSet::new();
+    let mut cached_bytes = 0u64;
+    for file in accepted {
+        let cache_name = conflict_cache_name(&file);
+        let entries_name = conflict_entries_cache_name(&cache_name);
+        let local = cache_dir.join(&cache_name);
+        let entries_local = cache_dir.join(&entries_name);
+        keep_names.insert(cache_name.clone());
+        keep_names.insert(entries_name);
+        let cached = std::fs::metadata(&local)
+            .map(|metadata| metadata.len() == file.size)
+            .unwrap_or(false);
+        if cached {
+            cached_bytes = cached_bytes.saturating_add(file.size);
+            if let Some(entries) = read_conflict_entries_cache(&entries_local) {
+                preparsed.push((file, entries));
+            } else {
+                downloaded.push((file, local));
+            }
+        } else {
+            pending.push(ConflictDownloadTask {
+                file,
+                local,
+                cache_name,
+            });
+        }
+    }
+    send_conflict_progress(
+        progress,
+        "downloading",
+        downloaded.len() + preparsed.len(),
+        total_files,
+        cached_bytes,
+        total_bytes,
+        None,
+        if downloaded.is_empty() && preparsed.is_empty() {
+            format!("准备并行下载 {total_files} 个远端 PAK")
+        } else {
+            format!(
+                "已命中 {} 个缓存（{} 个解析结果可直接复用），准备下载 {} 个远端 PAK",
+                downloaded.len() + preparsed.len(),
+                preparsed.len(),
+                pending.len()
+            )
+        }
+        .as_str(),
+    );
+
+    let downloaded = Arc::new(Mutex::new(downloaded));
+    let completed_files = Arc::new(AtomicUsize::new(
+        downloaded.lock().unwrap().len() + preparsed.len(),
+    ));
+    let completed_bytes = Arc::new(AtomicU64::new(cached_bytes));
+    if !pending.is_empty() {
+        let tasks = Arc::new(pending);
+        let next_task = Arc::new(AtomicUsize::new(0));
+        let worker_count = CONFLICT_DOWNLOAD_WORKERS.min(tasks.len());
+        let last_progress = Arc::new(Mutex::new(Instant::now() - CONFLICT_PROGRESS_INTERVAL));
+        std::thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            for _ in 0..worker_count {
+                let tasks = tasks.clone();
+                let next_task = next_task.clone();
+                let downloaded = downloaded.clone();
+                let completed_files = completed_files.clone();
+                let completed_bytes = completed_bytes.clone();
+                let progress = progress.clone();
+                let account = account.clone();
+                let last_progress = last_progress.clone();
+                handles.push(scope.spawn(move || -> Result<()> {
+                    with_sftp(paths, &account, |sftp| {
+                        loop {
+                            let index = next_task.fetch_add(1, Ordering::Relaxed);
+                            if index >= tasks.len() {
+                                break;
+                            }
+                            let task = &tasks[index];
+                            send_conflict_progress(
+                                &progress,
+                                "downloading",
+                                completed_files.load(Ordering::Relaxed),
+                                total_files,
+                                completed_bytes.load(Ordering::Relaxed),
+                                total_bytes,
+                                Some(task.file.name.clone()),
+                                &format!("正在下载 {}", task.file.name),
+                            );
+                            let partial = task
+                                .local
+                                .with_file_name(format!("{}.part", task.cache_name));
+                            let _ = std::fs::remove_file(&partial);
+                            let mut task_bytes = 0u64;
+                            let download = (|| -> Result<()> {
+                                let mut remote =
+                                    sftp.open(Path::new(&task.file.path)).with_context(|| {
+                                        format!("无法读取远端 PAK {}", task.file.path)
+                                    })?;
+                                let mut output = File::create(&partial).with_context(|| {
+                                    format!("无法创建冲突分析缓存 {}", partial.display())
+                                })?;
+                                let mut buffer = vec![0u8; CONFLICT_DOWNLOAD_CHUNK_BYTES];
+                                loop {
+                                    let read = remote.read(&mut buffer)?;
+                                    if read == 0 {
+                                        break;
+                                    }
+                                    output.write_all(&buffer[..read])?;
+                                    task_bytes = task_bytes.saturating_add(read as u64);
+                                    let bytes = completed_bytes
+                                        .fetch_add(read as u64, Ordering::Relaxed)
+                                        + read as u64;
+                                    let should_emit = {
+                                        let mut last = last_progress.lock().unwrap();
+                                        if last.elapsed() >= CONFLICT_PROGRESS_INTERVAL {
+                                            *last = Instant::now();
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    if should_emit {
+                                        send_conflict_progress(
+                                            &progress,
+                                            "downloading",
+                                            completed_files.load(Ordering::Relaxed),
+                                            total_files,
+                                            bytes,
+                                            total_bytes,
+                                            Some(task.file.name.clone()),
+                                            &format!("正在下载 {}", task.file.name),
+                                        );
+                                    }
+                                }
+                                output.flush()?;
+                                std::fs::rename(&partial, &task.local).with_context(|| {
+                                    format!("无法提交冲突分析缓存 {}", task.local.display())
+                                })?;
+                                Ok(())
+                            })();
+                            if let Err(error) = download {
+                                let _ = std::fs::remove_file(&partial);
+                                return Err(error);
+                            }
+                            downloaded
+                                .lock()
+                                .unwrap()
+                                .push((task.file.clone(), task.local.clone()));
+                            let finished = completed_files.fetch_add(1, Ordering::Relaxed) + 1;
+                            if task_bytes < task.file.size {
+                                completed_bytes
+                                    .fetch_add(task.file.size - task_bytes, Ordering::Relaxed);
+                            }
+                            send_conflict_progress(
+                                &progress,
+                                "downloading",
+                                finished,
+                                total_files,
+                                completed_bytes.load(Ordering::Relaxed),
+                                total_bytes,
+                                Some(task.file.name.clone()),
+                                &format!("已完成 {}", task.file.name),
+                            );
+                        }
+                        Ok(())
+                    })
+                }));
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("远端 PAK 下载线程异常退出"))??;
+            }
+            Ok(())
+        })?;
+    }
+    let downloaded = Arc::try_unwrap(downloaded)
+        .map_err(|_| anyhow::anyhow!("冲突分析缓存仍被占用"))?
+        .into_inner()
+        .unwrap();
+
+    send_conflict_progress(
+        progress,
+        "parsing",
+        preparsed.len(),
+        total_files,
+        0,
+        total_bytes,
+        None,
+        if preparsed.is_empty() {
+            "开始并行解析 PAK 资源清单"
+        } else {
+            "已复用部分 PAK 解析缓存，继续解析剩余文件"
+        },
+    );
+    let downloaded = Arc::new(downloaded);
+    let parsed = Arc::new(Mutex::new(preparsed));
+    let parse_failures = Arc::new(AtomicUsize::new(0));
+    let parse_done = Arc::new(AtomicUsize::new(parsed.lock().unwrap().len()));
+    if !downloaded.is_empty() {
+        let next_parse = Arc::new(AtomicUsize::new(0));
+        let worker_count = CONFLICT_PARSE_WORKERS.min(downloaded.len());
+        std::thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            for _ in 0..worker_count {
+                let downloaded = downloaded.clone();
+                let parsed = parsed.clone();
+                let parse_failures = parse_failures.clone();
+                let parse_done = parse_done.clone();
+                let next_parse = next_parse.clone();
+                let progress = progress.clone();
+                handles.push(scope.spawn(move || loop {
+                    let index = next_parse.fetch_add(1, Ordering::Relaxed);
+                    if index >= downloaded.len() {
+                        break;
+                    }
+                    let (file, local) = &downloaded[index];
+                    send_conflict_progress(
+                        &progress,
+                        "parsing",
+                        parse_done.load(Ordering::Relaxed),
+                        total_files,
+                        0,
+                        total_bytes,
+                        Some(file.name.clone()),
+                        &format!("正在解析 {}", file.name),
+                    );
+                    match crate::mods::list_pak_entries(paths, local) {
+                        Ok(entries) => {
+                            let entries_name = local
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let entries_local =
+                                local.with_file_name(conflict_entries_cache_name(&entries_name));
+                            write_conflict_entries_cache(&entries_local, &entries);
+                            parsed.lock().unwrap().push((file.clone(), entries));
+                        }
+                        Err(_) => {
+                            parse_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    let finished = parse_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    send_conflict_progress(
+                        &progress,
+                        "parsing",
+                        finished,
+                        total_files,
+                        0,
+                        total_bytes,
+                        Some(file.name.clone()),
+                        &format!("已解析 {}", file.name),
+                    );
+                }));
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("PAK 解析线程异常退出"))?;
+            }
+            Ok(())
+        })?;
+    }
+    skipped_mods += parse_failures.load(Ordering::Relaxed);
+    let parsed = Arc::try_unwrap(parsed)
+        .map_err(|_| anyhow::anyhow!("PAK 解析结果仍被占用"))?
+        .into_inner()
+        .unwrap();
 
     let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut display_paths: BTreeMap<String, String> = BTreeMap::new();
     let mut owner_info: BTreeMap<String, SftpConflictOwner> = BTreeMap::new();
-    let mut analyzed_mods = 0usize;
-    for (file, local) in &downloaded {
-        let entries = match crate::mods::list_pak_entries(paths, local) {
-            Ok(entries) => entries,
-            Err(_) => {
-                skipped_mods += 1;
-                continue;
-            }
-        };
-        analyzed_mods += 1;
+    for (file, entries) in &parsed {
         owner_info.insert(
             file.path.clone(),
             SftpConflictOwner {
@@ -1036,7 +1398,7 @@ fn analyze_remote_conflicts_inner(
         );
         let mut seen = HashSet::new();
         for raw in entries {
-            let Some(resource_path) = crate::mods::normalize_entry_path(&raw) else {
+            let Some(resource_path) = crate::mods::normalize_entry_path(raw) else {
                 continue;
             };
             let key = resource_path.to_ascii_lowercase();
@@ -1065,6 +1427,7 @@ fn analyze_remote_conflicts_inner(
             .cmp(&right.resource_path.to_ascii_lowercase())
             .then_with(|| left.resource_path.cmp(&right.resource_path))
     });
+    let analyzed_mods = parsed.len();
     let message = if groups.is_empty() {
         format!(
             "已分析 {analyzed_mods} 个远端 PAK，未发现资源冲突{}",
@@ -1085,12 +1448,87 @@ fn analyze_remote_conflicts_inner(
             }
         )
     };
+    prune_conflict_cache(cache_dir, &keep_names);
     Ok(SftpConflictReport {
         groups,
         analyzed_mods,
         skipped_mods,
         message,
     })
+}
+
+fn send_conflict_progress(
+    progress: &SftpConflictProgressCallback,
+    phase: &str,
+    completed_files: usize,
+    total_files: usize,
+    completed_bytes: u64,
+    total_bytes: u64,
+    current_file: Option<String>,
+    message: &str,
+) {
+    progress(SftpConflictProgress {
+        phase: phase.to_string(),
+        completed_files,
+        total_files,
+        completed_bytes,
+        total_bytes,
+        current_file,
+        message: message.to_string(),
+    });
+}
+
+fn conflict_cache_name(file: &RemoteFile) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(file.path.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(file.size.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(file.modified_at.as_deref().unwrap_or_default().as_bytes());
+    format!("{}.pak", &hex::encode(hasher.finalize())[..32])
+}
+
+fn conflict_entries_cache_name(cache_name: &str) -> String {
+    format!("{cache_name}.entries.json")
+}
+
+fn read_conflict_entries_cache(path: &Path) -> Option<Vec<String>> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFLICT_ENTRIES_CACHE_BYTES {
+        return None;
+    }
+    let data = std::fs::read(path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+fn write_conflict_entries_cache(path: &Path, entries: &[String]) {
+    let Ok(data) = serde_json::to_vec(entries) else {
+        return;
+    };
+    let partial = path.with_extension("json.part");
+    if std::fs::write(&partial, data).is_ok() {
+        let _ = std::fs::rename(&partial, path);
+    } else {
+        let _ = std::fs::remove_file(&partial);
+    }
+}
+
+fn prune_conflict_cache(cache_dir: &Path, keep_names: &HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if keep_names.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn ensure_remote_operation_allowed(account: &SftpAccount, path: &str) -> Result<()> {
@@ -1246,10 +1684,11 @@ fn remote_join(parent: &str, child: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_account, ensure_remote_operation_allowed, load_remote_notes, move_remote_notes,
-        pak_path_candidates, remote_join, remove_remote_notes_under, root_from_pak_path,
+        active_account, conflict_entries_cache_name, download_file,
+        ensure_remote_operation_allowed, load_remote_notes, move_remote_notes, pak_path_candidates,
+        read_conflict_entries_cache, remote_join, remove_remote_notes_under, root_from_pak_path,
         root_from_ue4ss_path, save_remote_notes, ue4ss_path_candidates, validate_remote_name,
-        RemoteNotesFile,
+        write_conflict_entries_cache, RemoteNotesFile,
     };
     use crate::models::{AppSettings, SftpAccount};
     use crate::test_support::TempRoot;
@@ -1365,6 +1804,40 @@ mod tests {
         assert!(validate_remote_name("bad/name.pak").is_err());
         assert!(validate_remote_name("bad\\name.pak").is_err());
         assert!(validate_remote_name("   ").is_err());
+    }
+
+    #[test]
+    fn validates_download_paths_before_opening_a_connection() {
+        let temp = TempRoot::new("sftp-download-validation");
+        let paths = temp.paths();
+        let settings = AppSettings {
+            sftp_accounts: vec![account("server")],
+            ..AppSettings::default()
+        };
+        assert!(
+            download_file(&paths, &settings, "server", "../escape.pak", "download.pak").is_err()
+        );
+        assert!(download_file(
+            &paths,
+            &settings,
+            "server",
+            "/srv/scum/SCUM/Content/Paks/~mods/Test.pak",
+            ""
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn round_trips_conflict_entry_cache() {
+        let temp = TempRoot::new("sftp-conflict-entry-cache");
+        let cache_name = conflict_entries_cache_name("abc.pak");
+        let path = temp.path().join(&cache_name);
+        let entries = vec![
+            "SCUM/Content/Items/One".to_string(),
+            "SCUM/Content/Items/Two".to_string(),
+        ];
+        write_conflict_entries_cache(&path, &entries);
+        assert_eq!(read_conflict_entries_cache(&path).unwrap(), entries);
     }
 
     #[test]

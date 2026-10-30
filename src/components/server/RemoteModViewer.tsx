@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
   RemoteFile,
+  SftpConflictProgress,
   SftpConflictReport,
   SftpConnectionResult,
   SftpUploadKind,
@@ -18,6 +19,7 @@ interface RemoteModViewerProps {
   notes: Record<string, string>;
   conflicts: SftpConflictReport | null;
   conflictLoading: boolean;
+  progress: SftpConflictProgress | null;
   loading: boolean;
   onUpload: (kind: SftpUploadKind) => Promise<void> | void;
   onRename: (path: string, newName: string) => Promise<string | null>;
@@ -37,6 +39,7 @@ export function RemoteModViewer({
   notes,
   conflicts,
   conflictLoading,
+  progress,
   loading,
   onUpload,
   onRename,
@@ -90,6 +93,28 @@ export function RemoteModViewer({
       ),
     [conflicts, selectedPath],
   );
+  const conflictPercent = progress
+    ? progress.phase === "completed"
+      ? 100
+      : progress.phase === "downloading" && progress.totalBytes > 0
+        ? Math.min(99, Math.round((progress.completedBytes / progress.totalBytes) * 100))
+        : progress.totalFiles > 0
+          ? Math.min(99, Math.round((progress.completedFiles / progress.totalFiles) * 100))
+          : null
+    : null;
+  const conflictActionLabel = conflictLoading
+    ? progress?.phase === "parsing"
+      ? t("remoteViewer.parsingProgress", {
+          completed: progress.completedFiles,
+          total: progress.totalFiles,
+        })
+      : progress?.phase === "downloading"
+        ? t("remoteViewer.downloadingProgress", {
+            completed: progress.completedFiles,
+            total: progress.totalFiles,
+          })
+        : t("remoteViewer.analyzing")
+    : t("remoteViewer.analyzeConflicts");
 
   useEffect(() => {
     if (selectedPath && items.some((item) => item.path === selectedPath)) return;
@@ -178,7 +203,7 @@ export function RemoteModViewer({
           onClick={() => void onAnalyzeConflicts()}
           disabled={loading || conflictLoading || scan.pakMods.length < 2}
         >
-          {conflictLoading ? t("remoteViewer.analyzing") : t("remoteViewer.analyzeConflicts")}
+          {conflictActionLabel}
         </Button>
       </header>
 
@@ -321,7 +346,35 @@ export function RemoteModViewer({
                   <b>{conflicts?.message || t("remoteViewer.conflictNotAnalyzed")}</b>
                 </div>
                 {conflictLoading ? (
-                  <p>{t("remoteViewer.conflictAnalyzing")}</p>
+                  <div className="remote-viewer-conflict-progress" aria-live="polite">
+                    <div>
+                      <span>{progress?.message || t("remoteViewer.conflictAnalyzing")}</span>
+                      {conflictPercent !== null ? <b>{conflictPercent}%</b> : null}
+                    </div>
+                    <div
+                      className="remote-viewer-progress-track"
+                      role="progressbar"
+                      aria-label={t("remoteViewer.conflictTitle")}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={conflictPercent ?? 0}
+                    >
+                      <i style={{ width: `${conflictPercent ?? 0}%` }} />
+                    </div>
+                    <small>
+                      {progress?.currentFile
+                        ? progress.currentFile
+                        : t("remoteViewer.conflictAnalyzing")}
+                    </small>
+                    {progress && progress.totalBytes > 0 ? (
+                      <small>
+                        {t("remoteViewer.bytesProgress", {
+                          completed: formatBytes(progress.completedBytes),
+                          total: formatBytes(progress.totalBytes),
+                        })}
+                      </small>
+                    ) : null}
+                  </div>
                 ) : !conflicts ? (
                   <p>{t("remoteViewer.conflictPrompt")}</p>
                 ) : selectedConflicts.length === 0 ? (

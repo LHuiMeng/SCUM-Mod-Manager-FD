@@ -1,83 +1,151 @@
 export type ServerPanelId = "account" | "files" | "viewer";
 
+export interface ServerPanelRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface ServerLayout {
-  order: ServerPanelId[];
-  heights: Record<ServerPanelId, number>;
+  rects: Record<ServerPanelId, ServerPanelRect>;
+}
+
+export interface ServerStageSize {
+  width: number;
+  height: number;
 }
 
 export const SERVER_PANEL_ORDER: ServerPanelId[] = ["account", "files", "viewer"];
 
-const PANEL_HEIGHT_LIMITS: Record<ServerPanelId, { min: number; max: number }> = {
-  account: { min: 260, max: 760 },
-  files: { min: 300, max: 760 },
-  viewer: { min: 260, max: 760 },
+export const SERVER_PANEL_MIN_SIZE: Record<
+  ServerPanelId,
+  { width: number; height: number }
+> = {
+  account: { width: 280, height: 240 },
+  files: { width: 320, height: 260 },
+  viewer: { width: 420, height: 280 },
 };
 
 export const DEFAULT_SERVER_LAYOUT: ServerLayout = {
-  order: [...SERVER_PANEL_ORDER],
-  heights: {
-    account: 300,
-    files: 330,
-    viewer: 320,
+  rects: {
+    account: { x: 0.01, y: 0.01, w: 0.4, h: 0.47 },
+    files: { x: 0.42, y: 0.01, w: 0.57, h: 0.47 },
+    viewer: { x: 0.01, y: 0.5, w: 0.98, h: 0.49 },
   },
 };
 
-const STORAGE_KEY = "scum-server-layout-v1";
+const STORAGE_KEY = "scum-server-layout-v2";
 
-export function clampServerPanelHeight(panel: ServerPanelId, value: number): number {
-  const limits = PANEL_HEIGHT_LIMITS[panel];
-  if (!Number.isFinite(value)) return DEFAULT_SERVER_LAYOUT.heights[panel];
-  return Math.round(Math.min(limits.max, Math.max(limits.min, value)));
+function finiteOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function defaultRect(panel: ServerPanelId): ServerPanelRect {
+  return { ...DEFAULT_SERVER_LAYOUT.rects[panel] };
+}
+
+/**
+ * Keep a normalized rectangle inside the stage and above the panel's usable
+ * minimum. The minimum is converted to stage-relative units so the same
+ * persisted layout can be reused at every window size.
+ */
+export function clampServerPanelRect(
+  panel: ServerPanelId,
+  rect: ServerPanelRect,
+  stage?: ServerStageSize,
+): ServerPanelRect {
+  const fallback = defaultRect(panel);
+  const rawW = clamp(finiteOr(rect.w, fallback.w), 0.001, 1);
+  const rawH = clamp(finiteOr(rect.h, fallback.h), 0.001, 1);
+  const minimum = SERVER_PANEL_MIN_SIZE[panel];
+  const minW =
+    stage && stage.width > 0
+      ? Math.min(1, minimum.width / stage.width)
+      : Math.min(1, rawW);
+  const minH =
+    stage && stage.height > 0
+      ? Math.min(1, minimum.height / stage.height)
+      : Math.min(1, rawH);
+  const w = clamp(rawW, minW, 1);
+  const h = clamp(rawH, minH, 1);
+  return {
+    x: clamp(finiteOr(rect.x, fallback.x), 0, Math.max(0, 1 - w)),
+    y: clamp(finiteOr(rect.y, fallback.y), 0, Math.max(0, 1 - h)),
+    w,
+    h,
+  };
+}
+
+export function moveServerPanelRect(
+  panel: ServerPanelId,
+  rect: ServerPanelRect,
+  deltaX: number,
+  deltaY: number,
+  stage?: ServerStageSize,
+): ServerPanelRect {
+  return clampServerPanelRect(
+    panel,
+    {
+      ...rect,
+      x: rect.x + deltaX,
+      y: rect.y + deltaY,
+    },
+    stage,
+  );
+}
+
+export function resizeServerPanelRect(
+  panel: ServerPanelId,
+  rect: ServerPanelRect,
+  deltaW: number,
+  deltaH: number,
+  stage?: ServerStageSize,
+): ServerPanelRect {
+  return clampServerPanelRect(
+    panel,
+    {
+      ...rect,
+      w: rect.w + deltaW,
+      h: rect.h + deltaH,
+    },
+    stage,
+  );
 }
 
 export function normalizeServerLayout(value: unknown): ServerLayout {
   const input =
-    value && typeof value === "object" ? (value as Partial<ServerLayout>) : {};
-  const order = Array.isArray(input.order)
-    ? input.order.filter(
-        (panel, index, list): panel is ServerPanelId =>
-          SERVER_PANEL_ORDER.includes(panel as ServerPanelId) &&
-          list.indexOf(panel) === index,
-      )
-    : [];
+    value && typeof value === "object"
+      ? (value as { rects?: Partial<Record<ServerPanelId, Partial<ServerPanelRect>>> })
+      : {};
+  const rects = {} as Record<ServerPanelId, ServerPanelRect>;
   for (const panel of SERVER_PANEL_ORDER) {
-    if (!order.includes(panel)) order.push(panel);
+    const candidate = input.rects?.[panel];
+    const fallback = defaultRect(panel);
+    rects[panel] = clampServerPanelRect(panel, {
+      x: finiteOr(candidate?.x, fallback.x),
+      y: finiteOr(candidate?.y, fallback.y),
+      w: finiteOr(candidate?.w, fallback.w),
+      h: finiteOr(candidate?.h, fallback.h),
+    });
   }
-  const heights = {} as Record<ServerPanelId, number>;
-  for (const panel of SERVER_PANEL_ORDER) {
-    const candidate = input.heights?.[panel];
-    heights[panel] = clampServerPanelHeight(
-      panel,
-      typeof candidate === "number" ? candidate : DEFAULT_SERVER_LAYOUT.heights[panel],
-    );
-  }
-  return { order, heights };
+  return { rects };
 }
 
-export function moveServerPanel(
-  order: ServerPanelId[],
-  panel: ServerPanelId,
-  target: ServerPanelId,
-): ServerPanelId[] {
-  if (panel === target) return [...order];
-  const next = order.filter((item) => item !== panel);
-  const targetIndex = next.indexOf(target);
-  if (targetIndex < 0) return [...order];
-  next.splice(targetIndex, 0, panel);
-  return next;
-}
-
-export function moveServerPanelBy(
-  order: ServerPanelId[],
-  panel: ServerPanelId,
-  delta: number,
-): ServerPanelId[] {
-  const index = order.indexOf(panel);
-  const targetIndex = index + delta;
-  if (index < 0 || targetIndex < 0 || targetIndex >= order.length) return [...order];
-  const next = [...order];
-  [next[index], next[targetIndex]] = [next[targetIndex], next[index]];
-  return next;
+export function fitServerLayoutToStage(
+  layout: ServerLayout,
+  stage: ServerStageSize,
+): ServerLayout {
+  const normalized = normalizeServerLayout(layout);
+  const rects = {} as Record<ServerPanelId, ServerPanelRect>;
+  for (const panel of SERVER_PANEL_ORDER) {
+    rects[panel] = clampServerPanelRect(panel, normalized.rects[panel], stage);
+  }
+  return { rects };
 }
 
 export function readStoredServerLayout(): ServerLayout {

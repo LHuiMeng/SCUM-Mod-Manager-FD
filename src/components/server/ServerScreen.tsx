@@ -1,26 +1,43 @@
-import { useEffect, useState, type DragEvent, type PointerEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent,
+} from "react";
 import type {
   RemoteFile,
   SftpAccount,
+  SftpConflictProgress,
   SftpConflictReport,
   SftpConnectionResult,
   SftpUploadKind,
 } from "../../types";
 import { useI18n } from "../../i18n";
 import { formatBytes, formatDate } from "../../lib/format";
+import {
+  isRemotePathWithin,
+  normalizeRemotePath,
+  remoteBreadcrumbs,
+  remoteParent,
+} from "../../lib/remotePath";
 import { parseSftpConnectionUrl } from "../../lib/sftpUrl";
 import {
-  clampServerPanelHeight,
   DEFAULT_SERVER_LAYOUT,
-  moveServerPanel,
-  moveServerPanelBy,
+  fitServerLayoutToStage,
+  moveServerPanelRect,
+  normalizeServerLayout,
   readStoredServerLayout,
+  resizeServerPanelRect,
+  SERVER_PANEL_ORDER,
   storeServerLayout,
   type ServerPanelId,
+  type ServerStageSize,
 } from "../../lib/serverLayout";
 import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
-import { Icon } from "../ui/Icon";
+import { Icon, type IconName } from "../ui/Icon";
 import { RemoteModViewer } from "./RemoteModViewer";
 
 interface ServerScreenProps {
@@ -39,6 +56,7 @@ interface ServerScreenProps {
   notes: Record<string, string>;
   conflicts: SftpConflictReport | null;
   conflictLoading: boolean;
+  conflictProgress: SftpConflictProgress | null;
   onSaveAccount: (
     account: Omit<SftpAccount, "id" | "hasPassword">,
     password: string,
@@ -47,6 +65,11 @@ interface ServerScreenProps {
   onTrustHost: () => void;
   onDismissTrust: () => void;
   onLoadFiles: (accountId: string, path: string) => void;
+  onDownload: (
+    accountId: string,
+    path: string,
+    name: string,
+  ) => Promise<void> | void;
   onUpload: (accountId: string, kind: SftpUploadKind) => Promise<void> | void;
   onRename: (
     accountId: string,
@@ -72,6 +95,36 @@ const PANEL_LABEL_KEYS: Record<
   viewer: "serverLayout.viewer",
 };
 
+const TEXT_FILE_EXTENSIONS = new Set([
+  "cfg",
+  "ini",
+  "json",
+  "lua",
+  "md",
+  "toml",
+  "txt",
+  "xml",
+  "yaml",
+  "yml",
+]);
+
+function remoteFileExtension(name: string): string {
+  const index = name.lastIndexOf(".");
+  return index > 0 && index < name.length - 1
+    ? name.slice(index + 1).toLowerCase()
+    : "";
+}
+
+function remoteFileIcon(file: RemoteFile): IconName {
+  if (file.isDirectory) return "folder";
+  const extension = remoteFileExtension(file.name);
+  if (extension === "pak") return "box";
+  if (extension === "sig") return "lock";
+  if (extension === "dll") return "settings";
+  if (TEXT_FILE_EXTENSIONS.has(extension)) return "terminal";
+  return "open";
+}
+
 export function ServerScreen({
   accounts,
   activeAccountId,
@@ -84,11 +137,13 @@ export function ServerScreen({
   notes,
   conflicts,
   conflictLoading,
+  conflictProgress,
   onSaveAccount,
   onTestAccount,
   onTrustHost,
   onDismissTrust,
   onLoadFiles,
+  onDownload,
   onUpload,
   onRename,
   onDelete,
@@ -112,10 +167,25 @@ export function ServerScreen({
   const [secretInput, setSecretInput] = useState("");
   const [modsPath, setModsPath] = useState(editing?.modsPath ?? "");
   const [ue4ssPath, setUe4ssPath] = useState(editing?.ue4ssPath ?? "");
-  const [browsePath, setBrowsePath] = useState(active?.modsPath ?? "");
+  const [browsePath, setBrowsePath] = useState(() =>
+    active?.modsPath ? normalizeRemotePath(active.modsPath) : "",
+  );
+  const [pathInput, setPathInput] = useState(() =>
+    active?.modsPath ? normalizeRemotePath(active.modsPath) : "",
+  );
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
   const [layout, setLayout] = useState(readStoredServerLayout);
-  const [draggedPanel, setDraggedPanel] = useState<ServerPanelId | null>(null);
-  const [dropTarget, setDropTarget] = useState<ServerPanelId | null>(null);
+  const [layoutEditing, setLayoutEditing] = useState(false);
+  const [activePanel, setActivePanel] = useState<ServerPanelId>("viewer");
+  const [stageSize, setStageSize] = useState<ServerStageSize>({
+    width: 1200,
+    height: 700,
+  });
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const effectiveLayout = useMemo(
+    () => fitServerLayoutToStage(layout, stageSize),
+    [layout, stageSize],
+  );
 
   useEffect(() => {
     const source = accounts.find((account) => account.id === editingId) ?? null;
@@ -143,7 +213,10 @@ export function ServerScreen({
   }, [active?.id, connected, editingId]);
 
   useEffect(() => {
-    setBrowsePath(active?.modsPath ?? "");
+    const nextPath = active?.modsPath ? normalizeRemotePath(active.modsPath) : "";
+    setBrowsePath(nextPath);
+    setPathInput(nextPath);
+    setSelectedFilePath(null);
   }, [active?.id, active?.modsPath]);
 
   useEffect(() => {
@@ -151,8 +224,32 @@ export function ServerScreen({
     return () => window.clearTimeout(timer);
   }, [layout]);
 
+  useEffect(() => {
+    const node = stageRef.current;
+    if (!node) return;
+    const measure = () => {
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      setStageSize((current) =>
+        Math.abs(current.width - rect.width) < 0.5 &&
+        Math.abs(current.height - rect.height) < 0.5
+          ? current
+          : { width: rect.width, height: rect.height },
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
   useEffect(
-    () => () => document.body.classList.remove("is-resizing-server-panel"),
+    () => () => {
+      document.body.classList.remove(
+        "is-moving-server-panel",
+        "is-resizing-server-panel",
+      );
+    },
     [],
   );
 
@@ -186,52 +283,176 @@ export function ServerScreen({
     }
   }
 
-  function beginResize(panel: ServerPanelId, event: PointerEvent<HTMLButtonElement>) {
+  function startPanelMove(
+    panel: ServerPanelId,
+    event: PointerEvent<HTMLButtonElement>,
+  ) {
+    if (!layoutEditing || event.button !== 0) return;
+    const stage = stageRef.current;
+    if (!stage) return;
     event.preventDefault();
     event.stopPropagation();
+    setActivePanel(panel);
+    const bounds = stage.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return;
+    const startRect = effectiveLayout.rects[panel];
+    const startX = event.clientX;
     const startY = event.clientY;
-    const startHeight = layout.heights[panel];
     const onMove = (moveEvent: globalThis.PointerEvent) => {
+      const next = moveServerPanelRect(
+        panel,
+        startRect,
+        (moveEvent.clientX - startX) / bounds.width,
+        (moveEvent.clientY - startY) / bounds.height,
+        { width: bounds.width, height: bounds.height },
+      );
       setLayout((current) => ({
-        ...current,
-        heights: {
-          ...current.heights,
-          [panel]: clampServerPanelHeight(panel, startHeight + moveEvent.clientY - startY),
+        rects: {
+          ...current.rects,
+          [panel]: next,
         },
       }));
     };
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      document.body.classList.remove("is-moving-server-panel");
+    };
+    document.body.classList.add("is-moving-server-panel");
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  }
+
+  function startPanelResize(
+    panel: ServerPanelId,
+    event: PointerEvent<HTMLButtonElement>,
+  ) {
+    if (!layoutEditing || event.button !== 0) return;
+    const stage = stageRef.current;
+    if (!stage) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setActivePanel(panel);
+    const bounds = stage.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return;
+    const startRect = effectiveLayout.rects[panel];
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const onMove = (moveEvent: globalThis.PointerEvent) => {
+      const next = resizeServerPanelRect(
+        panel,
+        startRect,
+        (moveEvent.clientX - startX) / bounds.width,
+        (moveEvent.clientY - startY) / bounds.height,
+        { width: bounds.width, height: bounds.height },
+      );
+      setLayout((current) => ({
+        rects: {
+          ...current.rects,
+          [panel]: next,
+        },
+      }));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
       document.body.classList.remove("is-resizing-server-panel");
     };
     document.body.classList.add("is-resizing-server-panel");
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
   }
 
-  function handleDragStart(panel: ServerPanelId, event: DragEvent<HTMLButtonElement>) {
-    setDraggedPanel(panel);
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", panel);
-  }
-
-  function handleDrop(panel: ServerPanelId, event: DragEvent<HTMLElement>) {
+  function handlePanelKeyDown(
+    panel: ServerPanelId,
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+  ) {
+    if (!layoutEditing) return;
+    const step = event.shiftKey ? 0.05 : 0.01;
+    let deltaX = 0;
+    let deltaY = 0;
+    if (event.key === "ArrowLeft") deltaX = -step;
+    else if (event.key === "ArrowRight") deltaX = step;
+    else if (event.key === "ArrowUp") deltaY = -step;
+    else if (event.key === "ArrowDown") deltaY = step;
+    else return;
     event.preventDefault();
-    if (draggedPanel) {
-      setLayout((current) => ({
-        ...current,
-        order: moveServerPanel(current.order, draggedPanel, panel),
-      }));
-    }
-    setDraggedPanel(null);
-    setDropTarget(null);
+    setLayout((current) => ({
+      rects: {
+        ...current.rects,
+        [panel]: moveServerPanelRect(
+          panel,
+          effectiveLayout.rects[panel],
+          deltaX,
+          deltaY,
+          stageSize,
+        ),
+      },
+    }));
+  }
+
+  function handleResizeKeyDown(
+    panel: ServerPanelId,
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+  ) {
+    if (!layoutEditing) return;
+    const step = event.shiftKey ? 0.05 : 0.01;
+    let deltaW = 0;
+    let deltaH = 0;
+    if (event.key === "ArrowLeft") deltaW = -step;
+    else if (event.key === "ArrowRight") deltaW = step;
+    else if (event.key === "ArrowUp") deltaH = -step;
+    else if (event.key === "ArrowDown") deltaH = step;
+    else return;
+    event.preventDefault();
+    setLayout((current) => ({
+      rects: {
+        ...current.rects,
+        [panel]: resizeServerPanelRect(
+          panel,
+          effectiveLayout.rects[panel],
+          deltaW,
+          deltaH,
+          stageSize,
+        ),
+      },
+    }));
+  }
+
+  function resetLayout() {
+    setLayout(normalizeServerLayout(DEFAULT_SERVER_LAYOUT));
+    setActivePanel("viewer");
+  }
+
+  function navigateRemote(path: string) {
+    if (!active) return;
+    const target = normalizeRemotePath(
+      path.trim() || scan?.homePath || active.modsPath || "/",
+    );
+    setBrowsePath(target);
+    setPathInput(target);
+    setSelectedFilePath(null);
+    onLoadFiles(active.id, target);
   }
 
   const displayPath = browsePath || active?.modsPath || "";
-  const canGoBackToMods = Boolean(
-    active?.modsPath && displayPath && displayPath !== active.modsPath,
+  const breadcrumbs = remoteBreadcrumbs(displayPath);
+  const selectedFile = files.find((file) => file.path === selectedFilePath) ?? null;
+  const homePath = scan?.homePath || "/";
+  const canModifyDirectory = Boolean(
+    active &&
+      displayPath &&
+      ((active.modsPath && isRemotePathWithin(active.modsPath, displayPath)) ||
+        (active.ue4ssPath && isRemotePathWithin(active.ue4ssPath, displayPath))),
   );
+  const uploadKind: SftpUploadKind =
+    active?.ue4ssPath && isRemotePathWithin(active.ue4ssPath, displayPath)
+      ? "ue4ss"
+      : "pak";
 
   const accountPanel = (
     <form
@@ -481,10 +702,103 @@ export function ServerScreen({
 
   const filesPanel = (
     <section className="server-browser">
-      <div className="section-title">
+      <div className="section-title server-browser-title">
         <span>{t("server.remoteFiles")}</span>
-        <b title={displayPath || undefined}>{displayPath || t("server.modsNotLocated")}</b>
+        <b>{t("server.fileCount", { count: files.length })}</b>
       </div>
+      {active ? (
+        <div className="remote-browser-navigation">
+          <form
+            className="remote-path-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              navigateRemote(pathInput);
+            }}
+          >
+            <div className="remote-path-controls">
+              <button
+                type="button"
+                className="remote-path-icon"
+                aria-label={t("server.homeDirectory")}
+                title={t("server.homeDirectory")}
+                onClick={() => navigateRemote(homePath)}
+                disabled={loading}
+              >
+                <Icon name="folder" size={15} />
+              </button>
+              <button
+                type="button"
+                className="remote-path-icon"
+                aria-label={t("server.parentDirectory")}
+                title={t("server.parentDirectory")}
+                onClick={() => navigateRemote(remoteParent(displayPath))}
+                disabled={loading || displayPath === "/"}
+              >
+                <Icon name="chevronRight" size={14} className="is-reversed" />
+              </button>
+              <input
+                aria-label={t("server.remotePath")}
+                value={pathInput}
+                onChange={(event) => setPathInput(event.target.value)}
+                placeholder={t("server.pathPlaceholder")}
+                spellCheck={false}
+                disabled={loading}
+              />
+              <Button
+                type="submit"
+                size="sm"
+                icon="arrow"
+                disabled={loading || !pathInput.trim()}
+              >
+                {t("server.goToPath")}
+              </Button>
+            </div>
+          </form>
+          <nav className="remote-breadcrumbs" aria-label={t("server.breadcrumbs")}>
+            {breadcrumbs.map((crumb, index) => (
+              <span key={crumb.path}>
+                {index > 0 ? <i>/</i> : null}
+                <button
+                  type="button"
+                  onClick={() => navigateRemote(crumb.path)}
+                  disabled={loading}
+                  aria-current={index === breadcrumbs.length - 1 ? "page" : undefined}
+                >
+                  {crumb.name}
+                </button>
+              </span>
+            ))}
+          </nav>
+          <div className="remote-root-switches">
+            <button
+              type="button"
+              onClick={() => active.modsPath && navigateRemote(active.modsPath)}
+              disabled={loading || !active.modsPath}
+              className={
+                active.modsPath &&
+                displayPath === normalizeRemotePath(active.modsPath)
+                  ? "is-active"
+                  : ""
+              }
+            >
+              {t("server.pakRoot")}
+            </button>
+            <button
+              type="button"
+              onClick={() => active.ue4ssPath && navigateRemote(active.ue4ssPath)}
+              disabled={loading || !active.ue4ssPath}
+              className={
+                active.ue4ssPath &&
+                displayPath === normalizeRemotePath(active.ue4ssPath)
+                  ? "is-active"
+                  : ""
+              }
+            >
+              {t("server.ue4ssRoot")}
+            </button>
+          </div>
+        </div>
+      ) : null}
       {!active ? (
         <EmptyState
           icon="server"
@@ -505,17 +819,21 @@ export function ServerScreen({
       ) : files.length === 0 ? (
         <EmptyState
           icon="folder"
-          title={t("server.empty.noFilesTitle")}
-          description={t("server.empty.noFilesDescription")}
+          title={t(
+            scan
+              ? "server.emptyDirectoryTitle"
+              : "server.empty.noFilesTitle",
+          )}
+          description={t(
+            scan
+              ? "server.emptyDirectoryDescription"
+              : "server.empty.noFilesDescription",
+          )}
           action={
             <Button
               icon="refresh"
-              onClick={() => {
-                const path = active.modsPath;
-                setBrowsePath(path);
-                onLoadFiles(active.id, path);
-              }}
-              disabled={!active.modsPath || loading}
+              onClick={() => navigateRemote(displayPath || active.modsPath)}
+              disabled={loading}
             >
               {t("server.readDirectory")}
             </Button>
@@ -524,69 +842,122 @@ export function ServerScreen({
       ) : (
         <div className="remote-file-list">
           {files.map((file) => {
+            const extension = remoteFileExtension(file.name);
             const content = (
               <>
-                <span className={`file-symbol ${file.isDirectory ? "is-folder" : ""}`}>
-                  <Icon name={file.isDirectory ? "folder" : "box"} size={16} />
+                <span
+                  className={`file-symbol ${file.isDirectory ? "is-folder" : ""}`}
+                >
+                  <Icon name={remoteFileIcon(file)} size={16} />
                 </span>
                 <div>
                   <b>{file.name}</b>
                   <span>
-                    {file.isDirectory ? t("common.directory") : formatBytes(file.size)}
+                    {file.isDirectory
+                      ? t("common.directory")
+                      : extension
+                        ? `${extension.toUpperCase()} · ${formatBytes(file.size)}`
+                        : formatBytes(file.size)}
                   </span>
                 </div>
                 <span>{formatDate(file.modifiedAt, language)}</span>
               </>
             );
-            return file.isDirectory ? (
+            return (
               <button
                 type="button"
-                className="remote-file-row is-browsable"
+                className={[
+                  "remote-file-row",
+                  file.isDirectory ? "is-browsable" : "",
+                  selectedFilePath === file.path ? "is-selected" : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
                 key={file.path}
-                aria-label={`${t("server.openFolder")} ${file.name}`}
+                title={file.path}
+                aria-label={
+                  file.isDirectory
+                    ? `${t("server.openFolder")} ${file.name}`
+                    : file.name
+                }
                 onClick={() => {
-                  setBrowsePath(file.path);
-                  onLoadFiles(active.id, file.path);
+                  if (file.isDirectory) {
+                    navigateRemote(file.path);
+                  } else {
+                    setSelectedFilePath(file.path);
+                  }
                 }}
               >
                 {content}
               </button>
-            ) : (
-              <div className="remote-file-row" key={file.path}>
-                {content}
-              </div>
             );
           })}
         </div>
       )}
+      {selectedFile ? (
+        <div className="remote-file-selection" aria-live="polite">
+          <div>
+            <b>{selectedFile.name}</b>
+            <code>{selectedFile.path}</code>
+          </div>
+          <div className="remote-file-selection-actions">
+            <span>
+              {selectedFile.isDirectory
+                ? t("common.directory")
+                : formatBytes(selectedFile.size)}
+            </span>
+            {!selectedFile.isDirectory && active ? (
+              <Button
+                size="sm"
+                icon="download"
+                onClick={() =>
+                  void onDownload(active.id, selectedFile.path, selectedFile.name)
+                }
+                disabled={loading}
+              >
+                {t("server.downloadFile")}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {active && displayPath && !canModifyDirectory ? (
+        <p className="server-browser-readonly">{t("server.readOnlyDirectory")}</p>
+      ) : null}
       <div className="server-browser-actions">
-        {canGoBackToMods ? (
-          <Button
-            icon="chevronRight"
-            onClick={() => {
-              if (!active?.modsPath) return;
-              setBrowsePath(active.modsPath);
-              onLoadFiles(active.id, active.modsPath);
-            }}
-            disabled={loading}
-          >
-            {t("server.browseRoot")}
-          </Button>
-        ) : null}
+        <Button
+          icon="chevronRight"
+          className="is-reversed"
+          onClick={() => navigateRemote(remoteParent(displayPath))}
+          disabled={loading || displayPath === "/"}
+        >
+          {t("server.parentDirectory")}
+        </Button>
+        <Button
+          icon="folder"
+          onClick={() => navigateRemote(homePath)}
+          disabled={loading || displayPath === homePath}
+        >
+          {t("server.homeDirectory")}
+        </Button>
         <Button
           icon="refresh"
-          onClick={() => active && onLoadFiles(active.id, displayPath || active.modsPath)}
-          disabled={!active?.modsPath || loading}
+          onClick={() => navigateRemote(displayPath)}
+          disabled={!active || loading}
         >
           {t("server.refreshDirectory")}
         </Button>
-        <Button
-          icon="upload"
-          onClick={() => active && void onUpload(active.id, "pak")}
-          disabled={!active || loading}
-        >
-          {t("server.upload")}
-        </Button>
+        {canModifyDirectory ? (
+          <Button
+            icon="upload"
+            onClick={() => active && void onUpload(active.id, uploadKind)}
+            disabled={!active || loading}
+          >
+            {uploadKind === "ue4ss"
+              ? t("remoteViewer.uploadUe4ss")
+              : t("server.upload")}
+          </Button>
+        ) : null}
       </div>
     </section>
   );
@@ -599,6 +970,7 @@ export function ServerScreen({
           notes={notes}
           conflicts={conflicts}
           conflictLoading={conflictLoading}
+          progress={conflictProgress}
           loading={loading || conflictLoading}
           onUpload={(kind) => onUpload(active.id, kind)}
           onRename={(path, newName) => onRename(active.id, path, newName)}
@@ -644,97 +1016,99 @@ export function ServerScreen({
       <div className="server-workspace-toolbar">
         <div>
           <b>{t("serverLayout.title")}</b>
-          <span>{t("serverLayout.hint")}</span>
+          <span>
+            {t(layoutEditing ? "serverLayout.editing" : "serverLayout.locked")} ·{" "}
+            {t("serverLayout.hint")}
+          </span>
         </div>
-        <Button
-          size="sm"
-          icon="refresh"
-          onClick={() => setLayout({ ...DEFAULT_SERVER_LAYOUT, heights: { ...DEFAULT_SERVER_LAYOUT.heights } })}
-        >
-          {t("serverLayout.reset")}
-        </Button>
+        <div className="server-layout-actions">
+          <Button
+            size="sm"
+            icon={layoutEditing ? "check" : "edit"}
+            className={layoutEditing ? "is-active" : ""}
+            onClick={() => setLayoutEditing((current) => !current)}
+          >
+            {t(
+              layoutEditing
+                ? "serverLayout.finishEditing"
+                : "serverLayout.edit",
+            )}
+          </Button>
+          <Button size="sm" icon="refresh" onClick={resetLayout}>
+            {t("serverLayout.reset")}
+          </Button>
+        </div>
       </div>
 
-      <div className="server-panel-grid">
-        {layout.order.map((panel, index) => (
-          <article
-            key={panel}
-            className={[
-              "server-panel-slot",
-              `panel-${panel}`,
-              draggedPanel === panel ? "is-dragging" : "",
-              dropTarget === panel ? "is-drop-target" : "",
-            ]
-              .filter(Boolean)
-              .join(" ")}
-            style={{ height: `${layout.heights[panel]}px` }}
-            onDragOver={(event) => {
-              if (!draggedPanel || draggedPanel === panel) return;
-              event.preventDefault();
-              event.dataTransfer.dropEffect = "move";
-              setDropTarget(panel);
-            }}
-            onDragLeave={(event) => {
-              const related = event.relatedTarget;
-              if (!(related instanceof Node) || !event.currentTarget.contains(related)) {
-                setDropTarget((current) => (current === panel ? null : current));
-              }
-            }}
-            onDrop={(event) => handleDrop(panel, event)}
-          >
-            <header className="server-panel-bar">
-              <button
-                type="button"
-                className="server-panel-drag"
-                draggable
-                onDragStart={(event) => handleDragStart(panel, event)}
-                onDragEnd={() => {
-                  setDraggedPanel(null);
-                  setDropTarget(null);
-                }}
-                title={t("serverLayout.dragHint")}
-              >
-                <Icon name="drag" size={13} />
-                <span>{t(PANEL_LABEL_KEYS[panel])}</span>
-              </button>
-              <div className="server-panel-order">
+      <div
+        ref={stageRef}
+        className={`server-panel-stage ${layoutEditing ? "is-editing" : ""}`}
+      >
+        {SERVER_PANEL_ORDER.map((panel, index) => {
+          const rect = effectiveLayout.rects[panel];
+          return (
+            <article
+              key={panel}
+              className={[
+                "server-panel-slot",
+                `panel-${panel}`,
+                activePanel === panel ? "is-active" : "",
+                layoutEditing ? "is-editable" : "is-locked",
+              ].join(" ")}
+              style={{
+                left: `${rect.x * 100}%`,
+                top: `${rect.y * 100}%`,
+                width: `${rect.w * 100}%`,
+                height: `${rect.h * 100}%`,
+                zIndex: activePanel === panel ? 5 : index + 1,
+              }}
+              onPointerDownCapture={() => setActivePanel(panel)}
+            >
+              <header className="server-panel-bar">
+                {layoutEditing ? (
+                  <button
+                    type="button"
+                    className="server-panel-drag"
+                    title={`${t("serverLayout.dragHint")} · ${t(
+                      "serverLayout.keyboardHint",
+                    )}`}
+                    aria-label={`${t("serverLayout.dragHint")} ${t(
+                      PANEL_LABEL_KEYS[panel],
+                    )}`}
+                    onPointerDown={(event) => startPanelMove(panel, event)}
+                    onKeyDown={(event) => handlePanelKeyDown(panel, event)}
+                  >
+                    <Icon name="drag" size={13} />
+                    <span>{t(PANEL_LABEL_KEYS[panel])}</span>
+                  </button>
+                ) : (
+                  <div className="server-panel-drag is-locked">
+                    <span>{t(PANEL_LABEL_KEYS[panel])}</span>
+                  </div>
+                )}
+                {layoutEditing ? (
+                  <span className="server-panel-size">
+                    {Math.round(rect.w * 100)}% × {Math.round(rect.h * 100)}%
+                  </span>
+                ) : null}
+              </header>
+              <div className="server-panel-content">{panels[panel]}</div>
+              {layoutEditing ? (
                 <button
                   type="button"
-                  aria-label={t("serverLayout.moveEarlier")}
-                  onClick={() =>
-                    setLayout((current) => ({
-                      ...current,
-                      order: moveServerPanelBy(current.order, panel, -1),
-                    }))
-                  }
-                  disabled={index === 0}
+                  className="server-panel-resizer"
+                  aria-label={t("serverLayout.resizeHint", {
+                    panel: t(PANEL_LABEL_KEYS[panel]),
+                  })}
+                  onPointerDown={(event) => startPanelResize(panel, event)}
+                  onKeyDown={(event) => handleResizeKeyDown(panel, event)}
                 >
-                  <Icon name="chevronRight" size={12} className="is-reversed" />
+                  <span />
                 </button>
-                <button
-                  type="button"
-                  aria-label={t("serverLayout.moveLater")}
-                  onClick={() =>
-                    setLayout((current) => ({
-                      ...current,
-                      order: moveServerPanelBy(current.order, panel, 1),
-                    }))
-                  }
-                  disabled={index === layout.order.length - 1}
-                >
-                  <Icon name="chevronRight" size={12} />
-                </button>
-              </div>
-            </header>
-            <div className="server-panel-content">{panels[panel]}</div>
-            <button
-              type="button"
-              className="server-panel-resizer"
-              aria-label={t("serverLayout.resizeHint", { panel: t(PANEL_LABEL_KEYS[panel]) })}
-              onPointerDown={(event) => beginResize(panel, event)}
-            />
-          </article>
-        ))}
+              ) : null}
+            </article>
+          );
+        })}
       </div>
     </section>
   );

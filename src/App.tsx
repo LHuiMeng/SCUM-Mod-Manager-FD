@@ -3,6 +3,7 @@ import {
   api,
   chooseDirectory,
   chooseFiles,
+  chooseSavePath,
   chooseServerPakFiles,
   isTauri,
 } from "./api/tauri";
@@ -22,6 +23,7 @@ import type {
   RemoteMod,
   RuntimeLog,
   SftpAccount,
+  SftpConflictProgress,
   SftpConflictReport,
   SftpConnectionResult,
   SftpUploadKind,
@@ -107,6 +109,8 @@ function LocalizedApp() {
   const [remoteNotes, setRemoteNotes] = useState<Record<string, string>>({});
   const [remoteConflicts, setRemoteConflicts] = useState<SftpConflictReport | null>(null);
   const [remoteConflictLoading, setRemoteConflictLoading] = useState(false);
+  const [remoteConflictProgress, setRemoteConflictProgress] =
+    useState<SftpConflictProgress | null>(null);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [updatePhase, setUpdatePhase] = useState<AppUpdatePhase>("idle");
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
@@ -374,6 +378,27 @@ function LocalizedApp() {
         listen<AppUpdateProgress>("app-update-progress", (event) => {
           setUpdateProgress(event.payload);
           setUpdatePhase(event.payload.phase);
+        }),
+      )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<SftpConflictProgress>("sftp-conflict-progress", (event) => {
+          setRemoteConflictProgress(event.payload);
         }),
       )
       .then((stop) => {
@@ -1013,6 +1038,7 @@ function LocalizedApp() {
       setSftpScanAccountId(null);
       setRemoteNotes({});
       setRemoteConflicts(null);
+      setRemoteConflictProgress(null);
       setRemoteFiles([]);
       notify(t("toast.sftpSaved.title"), t("toast.sftpSaved.detail"), "success");
     } catch (error) {
@@ -1031,6 +1057,7 @@ function LocalizedApp() {
         setSftpScanAccountId(null);
         setRemoteNotes({});
         setRemoteConflicts(null);
+        setRemoteConflictProgress(null);
         setSftpTrustPrompt({
           accountId,
           fingerprint: result.hostKeyFingerprint,
@@ -1048,6 +1075,7 @@ function LocalizedApp() {
       setSftpScan(result);
       setSftpScanAccountId(accountId);
       setRemoteConflicts(null);
+      setRemoteConflictProgress(null);
       try {
         setRemoteNotes(await api.getSftpRemoteNotes(accountId));
       } catch {
@@ -1064,6 +1092,7 @@ function LocalizedApp() {
       setSftpScanAccountId(null);
       setRemoteNotes({});
       setRemoteConflicts(null);
+      setRemoteConflictProgress(null);
       setServerError(String(error));
       notify(t("toast.sftpFailed.title"), String(error), "error");
     } finally {
@@ -1093,6 +1122,25 @@ function LocalizedApp() {
       setRemoteFiles(await api.listRemoteFiles(path));
     } catch (error) {
       setServerError(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDownloadSftpFile(
+    accountId: string,
+    path: string,
+    name: string,
+  ) {
+    const localPath = await chooseSavePath(name);
+    if (!localPath) return;
+    setBusy(true);
+    try {
+      const result = await api.downloadSftpFile(accountId, path, localPath);
+      notify(t("toast.downloadDone.title"), result.message, "success");
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.downloadFailed.title"), String(error), "error");
     } finally {
       setBusy(false);
     }
@@ -1175,6 +1223,7 @@ function LocalizedApp() {
     if (busy || remoteConflictLoading) return;
     setBusy(true);
     setRemoteConflictLoading(true);
+    setRemoteConflictProgress(null);
     try {
       const report = await api.analyzeSftpConflicts(accountId);
       setRemoteConflicts(report);
@@ -1303,6 +1352,7 @@ function LocalizedApp() {
               notes={remoteNotes}
               conflicts={remoteConflicts}
               conflictLoading={remoteConflictLoading}
+              conflictProgress={remoteConflictProgress}
               onSaveAccount={(account, password) =>
                 void handleSaveSftpAccount(account, password)
               }
@@ -1310,6 +1360,7 @@ function LocalizedApp() {
               onTrustHost={() => void handleTrustSftpHost()}
               onDismissTrust={() => setSftpTrustPrompt(null)}
               onLoadFiles={(_id, path) => void handleLoadRemoteFiles(path)}
+              onDownload={handleDownloadSftpFile}
               onUpload={(id, kind) => handleUpload(id, kind)}
               onRename={handleRenameSftpEntry}
               onDelete={handleDeleteSftpEntry}

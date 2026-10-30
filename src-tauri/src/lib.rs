@@ -62,6 +62,7 @@ pub fn run() {
             commands::fetch_cloud_catalog,
             commands::download_remote_mod,
             commands::list_remote_files,
+            commands::download_sftp_file,
             commands::test_sftp_connection,
             commands::trust_sftp_host,
             commands::save_sftp_account,

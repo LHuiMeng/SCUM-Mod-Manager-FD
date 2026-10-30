@@ -435,6 +435,25 @@ pub async fn list_remote_files(app: AppHandle, path: String) -> Result<Vec<Remot
 }
 
 #[tauri::command]
+pub async fn download_sftp_file(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+    local_path: String,
+) -> Result<SftpOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::download_file(&state.paths, &settings, &account_id, &path, &local_path)?;
+        state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
 pub async fn test_sftp_connection(
     app: AppHandle,
     account_id: String,
@@ -584,10 +603,15 @@ pub async fn analyze_sftp_conflicts(
     app: AppHandle,
     account_id: String,
 ) -> Result<SftpConflictReport, String> {
+    let progress_app = app.clone();
+    let progress: sftp::SftpConflictProgressCallback = Arc::new(move |payload| {
+        let _ = progress_app.emit("sftp-conflict-progress", payload);
+    });
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
-        let result = sftp::analyze_remote_conflicts(&state.paths, &settings, &account_id)?;
+        let result =
+            sftp::analyze_remote_conflicts(&state.paths, &settings, &account_id, progress)?;
         state.log("info", "sftp", &result.message);
         Ok::<_, anyhow::Error>(result)
     })

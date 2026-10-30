@@ -67,6 +67,16 @@ export const api = {
   downloadRemoteMod: (id: string) => call<{ message: string }>("download_remote_mod", { id }),
   listRemoteFiles: (path: string) =>
     call<RemoteFile[]>("list_remote_files", { path }),
+  downloadSftpFile: (
+    accountId: string,
+    path: string,
+    localPath: string,
+  ) =>
+    call<SftpOperationResult>("download_sftp_file", {
+      accountId,
+      path,
+      localPath,
+    }),
   testSftpConnection: (accountId: string) =>
     call<SftpConnectionResult>("test_sftp_connection", { accountId }),
   trustSftpHost: (accountId: string, fingerprint: string) =>
@@ -132,4 +142,12 @@ export async function chooseDirectory(): Promise<string | null> {
   const { open } = await import("@tauri-apps/plugin-dialog");
   const selected = await open({ directory: true, multiple: false });
   return typeof selected === "string" ? selected : null;
+}
+
+export async function chooseSavePath(defaultName: string): Promise<string | null> {
+  if (!isTauri()) return null;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  return save({
+    defaultPath: defaultName,
+  });
 }

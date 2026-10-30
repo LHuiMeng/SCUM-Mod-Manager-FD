@@ -370,6 +370,8 @@ pub struct SftpConnectionResult {
     #[serde(default)]
     pub scanned_directories: usize,
     #[serde(default)]
+    pub home_path: Option<String>,
+    #[serde(default)]
     pub host_key_fingerprint: Option<String>,
     #[serde(default)]
     pub requires_trust: bool,
@@ -403,6 +405,19 @@ pub struct SftpConflictReport {
     pub groups: Vec<SftpConflictGroup>,
     pub analyzed_mods: usize,
     pub skipped_mods: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpConflictProgress {
+    pub phase: String,
+    pub completed_files: usize,
+    pub total_files: usize,
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_file: Option<String>,
     pub message: String,
 }
 

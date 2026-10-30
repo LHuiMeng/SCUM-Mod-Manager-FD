@@ -905,6 +905,183 @@ async function connect(url, appUrl) {
     return { rows: await evaluate("document.querySelectorAll('.remote-file-row').length") };
   });
 
+  await test("SFTP 路径导航、全类型文件与布局编辑", async () => {
+    const initial = await evaluate(`(() => ({
+      lockedPanels: document.querySelectorAll(".server-panel-drag.is-locked").length,
+      resizers: document.querySelectorAll(".server-panel-resizer").length,
+      path: document.querySelector(".remote-path-controls input")?.value ?? "",
+      files: [...document.querySelectorAll(".remote-file-row")]
+        .map(row => row.innerText)
+        .slice(0, 6),
+    }))()`);
+    if (initial.lockedPanels !== 3 || initial.resizers !== 0) {
+      throw new Error(`默认布局未锁定：${JSON.stringify(initial)}`);
+    }
+    if (!initial.path.includes("/~mods")) {
+      throw new Error(`初始远端路径异常：${initial.path}`);
+    }
+    if (!initial.files.some(text => text.includes("PAK"))) {
+      throw new Error(`文件树未展示 PAK 类型：${JSON.stringify(initial.files)}`);
+    }
+    await evaluate("document.querySelector('.remote-file-row:not(.is-browsable)')?.click()");
+    await waitFor("document.querySelector('.remote-file-selection') !== null");
+    const selectedFile = await evaluate(`(() => ({
+      text: document.querySelector(".remote-file-selection")?.innerText ?? "",
+      download: Boolean(document.querySelector(".remote-file-selection button")),
+    }))()`);
+    if (!selectedFile.download || !selectedFile.text.toLowerCase().includes(".pak")) {
+      throw new Error(`文件详情或下载入口缺失：${JSON.stringify(selectedFile)}`);
+    }
+
+    await clickText("上级目录");
+    await waitFor(
+      "document.querySelector('.remote-path-controls input')?.value === '/srv/scum/SCUM/Content/Paks'",
+    );
+    await waitFor(
+      "document.querySelector('.remote-root-switches button:not(:disabled)') !== null",
+    );
+    await clickText("PAK 根目录");
+    await waitFor(
+      "document.querySelector('.remote-path-controls input')?.value === '/srv/scum/SCUM/Content/Paks/~mods'",
+    );
+    await waitFor(
+      "document.querySelector('.remote-root-switches button:not(:disabled)') !== null",
+    );
+    await clickText("主目录");
+    await waitFor("document.body.innerText.includes('该目录位于模组根目录之外，仅可浏览')");
+    await waitFor(
+      "document.querySelector('.remote-root-switches button:not(:disabled)') !== null",
+    );
+    await clickText("PAK 根目录");
+    await waitFor(
+      "document.querySelector('.remote-path-controls input')?.value === '/srv/scum/SCUM/Content/Paks/~mods'",
+    );
+
+    await clickText("编辑布局");
+    await waitFor(
+      "document.querySelector('.server-panel-stage.is-editing') !== null && document.querySelectorAll('.server-panel-resizer').length === 3",
+    );
+    const beforeMove = await evaluate(`(() => {
+      const panel = document.querySelector(".panel-account");
+      const drag = panel.querySelector(".server-panel-drag");
+      const rect = panel.getBoundingClientRect();
+      const dragRect = drag.getBoundingClientRect();
+      window.__serverDrag = {
+        x: dragRect.left + dragRect.width / 2,
+        y: dragRect.top + dragRect.height / 2,
+      };
+      drag.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 71,
+        pointerType: "mouse",
+        isPrimary: true,
+        button: 0,
+        buttons: 1,
+        clientX: window.__serverDrag.x,
+        clientY: window.__serverDrag.y,
+      }));
+      return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    })()`);
+    await evaluate(`window.dispatchEvent(new PointerEvent("pointermove", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 71,
+      pointerType: "mouse",
+      isPrimary: true,
+      buttons: 1,
+      clientX: window.__serverDrag.x + 36,
+      clientY: window.__serverDrag.y + 24,
+    }))`);
+    await wait(90);
+    await evaluate(`window.dispatchEvent(new PointerEvent("pointerup", {
+      bubbles: true,
+      pointerId: 71,
+      pointerType: "mouse",
+      isPrimary: true,
+      button: 0,
+      buttons: 0,
+      clientX: window.__serverDrag.x + 36,
+      clientY: window.__serverDrag.y + 24,
+    }))`);
+    const afterMove = await evaluate(`(() => {
+      const rect = document.querySelector(".panel-account").getBoundingClientRect();
+      return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    })()`);
+    if (afterMove.left <= beforeMove.left + 4 || afterMove.top <= beforeMove.top + 4) {
+      throw new Error(`面板未跟随拖拽：${JSON.stringify({ beforeMove, afterMove })}`);
+    }
+
+    const resizeStart = await evaluate(`(() => {
+      const panel = document.querySelector(".panel-account");
+      const handle = panel.querySelector(".server-panel-resizer");
+      const rect = panel.getBoundingClientRect();
+      const handleRect = handle.getBoundingClientRect();
+      window.__serverResize = {
+        x: handleRect.left + handleRect.width / 2,
+        y: handleRect.top + handleRect.height / 2,
+      };
+      handle.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 72,
+        pointerType: "mouse",
+        isPrimary: true,
+        button: 0,
+        buttons: 1,
+        clientX: window.__serverResize.x,
+        clientY: window.__serverResize.y,
+      }));
+      return { width: rect.width, height: rect.height };
+    })()`);
+    await evaluate(`window.dispatchEvent(new PointerEvent("pointermove", {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 72,
+      pointerType: "mouse",
+      isPrimary: true,
+      buttons: 1,
+      clientX: window.__serverResize.x + 42,
+      clientY: window.__serverResize.y + 28,
+    }))`);
+    await wait(90);
+    await evaluate(`window.dispatchEvent(new PointerEvent("pointerup", {
+      bubbles: true,
+      pointerId: 72,
+      pointerType: "mouse",
+      isPrimary: true,
+      button: 0,
+      buttons: 0,
+      clientX: window.__serverResize.x + 42,
+      clientY: window.__serverResize.y + 28,
+    }))`);
+    const resizeEnd = await evaluate(`(() => {
+      const rect = document.querySelector(".panel-account").getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    })()`);
+    if (resizeEnd.width <= resizeStart.width + 8 || resizeEnd.height <= resizeStart.height + 8) {
+      throw new Error(`面板未跟随缩放：${JSON.stringify({ resizeStart, resizeEnd })}`);
+    }
+    screenshots.push(await screenshot("1440-light-server-layout-edit"));
+
+    await clickText("完成编辑");
+    await waitFor(
+      "document.querySelectorAll('.server-panel-resizer').length === 0 && document.querySelectorAll('.server-panel-drag.is-locked').length === 3",
+    );
+    await clickText("恢复布局");
+    await wait(120);
+    return {
+      initial,
+      beforeMove,
+      afterMove,
+      resizeStart,
+      resizeEnd,
+      lockedAfterFinish: await evaluate(
+        "document.querySelectorAll('.server-panel-drag.is-locked').length",
+      ),
+    };
+  });
+
   await test("日志刷新、筛选与清空", async () => {
     await navigate("日志");
     await waitFor("document.querySelectorAll('.log-line').length > 0", 10000);

@@ -166,6 +166,7 @@ export interface SftpConnectionResult {
   pakMods: RemoteFile[];
   ue4ssMods: RemoteFile[];
   scannedDirectories: number;
+  homePath?: string | null;
   hostKeyFingerprint: string | null;
   requiresTrust: boolean;
 }
@@ -192,6 +193,16 @@ export interface SftpConflictReport {
   groups: SftpConflictGroup[];
   analyzedMods: number;
   skippedMods: number;
+  message: string;
+}
+
+export interface SftpConflictProgress {
+  phase: "preparing" | "downloading" | "parsing" | "completed" | "error";
+  completedFiles: number;
+  totalFiles: number;
+  completedBytes: number;
+  totalBytes: number;
+  currentFile?: string | null;
   message: string;
 }
 
