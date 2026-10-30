@@ -442,17 +442,29 @@ pub async fn test_sftp_connection(
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
         let result = sftp::test_connection(&state.paths, &settings, &account_id)?;
-        if let Some(path) = &result.detected_mods_path {
-            let mut current = state.settings.lock().unwrap();
-            if let Some(account) = current
-                .sftp_accounts
-                .iter_mut()
-                .find(|account| account.id == account_id)
-            {
-                if account.mods_path.trim().is_empty() {
-                    account.mods_path = path.clone();
-                    crate::config::save_settings(&state.paths, &current)?;
+        let detected_pak = result.detected_mods_path.clone();
+        let detected_ue4ss = result.detected_ue4ss_path.clone();
+        let mut current = state.settings.lock().unwrap();
+        if let Some(account) = current
+            .sftp_accounts
+            .iter_mut()
+            .find(|account| account.id == account_id)
+        {
+            let mut changed = false;
+            if let Some(path) = detected_pak {
+                if account.mods_path != path {
+                    account.mods_path = path;
+                    changed = true;
                 }
+            }
+            if let Some(path) = detected_ue4ss {
+                if account.ue4ss_path != path {
+                    account.ue4ss_path = path;
+                    changed = true;
+                }
+            }
+            if changed {
+                crate::config::save_settings(&state.paths, &current)?;
             }
         }
         state.log("info", "sftp", &result.message);

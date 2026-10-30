@@ -20,6 +20,10 @@ interface CloudScreenProps {
   loading: boolean;
   downloads: Record<string, CloudDownloadProgress>;
   error: string | null;
+  loaded: boolean;
+  attempt: number;
+  autoAttempts: number;
+  manualOnly: boolean;
   configured: boolean;
   edition: AppEdition;
   maxSegments: number;
@@ -33,6 +37,10 @@ export function CloudScreen({
   loading,
   downloads,
   error,
+  loaded,
+  attempt,
+  autoAttempts,
+  manualOnly,
   configured,
   edition,
   maxSegments,
@@ -53,6 +61,16 @@ export function CloudScreen({
     () => mods.filter((mod) => mod.installed).length,
     [mods],
   );
+  const refreshLabel = loading
+    ? t(attempt > 0 ? "cloud.loadingAttempt" : "cloud.loading", {
+        attempt,
+        total: autoAttempts,
+      })
+    : manualOnly
+      ? t("cloud.manualRetry")
+      : loaded
+        ? t("cloud.refresh")
+        : t("cloud.fetch");
   return (
     <section className="page page-cloud">
       <header className="page-header">
@@ -71,7 +89,7 @@ export function CloudScreen({
             onClick={onRefresh}
             disabled={loading}
           >
-            {loading ? t("cloud.loading") : t("cloud.refresh")}
+            {refreshLabel}
           </Button>
           <Button icon="settings" onClick={onOpenSettings}>
             {t("cloud.settings")}
@@ -95,7 +113,11 @@ export function CloudScreen({
             )}
           </span>
         </div>
-        {configured && !error && mods.length > 0 ? (
+        {manualOnly ? (
+          <span className="cloud-manual-state">
+            {t("cloud.manualState", { attempts: autoAttempts })}
+          </span>
+        ) : configured && !error && mods.length > 0 ? (
           <span className="cloud-edition-meta">
             {t("cloud.meta.count", { count: mods.length })}
             {installedCount > 0
@@ -120,8 +142,28 @@ export function CloudScreen({
         <EmptyState
           icon="cloud"
           title={t("cloud.empty.unreachableTitle")}
-          description={error}
-          action={<Button onClick={onRefresh}>{t("common.retry")}</Button>}
+          description={
+            manualOnly
+              ? `${error} ${t("cloud.manualOnlyHint", { attempts: autoAttempts })}`
+              : error
+          }
+          action={<Button onClick={onRefresh}>{t("cloud.manualRetry")}</Button>}
+        />
+      ) : !loaded && loading ? (
+        <EmptyState
+          icon="cloud"
+          title={t("cloud.fetchingTitle")}
+          description={t("cloud.loadingAttempt", {
+            attempt: Math.max(attempt, 1),
+            total: autoAttempts,
+          })}
+        />
+      ) : !loaded ? (
+        <EmptyState
+          icon="cloud"
+          title={t("cloud.notLoadedTitle")}
+          description={t("cloud.notLoadedDescription")}
+          action={<Button onClick={onRefresh}>{t("cloud.fetch")}</Button>}
         />
       ) : filtered.length === 0 && !loading ? (
         <EmptyState

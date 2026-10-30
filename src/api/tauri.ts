@@ -69,7 +69,14 @@ export const api = {
   trustSftpHost: (accountId: string, fingerprint: string) =>
     call<SftpConnectionResult>("trust_sftp_host", { accountId, fingerprint }),
   saveSftpAccount: (
-    account: { name: string; host: string; port: number; username: string; modsPath: string },
+    account: {
+      name: string;
+      host: string;
+      port: number;
+      username: string;
+      modsPath: string;
+      ue4ssPath: string;
+    },
     password: string,
   ) => call<LibrarySnapshot>("save_sftp_account", { account, password }),
   uploadServerMods: (accountId: string, paths: string[]) =>

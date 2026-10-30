@@ -16,6 +16,7 @@ import type {
   RemoteMod,
   RuntimeLog,
   SftpAccount,
+  SftpConnectionResult,
   ThemeMode,
   ToastMessage,
 } from "./types";
@@ -31,6 +32,7 @@ import {
 } from "./i18n";
 import { resolveFileDrop } from "./lib/fileDrop";
 import { cloudDownloadIsActive } from "./lib/cloudDownload";
+import { CLOUD_AUTO_ATTEMPTS, runCloudCatalogAttempts } from "./lib/cloudCatalog";
 import { AppShell } from "./components/shell/AppShell";
 import { LibraryScreen } from "./components/library/LibraryScreen";
 import { ImportConflictDialog } from "./components/library/ImportConflictDialog";
@@ -83,6 +85,8 @@ function LocalizedApp() {
   const [cloudLoading, setCloudLoading] = useState(false);
   const [cloudError, setCloudError] = useState<string | null>(null);
   const [cloudLoaded, setCloudLoaded] = useState(false);
+  const [cloudAttempt, setCloudAttempt] = useState(0);
+  const [cloudManualOnly, setCloudManualOnly] = useState(false);
   const [cloudDownloads, setCloudDownloads] = useState<
     Record<string, CloudDownloadProgress>
   >({});
@@ -90,6 +94,8 @@ function LocalizedApp() {
   const [remoteFiles, setRemoteFiles] = useState<RemoteFile[]>([]);
   const [serverError, setServerError] = useState<string | null>(null);
   const [sftpTrustPrompt, setSftpTrustPrompt] = useState<SftpTrustPrompt | null>(null);
+  const [sftpScan, setSftpScan] = useState<SftpConnectionResult | null>(null);
+  const [sftpScanAccountId, setSftpScanAccountId] = useState<string | null>(null);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [updatePhase, setUpdatePhase] = useState<AppUpdatePhase>("idle");
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
@@ -105,9 +111,14 @@ function LocalizedApp() {
   const launchSettingsQueue = useRef<Promise<void>>(Promise.resolve());
   const toggleRevisions = useRef(new Map<string, number>());
   const activeCloudDownloads = useRef(new Set<string>());
+  const snapshotRef = useRef<LibrarySnapshot | null>(null);
+  const cloudRequestActive = useRef(false);
+  const cloudAutoStartedFor = useRef("");
+  const cloudSourcesRevision = useRef(0);
   const localeRequest = useRef(0);
   const languageSaveRevision = useRef(0);
   const languageSaveQueue = useRef<Promise<void>>(Promise.resolve());
+  snapshotRef.current = snapshot;
 
   const t = useCallback<Translator>(
     (key, variables) => translate(language, localeMessages, key, variables),
@@ -558,39 +569,76 @@ function LocalizedApp() {
   // 云源线路一改，上一份目录就不再是"当前目录"：清空它，避免旧条数继续挂在横幅上。
   const cloudSourcesKey = snapshot?.settings.cloud.baseUrls.join("\n") ?? "";
   useEffect(() => {
+    cloudSourcesRevision.current += 1;
+    cloudAutoStartedFor.current = "";
     setCloudMods([]);
     setCloudLoaded(false);
     setCloudError(null);
+    setCloudAttempt(0);
+    setCloudManualOnly(false);
   }, [cloudSourcesKey]);
 
-  const refreshCloud = useCallback(
-    async (force = false) => {
-      if (!snapshot) return;
-      if (snapshot.settings.cloud.baseUrls.length === 0) {
-        setCloudMods([]);
-        setCloudError(null);
-        setCloudLoaded(true);
-        return;
-      }
-      if (cloudLoading || (cloudLoaded && !force)) return;
-      setCloudLoading(true);
+  const loadCloudCatalog = useCallback(async (mode: "auto" | "manual") => {
+    const current = snapshotRef.current;
+    if (!current || cloudRequestActive.current) return;
+    if (current.settings.cloud.baseUrls.length === 0) {
+      setCloudMods([]);
       setCloudError(null);
-      try {
-        const mods = await api.fetchCloudCatalog();
-        setCloudMods(mods);
-        setCloudLoaded(true);
-      } catch (error) {
-        setCloudError(String(error));
-      } finally {
-        setCloudLoading(false);
-      }
-    },
-    [cloudLoaded, cloudLoading, snapshot],
-  );
+      setCloudLoaded(true);
+      setCloudManualOnly(false);
+      return;
+    }
 
+    const revision = cloudSourcesRevision.current;
+    cloudRequestActive.current = true;
+    setCloudLoading(true);
+    setCloudError(null);
+    setCloudAttempt(0);
+    if (mode === "auto") setCloudManualOnly(false);
+    try {
+      const outcome = await runCloudCatalogAttempts(() => api.fetchCloudCatalog(), {
+        maxAttempts: mode === "auto" ? CLOUD_AUTO_ATTEMPTS : 1,
+        onAttempt: (attempt) => {
+          if (revision === cloudSourcesRevision.current) setCloudAttempt(attempt);
+        },
+      });
+      if (revision !== cloudSourcesRevision.current) return;
+      setCloudMods(outcome.result);
+      setCloudLoaded(true);
+      setCloudManualOnly(false);
+    } catch (error) {
+      if (revision !== cloudSourcesRevision.current) return;
+      setCloudError(String(error));
+      setCloudManualOnly(true);
+    } finally {
+      cloudRequestActive.current = false;
+      setCloudLoading(false);
+    }
+  }, []);
+
+  // 首次进入云端页自动尝试 4 次；失败后只接受用户手动重试，避免循环请求。
   useEffect(() => {
-    if (section === "cloud") void refreshCloud();
-  }, [refreshCloud, section]);
+    if (section !== "cloud" || !snapshot) return;
+    if (snapshot.settings.cloud.baseUrls.length === 0) {
+      setCloudMods([]);
+      setCloudError(null);
+      setCloudLoaded(true);
+      setCloudManualOnly(false);
+      return;
+    }
+    if (cloudLoading || cloudLoaded || cloudManualOnly) return;
+    if (cloudAutoStartedFor.current === cloudSourcesKey) return;
+    cloudAutoStartedFor.current = cloudSourcesKey;
+    void loadCloudCatalog("auto");
+  }, [
+    cloudLoaded,
+    cloudLoading,
+    cloudManualOnly,
+    cloudSourcesKey,
+    loadCloudCatalog,
+    section,
+    snapshot,
+  ]);
 
   function changeTheme(nextTheme: ThemeMode) {
     setThemeState(nextTheme);
@@ -950,6 +998,9 @@ function LocalizedApp() {
       const next = await api.saveSftpAccount(account, password);
       setSnapshot(next);
       setSftpTrustPrompt(null);
+      setSftpScan(null);
+      setSftpScanAccountId(null);
+      setRemoteFiles([]);
       notify(t("toast.sftpSaved.title"), t("toast.sftpSaved.detail"), "success");
     } catch (error) {
       setServerError(String(error));
@@ -959,9 +1010,12 @@ function LocalizedApp() {
 
   async function handleTestSftp(accountId: string) {
     setServerError(null);
+    setBusy(true);
     try {
       const result = await api.testSftpConnection(accountId);
       if (result.requiresTrust && result.hostKeyFingerprint) {
+        setSftpScan(null);
+        setSftpScanAccountId(null);
         setSftpTrustPrompt({
           accountId,
           fingerprint: result.hostKeyFingerprint,
@@ -975,13 +1029,22 @@ function LocalizedApp() {
       }
       setSftpTrustPrompt(null);
       if (!result.ok) throw new Error(result.message);
+      setSnapshot(await api.getSnapshot());
+      setSftpScan(result);
+      setSftpScanAccountId(accountId);
       notify(t("toast.connectionDone.title"), result.message, "success");
       if (result.detectedModsPath) {
         await handleLoadRemoteFiles(result.detectedModsPath);
+      } else {
+        setRemoteFiles([]);
       }
     } catch (error) {
+      setSftpScan(null);
+      setSftpScanAccountId(null);
       setServerError(String(error));
       notify(t("toast.sftpFailed.title"), String(error), "error");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -1118,10 +1181,14 @@ function LocalizedApp() {
               loading={cloudLoading}
               downloads={cloudDownloads}
               error={cloudError}
+              loaded={cloudLoaded}
+              attempt={cloudAttempt}
+              autoAttempts={CLOUD_AUTO_ATTEMPTS}
+              manualOnly={cloudManualOnly}
               configured={snapshot.settings.cloud.baseUrls.length > 0}
               edition={appInfo?.edition ?? "public"}
               maxSegments={snapshot.settings.cloud.maxDownloadSegments}
-              onRefresh={() => void refreshCloud(true)}
+              onRefresh={() => void loadCloudCatalog("manual")}
               onDownload={(id) => void handleDownloadRemoteMod(id)}
               onOpenSettings={() => setSection("settings")}
             />
@@ -1134,6 +1201,8 @@ function LocalizedApp() {
               loading={busy}
               error={serverError}
               trustPrompt={sftpTrustPrompt}
+              scan={sftpScanAccountId === snapshot.settings.activeSftpAccountId ? sftpScan : null}
+              connectedAccountId={sftpScanAccountId}
               onSaveAccount={(account, password) =>
                 void handleSaveSftpAccount(account, password)
               }

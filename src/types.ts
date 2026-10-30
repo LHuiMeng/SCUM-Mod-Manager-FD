@@ -74,6 +74,7 @@ export interface SftpAccount {
   port: number;
   username: string;
   modsPath: string;
+  ue4ssPath: string;
   hasPassword: boolean;
 }
 
@@ -161,6 +162,10 @@ export interface SftpConnectionResult {
   ok: boolean;
   message: string;
   detectedModsPath?: string | null;
+  detectedUe4ssPath?: string | null;
+  pakMods: RemoteFile[];
+  ue4ssMods: RemoteFile[];
+  scannedDirectories: number;
   hostKeyFingerprint: string | null;
   requiresTrust: boolean;
 }

@@ -1742,6 +1742,15 @@ body.is-row-dragging {
   white-space: nowrap;
 }
 
+.cloud-manual-state {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--warn);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  white-space: nowrap;
+}
+
 .empty-state {
   min-height: 260px;
   display: flex;
@@ -1991,6 +2000,12 @@ body.is-row-dragging {
 }
 
 /* Server */
+.server-workspace {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
 .server-layout {
   display: grid;
   grid-template-columns: minmax(360px, 0.86fr) minmax(420px, 1.14fr);
@@ -2007,6 +2022,90 @@ body.is-row-dragging {
 
 .server-form {
   padding: 18px;
+}
+
+.server-form.is-collapsed {
+  align-self: start;
+}
+
+.server-form-title > div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.server-form-title b {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sftp-connection-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--good);
+  white-space: nowrap;
+}
+
+.sftp-connection-state i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--good);
+  box-shadow: 0 0 0 3px var(--good-soft);
+}
+
+.sftp-account-summary {
+  display: grid;
+  gap: 15px;
+  margin-top: 15px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+
+.sftp-account-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sftp-account-summary b {
+  font-size: var(--type-body-strong);
+  font-weight: 600;
+}
+
+.sftp-account-summary span,
+.sftp-account-summary dd {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-meta);
+}
+
+.sftp-account-summary dl {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+}
+
+.sftp-account-summary dl > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.sftp-account-summary dt {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+
+.sftp-account-summary dd {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .server-browser {
@@ -2033,6 +2132,68 @@ body.is-row-dragging {
   color: var(--ink);
   background: var(--paper-hi);
   font-size: var(--type-body);
+}
+
+.sftp-url-import {
+  margin-top: 15px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 5%, var(--paper-hi));
+}
+
+.sftp-url-import label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.sftp-url-import label > span {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink);
+  font-size: var(--type-label);
+}
+
+.sftp-url-import label small {
+  color: var(--muted);
+  font-size: var(--type-micro);
+  font-weight: 400;
+}
+
+.sftp-url-import label > div {
+  display: flex;
+  gap: 8px;
+}
+
+.sftp-url-import input {
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: var(--paper-hi);
+  font-family: var(--mono);
+  font-size: var(--type-meta);
+}
+
+.sftp-url-import input:focus {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.sftp-import-message {
+  margin: 8px 0 0;
+  color: var(--good);
+  font-size: var(--type-meta);
+}
+
+.sftp-import-message.is-error {
+  color: var(--danger);
 }
 
 .form-grid {
@@ -2144,12 +2305,26 @@ body.is-row-dragging {
 }
 
 .remote-file-row {
+  width: 100%;
   display: grid;
   grid-template-columns: 32px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   min-height: 56px;
+  padding: 0;
+  border: 0;
   border-bottom: 1px solid var(--line);
+  color: inherit;
+  background: transparent;
+  text-align: left;
+}
+
+.remote-file-row.is-browsable {
+  cursor: pointer;
+}
+
+.remote-file-row.is-browsable:hover {
+  background: var(--soft-fill-hover);
 }
 
 .file-symbol {
@@ -2188,6 +2363,108 @@ body.is-row-dragging {
   margin-top: auto;
   padding-top: 15px;
   border-top: 1px solid var(--line);
+}
+
+.server-mod-scan {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--soft-fill);
+}
+
+.server-mod-scan > .section-title b {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.server-scan-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 13px;
+}
+
+.server-scan-group {
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper-hi);
+}
+
+.server-scan-group > header {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.server-scan-group > header > div {
+  min-width: 0;
+}
+
+.server-scan-group > header b {
+  display: block;
+  font-size: var(--type-body);
+  font-weight: 600;
+}
+
+.server-scan-group > header code {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-scan-group > header > span:last-child {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  white-space: nowrap;
+}
+
+.server-scan-list {
+  max-height: 172px;
+  margin-top: 11px;
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+
+.server-scan-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.server-scan-row span {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--type-body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-scan-row small {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+
+.server-scan-empty {
+  margin: 11px 0 0;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: var(--type-meta);
 }
 
 /* Logs */
@@ -3158,6 +3435,11 @@ body.is-row-dragging {
     grid-template-columns: 1fr;
   }
 
+  .server-form-title > div {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
   .update-overview {
     align-items: flex-start;
   }
@@ -3218,6 +3500,16 @@ body.is-row-dragging {
   .page-header .heading-tools {
     width: 100%;
     justify-content: flex-end;
+  }
+
+  .server-scan-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .sftp-url-import label > span {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
   }
 }
 

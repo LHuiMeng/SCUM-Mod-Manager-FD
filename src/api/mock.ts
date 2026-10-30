@@ -396,6 +396,23 @@ const remoteFiles: RemoteFile[] = [
   { name: "LootBalance_Plus.pak", path: "/srv/scum/SCUM/Content/Paks/~mods/LootBalance_Plus.pak", isDirectory: false, size: 13421772, modifiedAt: new Date(now - 4 * 86400000).toISOString() },
 ];
 
+const remoteUe4ssMods: RemoteFile[] = [
+  {
+    name: "BPModLoaderMod",
+    path: "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/BPModLoaderMod",
+    isDirectory: true,
+    size: 0,
+    modifiedAt: new Date(now - 3 * 86400000).toISOString(),
+  },
+  {
+    name: "SCUMTweaks",
+    path: "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/SCUMTweaks",
+    isDirectory: true,
+    size: 0,
+    modifiedAt: new Date(now - 5 * 86400000).toISOString(),
+  },
+];
+
 export function mockSnapshot(): LibrarySnapshot {
   recomputeMockConflicts();
   return structuredClone({
@@ -573,6 +590,12 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         ok: true,
         message: "连接成功（演示环境）",
         detectedModsPath: "/srv/scum/SCUM/Content/Paks/~mods",
+        detectedUe4ssPath: "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods",
+        pakMods: structuredClone(
+          remoteFiles.filter((file) => !file.isDirectory && file.name.endsWith(".pak")),
+        ),
+        ue4ssMods: structuredClone(remoteUe4ssMods),
+        scannedDirectories: 9,
         hostKeyFingerprint: "SHA256:demo-fingerprint",
         requiresTrust: false,
       } as T;
@@ -581,12 +604,23 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         ok: true,
         message: "已信任服务器主机密钥（演示环境）",
         detectedModsPath: null,
+        detectedUe4ssPath: null,
+        pakMods: [],
+        ue4ssMods: [],
+        scannedDirectories: 0,
         hostKeyFingerprint: String(args?.fingerprint ?? "SHA256:demo-fingerprint"),
         requiresTrust: false,
       } as T;
     case "save_sftp_account": {
       const account = args?.account as
-        | { name: string; host: string; port: number; username: string; modsPath: string }
+        | {
+            name: string;
+            host: string;
+            port: number;
+            username: string;
+            modsPath: string;
+            ue4ssPath: string;
+          }
         | undefined;
       if (!account) throw new Error("Missing account");
       const existing = settings.sftpAccounts.find((item) => item.name === account.name);

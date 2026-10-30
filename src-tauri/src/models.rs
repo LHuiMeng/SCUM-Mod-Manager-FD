@@ -87,6 +87,8 @@ pub struct SftpAccount {
     pub username: String,
     #[serde(alias = "modsPath", alias = "mods_path")]
     pub mods_path: String,
+    #[serde(default)]
+    pub ue4ss_path: String,
     #[serde(alias = "hasPassword", alias = "has_password")]
     pub has_password: bool,
 }
@@ -100,6 +102,7 @@ impl Default for SftpAccount {
             port: 22,
             username: String::new(),
             mods_path: String::new(),
+            ue4ss_path: String::new(),
             has_password: false,
         }
     }
@@ -348,6 +351,8 @@ pub struct SftpAccountInput {
     pub port: u16,
     pub username: String,
     pub mods_path: String,
+    #[serde(default)]
+    pub ue4ss_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +361,14 @@ pub struct SftpConnectionResult {
     pub ok: bool,
     pub message: String,
     pub detected_mods_path: Option<String>,
+    #[serde(default)]
+    pub detected_ue4ss_path: Option<String>,
+    #[serde(default)]
+    pub pak_mods: Vec<RemoteFile>,
+    #[serde(default)]
+    pub ue4ss_mods: Vec<RemoteFile>,
+    #[serde(default)]
+    pub scanned_directories: usize,
     #[serde(default)]
     pub host_key_fingerprint: Option<String>,
     #[serde(default)]

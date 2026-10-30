@@ -456,6 +456,7 @@ impl AppState {
             port: input.port.max(1),
             username: input.username.trim().to_string(),
             mods_path: input.mods_path.trim().to_string(),
+            ue4ss_path: input.ue4ss_path.trim().to_string(),
             has_password,
         };
         if let Some(index) = existing_index {
