@@ -167,6 +167,7 @@ export interface SftpConnectionResult {
   ue4ssMods: RemoteFile[];
   scannedDirectories: number;
   homePath?: string | null;
+  managedManifest?: SftpManagedManifest | null;
   hostKeyFingerprint: string | null;
   requiresTrust: boolean;
 }
@@ -204,6 +205,42 @@ export interface SftpConflictProgress {
   totalBytes: number;
   currentFile?: string | null;
   message: string;
+}
+
+export interface SftpManagedSource {
+  name: string;
+  path: string;
+}
+
+export interface SftpManagedBackup {
+  name: string;
+  originalPath: string;
+  backupPath: string;
+  reason: string;
+}
+
+export interface SftpManagedRename {
+  name: string;
+  originalPath: string;
+  deployedPath: string;
+  hasSignature: boolean;
+}
+
+export interface SftpManagedManifest {
+  version: number;
+  createdAt: string;
+  mergedPath?: string | null;
+  mergedName?: string | null;
+  sources: SftpManagedSource[];
+  backups: SftpManagedBackup[];
+  renames: SftpManagedRename[];
+  createdPaths: string[];
+  winners: Record<string, string>;
+}
+
+export interface SftpApplyResult {
+  message: string;
+  manifest: SftpManagedManifest;
 }
 
 export interface ImportResult {

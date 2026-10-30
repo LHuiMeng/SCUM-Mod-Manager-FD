@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   chooseDirectory,
@@ -23,9 +23,11 @@ import type {
   RemoteMod,
   RuntimeLog,
   SftpAccount,
+  SftpApplyResult,
   SftpConflictProgress,
   SftpConflictReport,
   SftpConnectionResult,
+  SftpManagedManifest,
   SftpUploadKind,
   ThemeMode,
   ToastMessage,
@@ -43,8 +45,19 @@ import {
 import { resolveFileDrop } from "./lib/fileDrop";
 import { cloudDownloadIsActive } from "./lib/cloudDownload";
 import { CLOUD_AUTO_ATTEMPTS, runCloudCatalogAttempts } from "./lib/cloudCatalog";
+import {
+  buildServerLibrarySnapshot,
+  normalizeServerLibraryState,
+  readStoredServerLibraryState,
+  serverLibraryDisabledPaths,
+  storeServerLibraryState,
+  type ServerLibraryState,
+} from "./lib/serverLibrary";
 import { AppShell } from "./components/shell/AppShell";
-import { LibraryScreen } from "./components/library/LibraryScreen";
+import {
+  LibraryScreen,
+  type ServerLibraryView,
+} from "./components/library/LibraryScreen";
 import { ImportConflictDialog } from "./components/library/ImportConflictDialog";
 import { CloudScreen } from "./components/cloud/CloudScreen";
 import { ServerScreen } from "./components/server/ServerScreen";
@@ -111,6 +124,9 @@ function LocalizedApp() {
   const [remoteConflictLoading, setRemoteConflictLoading] = useState(false);
   const [remoteConflictProgress, setRemoteConflictProgress] =
     useState<SftpConflictProgress | null>(null);
+  const [libraryMode, setLibraryMode] = useState<"local" | "server">("local");
+  const [serverLibraryState, setServerLibraryState] =
+    useState<ServerLibraryState | null>(null);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [updatePhase, setUpdatePhase] = useState<AppUpdatePhase>("idle");
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
@@ -150,6 +166,49 @@ function LocalizedApp() {
     },
     [],
   );
+
+  const activeServerAccountId =
+    snapshot?.settings.activeSftpAccountId &&
+    sftpScanAccountId === snapshot.settings.activeSftpAccountId
+      ? sftpScanAccountId
+      : null;
+  const serverLibraryView = useMemo(() => {
+    if (!snapshot || !sftpScan || !remoteConflicts || !activeServerAccountId) {
+      return null;
+    }
+    const state = normalizeServerLibraryState(
+      serverLibraryState ?? readStoredServerLibraryState(activeServerAccountId, sftpScan),
+      sftpScan,
+    );
+    const built = buildServerLibrarySnapshot({
+      base: snapshot,
+      scan: sftpScan,
+      report: remoteConflicts,
+      state,
+      manifest: sftpScan.managedManifest ?? null,
+      labels: {
+        mergedName: t("serverLibrary.mergedName"),
+        mergedTag: t("serverLibrary.mergedTag"),
+        mergedDescription: (sources) =>
+          t("serverLibrary.mergedDescription", {
+            sources: sources.join("、"),
+          }),
+      },
+    });
+    return {
+      ...built,
+      accountId: activeServerAccountId,
+      available: true,
+      manifest: (sftpScan.managedManifest ?? null) as SftpManagedManifest | null,
+    };
+  }, [
+    activeServerAccountId,
+    remoteConflicts,
+    serverLibraryState,
+    sftpScan,
+    snapshot,
+    t,
+  ]);
 
   const completeImport = useCallback(
     async (paths: string[], replaceExisting: boolean) => {
@@ -390,6 +449,23 @@ function LocalizedApp() {
       unlisten?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (!activeServerAccountId || !sftpScan) {
+      setServerLibraryState(null);
+      setLibraryMode("local");
+      return;
+    }
+    setServerLibraryState(
+      readStoredServerLibraryState(activeServerAccountId, sftpScan),
+    );
+  }, [activeServerAccountId, sftpScan]);
+
+  useEffect(() => {
+    if (libraryMode === "server" && !serverLibraryView) {
+      setLibraryMode("local");
+    }
+  }, [libraryMode, serverLibraryView]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -1241,6 +1317,127 @@ function LocalizedApp() {
     }
   }
 
+  function commitServerLibraryState(next: ServerLibraryState) {
+    if (!activeServerAccountId || !sftpScan) return;
+    const normalized = normalizeServerLibraryState(next, sftpScan);
+    setServerLibraryState(normalized);
+    storeServerLibraryState(activeServerAccountId, normalized, sftpScan);
+  }
+
+  function handleServerLibraryToggle(id: string, enabled: boolean) {
+    const state = serverLibraryView?.state;
+    if (!state || serverLibraryView?.manifest) return;
+    commitServerLibraryState({
+      ...state,
+      enabled: { ...state.enabled, [id]: enabled },
+    });
+  }
+
+  function handleServerLibraryReorder(ids: string[]) {
+    const state = serverLibraryView?.state;
+    if (!state || serverLibraryView?.manifest) return;
+    commitServerLibraryState({ ...state, order: ids });
+  }
+
+  async function handleServerLibrarySaveWinners(
+    winners: Record<string, string>,
+  ): Promise<boolean> {
+    const state = serverLibraryView?.state;
+    if (!state || serverLibraryView?.manifest) return false;
+    commitServerLibraryState({ ...state, winners });
+    notify(
+      t("toast.conflictSaved.title"),
+      t("toast.conflictSaved.detail"),
+      "success",
+    );
+    return true;
+  }
+
+  async function refreshServerLibrary(accountId: string) {
+    const result = await api.testSftpConnection(accountId);
+    if (!result.ok) throw new Error(result.message);
+    setSnapshot(await api.getSnapshot());
+    setSftpScan(result);
+    setSftpScanAccountId(accountId);
+    setSftpTrustPrompt(null);
+    setRemoteConflictProgress(null);
+    setRemoteConflictLoading(true);
+    try {
+      const report = await api.analyzeSftpConflicts(accountId);
+      setRemoteConflicts(report);
+      try {
+        setRemoteNotes(await api.getSftpRemoteNotes(accountId));
+      } catch {
+        setRemoteNotes({});
+      }
+      if (result.detectedModsPath) {
+        setRemoteFiles(await api.listRemoteFiles(result.detectedModsPath));
+      } else {
+        setRemoteFiles([]);
+      }
+    } finally {
+      setRemoteConflictLoading(false);
+    }
+  }
+
+  async function handleServerLibraryRefresh() {
+    const accountId = serverLibraryView?.accountId;
+    if (!accountId || busy) return;
+    setBusy(true);
+    setServerError(null);
+    try {
+      await refreshServerLibrary(accountId);
+      notify(t("toast.serverLibraryRefreshed.title"), undefined, "success");
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.serverLibraryRefreshFailed.title"), String(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleApplyServerLibrary() {
+    const view = serverLibraryView;
+    if (!view || busy) return;
+    setBusy(true);
+    setServerError(null);
+    setRemoteConflictLoading(true);
+    setRemoteConflictProgress(null);
+    try {
+      const result: SftpApplyResult = await api.applySftpModLayout(
+        view.accountId,
+        view.state.order,
+        serverLibraryDisabledPaths(view.state),
+        view.state.winners,
+      );
+      notify(t("toast.serverLibraryApplied.title"), result.message, "success");
+      await refreshServerLibrary(view.accountId);
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.serverLibraryApplyFailed.title"), String(error), "error");
+    } finally {
+      setRemoteConflictLoading(false);
+      setBusy(false);
+    }
+  }
+
+  async function handleRestoreServerLibrary() {
+    const accountId = serverLibraryView?.accountId;
+    if (!accountId || busy) return;
+    setBusy(true);
+    setServerError(null);
+    try {
+      const result = await api.restoreSftpModLayout(accountId);
+      notify(t("toast.serverLibraryRestored.title"), result.message, "success");
+      await refreshServerLibrary(accountId);
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.serverLibraryRestoreFailed.title"), String(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleChooseDirectory(kind: "client" | "server") {
     const path = await chooseDirectory();
     if (!path) {
@@ -1301,6 +1498,29 @@ function LocalizedApp() {
           {section === "library" ? (
             <LibraryScreen
               snapshot={snapshot}
+              mode={libraryMode}
+              onModeChange={(next) => {
+                if (next === "server" && !serverLibraryView) return;
+                setLibraryMode(next);
+                setSearch("");
+                setSelectedId(null);
+              }}
+              server={
+                serverLibraryView
+                  ? ({
+                      snapshot: serverLibraryView.snapshot,
+                      state: serverLibraryView.state,
+                      manifest: serverLibraryView.manifest,
+                      busy,
+                      onRefresh: () => void handleServerLibraryRefresh(),
+                      onToggle: handleServerLibraryToggle,
+                      onReorder: handleServerLibraryReorder,
+                      onSaveConflictWinners: handleServerLibrarySaveWinners,
+                      onApply: () => void handleApplyServerLibrary(),
+                      onRestore: () => void handleRestoreServerLibrary(),
+                    } satisfies ServerLibraryView)
+                  : null
+              }
               search={search}
               onSearchChange={setSearch}
               onScan={handleScan}

@@ -395,6 +395,7 @@ let remoteFiles: RemoteFile[] = [
   { name: "SCUM_WeaponPack_Elite.pak", path: "/srv/scum/SCUM/Content/Paks/~mods/SCUM_WeaponPack_Elite.pak", isDirectory: false, size: 1374389535, modifiedAt: new Date(now - 2 * 86400000).toISOString() },
   { name: "LootBalance_Plus.pak", path: "/srv/scum/SCUM/Content/Paks/~mods/LootBalance_Plus.pak", isDirectory: false, size: 13421772, modifiedAt: new Date(now - 4 * 86400000).toISOString() },
 ];
+let remoteManagedFiles: RemoteFile[] | null = null;
 
 let remoteUe4ssMods: RemoteFile[] = [
   {
@@ -607,6 +608,25 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         ue4ssMods: structuredClone(remoteUe4ssMods),
         scannedDirectories: 9,
         homePath: "/home/modder",
+        managedManifest: remoteFiles.some((file) =>
+          file.name.includes("SCUM_Mod_Desk_Merged"),
+        )
+          ? {
+              version: 1,
+              createdAt: now,
+              mergedPath:
+                "/srv/scum/SCUM/Content/Paks/~mods/999_SCUM_Mod_Desk_Merged.pak",
+              mergedName: "999_SCUM_Mod_Desk_Merged.pak",
+              sources: (remoteManagedFiles ?? [])
+                .filter((file) => file.name.endsWith(".pak"))
+                .slice(0, 2)
+                .map((file) => ({ name: file.name, path: file.path })),
+              backups: [],
+              renames: [],
+              createdPaths: [],
+              winners: {},
+            }
+          : null,
         hostKeyFingerprint: "SHA256:demo-fingerprint",
         requiresTrust: false,
       } as T;
@@ -620,6 +640,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         ue4ssMods: [],
         scannedDirectories: 0,
         homePath: null,
+        managedManifest: null,
         hostKeyFingerprint: String(args?.fingerprint ?? "SHA256:demo-fingerprint"),
         requiresTrust: false,
       } as T;
@@ -722,6 +743,60 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
           : `已分析 ${pakMods.length} 个远端 PAK，未发现资源冲突`,
       } as T;
     }
+    case "apply_sftp_mod_layout": {
+      const pakMods = remoteFiles.filter(
+        (file) => !file.isDirectory && file.name.endsWith(".pak"),
+      );
+      const sources = pakMods.slice(0, 2).map((file) => ({
+        name: file.name,
+        path: file.path,
+      }));
+      if (sources.length > 0) {
+        remoteManagedFiles = structuredClone(remoteFiles);
+        remoteFiles = [
+          ...remoteFiles.filter(
+            (file) => !sources.some((source) => source.path === file.path),
+          ),
+          {
+            name: "999_SCUM_Mod_Desk_Merged.pak",
+            path: "/srv/scum/SCUM/Content/Paks/~mods/999_SCUM_Mod_Desk_Merged.pak",
+            isDirectory: false,
+            size: 1400000000,
+            modifiedAt: new Date().toISOString(),
+          },
+        ];
+      }
+      return {
+        message: "演示环境已备份冲突模组并上传合并包",
+        manifest: {
+          version: 1,
+          createdAt: new Date().toISOString(),
+          mergedPath: sources.length
+            ? "/srv/scum/SCUM/Content/Paks/~mods/999_SCUM_Mod_Desk_Merged.pak"
+            : null,
+          mergedName: sources.length ? "999_SCUM_Mod_Desk_Merged.pak" : null,
+          sources,
+          backups: sources.map((source) => ({
+            name: source.name,
+            originalPath: source.path,
+            backupPath: `/srv/scum/SCUM/Content/Paks/~mods/_SCUM_Mod_Desk_Backups/${source.name}.bak`,
+            reason: "merged",
+          })),
+          renames: [],
+          createdPaths: [],
+          winners: (args?.winners as Record<string, string> | undefined) ?? {},
+        },
+      } as T;
+    }
+    case "restore_sftp_mod_layout":
+      if (remoteManagedFiles) {
+        remoteFiles = structuredClone(remoteManagedFiles);
+        remoteManagedFiles = null;
+      }
+      return {
+        message: "演示环境已恢复服务器原始模组",
+        path: "/srv/scum/SCUM/Content/Paks/~mods",
+      } as T;
     case "inspect_mod_import": {
       const paths = (args?.paths as string[] | undefined) ?? [];
       const conflicts = paths.flatMap((sourcePath) => {

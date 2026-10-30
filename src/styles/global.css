@@ -739,7 +739,87 @@ textarea:focus-visible,
 .heading-tools {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
+}
+
+.library-source-switch {
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--paper-lo);
+}
+
+.library-source-switch button {
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  background: transparent;
+  font-size: var(--type-micro);
+  white-space: nowrap;
+}
+
+.library-source-switch button:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+.library-source-switch button.is-active {
+  color: var(--accent);
+  background: var(--paper-hi);
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
+.server-library-strip {
+  min-height: 72px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--line));
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--accent) 4%, var(--paper-lo));
+}
+
+.server-library-strip-copy {
+  min-width: 0;
+}
+
+.server-library-strip-copy > span {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+
+.server-library-strip-copy b {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--type-emphasis);
+  font-weight: 600;
+}
+
+.server-library-strip-copy p {
+  margin: 4px 0 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--type-label);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-library-strip-actions {
+  flex: none;
+  display: flex;
+  gap: 7px;
 }
 
 .launch-strip {
@@ -2102,16 +2182,19 @@ body.is-row-dragging {
     0 12px 28px color-mix(in srgb, var(--ink) 8%, transparent);
 }
 
-.server-panel-bar {
-  height: 31px;
-  flex: 0 0 31px;
+.server-panel-edit-handle {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 4;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 0 8px 0 10px;
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--paper-hi) 62%, transparent);
+  gap: 5px;
+  padding: 3px 6px 3px 4px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--line));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--paper-hi) 94%, var(--accent));
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--ink) 10%, transparent);
 }
 
 .server-panel-drag {
@@ -2141,10 +2224,6 @@ body.is-row-dragging {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.server-panel-drag.is-locked {
-  padding-left: 1px;
 }
 
 .server-panel-size {
@@ -3045,6 +3124,81 @@ body.is-resizing-server-panel * {
   font-size: var(--type-meta);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.remote-viewer-merged-sources {
+  margin-top: 13px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 4%, var(--paper-hi));
+}
+
+.remote-viewer-merged-sources .section-title b {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  font-weight: 400;
+}
+
+.remote-viewer-source-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.remote-viewer-source-list > div {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+}
+
+.remote-viewer-source-list .icon {
+  margin-top: 2px;
+  color: var(--accent);
+}
+
+.remote-viewer-source-list span {
+  min-width: 0;
+}
+
+.remote-viewer-source-list b,
+.remote-viewer-source-list code {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.remote-viewer-source-list b {
+  font-size: var(--type-meta);
+  font-weight: 500;
+}
+
+.remote-viewer-source-list code {
+  margin-top: 2px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.remote-viewer-managed-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 12px 0 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--line));
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: color-mix(in srgb, var(--accent) 4%, var(--paper-hi));
+  font-size: var(--type-meta);
+  line-height: 1.55;
+}
+
+.remote-viewer-managed-note .icon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--accent);
 }
 
 .remote-viewer-note {

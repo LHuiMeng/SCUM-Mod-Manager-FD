@@ -86,6 +86,18 @@ export function RemoteModViewer({
   }, [filter, items, search]);
 
   const selected = items.find((item) => item.path === selectedPath) ?? null;
+  const managedManifest = scan.managedManifest ?? null;
+  const selectedIsMerged = Boolean(
+    selected && managedManifest?.mergedPath === selected.path,
+  );
+  const selectedIsManaged = Boolean(
+    selected &&
+      managedManifest &&
+      (managedManifest.mergedPath === selected.path ||
+        managedManifest.renames?.some(
+          (rename) => rename.deployedPath === selected.path,
+        )),
+  );
   const selectedConflicts = useMemo(
     () =>
       (conflicts?.groups ?? []).filter((group) =>
@@ -248,7 +260,12 @@ export function RemoteModViewer({
                     <span className="remote-viewer-item-main">
                       <b>{item.name}</b>
                       <small>
-                        {item.kind === "pak" ? "PAK" : "UE4SS"} ·{" "}
+                        {item.kind === "pak"
+                          ? managedManifest?.mergedPath === item.path
+                            ? t("remoteViewer.mergedKind")
+                            : "PAK"
+                          : "UE4SS"}{" "}
+                        ·{" "}
                         {item.isDirectory ? t("common.directory") : formatBytes(item.size)}
                       </small>
                     </span>
@@ -277,7 +294,11 @@ export function RemoteModViewer({
               <header>
                 <div>
                   <span className="remote-viewer-kind">
-                    {selected.kind === "pak" ? "PAK" : "UE4SS"}
+                    {selectedIsMerged
+                      ? t("remoteViewer.mergedKind")
+                      : selected.kind === "pak"
+                        ? "PAK"
+                        : "UE4SS"}
                   </span>
                   <h3>{selected.name}</h3>
                 </div>
@@ -289,7 +310,12 @@ export function RemoteModViewer({
                       setRenameValue(selected.name);
                       setRenameOpen(true);
                     }}
-                    disabled={loading}
+                    disabled={loading || selectedIsManaged}
+                    title={
+                      selectedIsManaged
+                        ? t("remoteViewer.managedReadOnly")
+                        : undefined
+                    }
                   >
                     {t("remoteViewer.rename")}
                   </Button>
@@ -298,7 +324,12 @@ export function RemoteModViewer({
                     variant="danger"
                     icon="trash"
                     onClick={() => setDeleteOpen(true)}
-                    disabled={loading}
+                    disabled={loading || selectedIsManaged}
+                    title={
+                      selectedIsManaged
+                        ? t("remoteViewer.managedReadOnly")
+                        : undefined
+                    }
                   >
                     {t("remoteViewer.delete")}
                   </Button>
@@ -319,6 +350,37 @@ export function RemoteModViewer({
                   <dd>{conflictCounts[selected.path] ?? 0}</dd>
                 </div>
               </dl>
+
+              {selectedIsManaged ? (
+                <p className="remote-viewer-managed-note">
+                  <Icon name="lock" size={13} />
+                  <span>{t("remoteViewer.managedReadOnly")}</span>
+                </p>
+              ) : null}
+
+              {selectedIsMerged && managedManifest ? (
+                <section className="remote-viewer-merged-sources">
+                  <div className="section-title">
+                    <span>{t("remoteViewer.mergedSources")}</span>
+                    <b>
+                      {t("remoteViewer.mergedSourceCount", {
+                        count: managedManifest.sources.length,
+                      })}
+                    </b>
+                  </div>
+                  <div className="remote-viewer-source-list">
+                    {managedManifest.sources.map((source) => (
+                      <div key={source.path}>
+                        <Icon name="box" size={14} />
+                        <span>
+                          <b>{source.name}</b>
+                          <code>{source.path}</code>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
 
               <label className="remote-viewer-note">
                 <span>{t("remoteViewer.note")}</span>

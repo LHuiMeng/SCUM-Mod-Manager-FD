@@ -72,6 +72,8 @@ pub fn run() {
             commands::get_sftp_remote_notes,
             commands::save_sftp_remote_note,
             commands::analyze_sftp_conflicts,
+            commands::apply_sftp_mod_layout,
+            commands::restore_sftp_mod_layout,
             commands::window_minimize,
             commands::window_toggle_maximize,
             commands::window_close,

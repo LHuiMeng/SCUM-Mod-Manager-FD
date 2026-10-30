@@ -15,6 +15,7 @@ interface ModRowProps {
   sortable: boolean;
   showLoadOrder: boolean;
   locked: boolean;
+  lockedTitle?: string;
   dragging: boolean;
   dragShift: "up" | "down" | null;
   dragOffsetY: number | null;
@@ -34,6 +35,7 @@ export function ModRow({
   sortable,
   showLoadOrder,
   locked,
+  lockedTitle,
   dragging,
   dragShift,
   dragOffsetY,
@@ -155,7 +157,7 @@ export function ModRow({
         className="mod-toggle-cell"
         onClick={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
-        title={locked ? t("library.row.lockTitle") : undefined}
+        title={locked ? lockedTitle ?? t("library.row.lockTitle") : undefined}
       >
         <Toggle
           checked={mod.enabled}

@@ -12,6 +12,7 @@ import type {
   RemoteFile,
   RemoteMod,
   RuntimeLog,
+  SftpApplyResult,
   SftpConflictReport,
   SftpConnectionResult,
   SftpOperationResult,
@@ -108,6 +109,20 @@ export const api = {
     call<Record<string, string>>("save_sftp_remote_note", { accountId, path, note }),
   analyzeSftpConflicts: (accountId: string) =>
     call<SftpConflictReport>("analyze_sftp_conflicts", { accountId }),
+  applySftpModLayout: (
+    accountId: string,
+    order: string[],
+    disabled: string[],
+    winners: Record<string, string>,
+  ) =>
+    call<SftpApplyResult>("apply_sftp_mod_layout", {
+      accountId,
+      order,
+      disabled,
+      winners,
+    }),
+  restoreSftpModLayout: (accountId: string) =>
+    call<SftpOperationResult>("restore_sftp_mod_layout", { accountId }),
   minimize: () => call<void>("window_minimize"),
   toggleMaximize: () => call<void>("window_toggle_maximize"),
   close: () => call<void>("window_close"),

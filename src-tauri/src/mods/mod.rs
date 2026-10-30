@@ -20,7 +20,8 @@ mod pak_scan;
 
 pub use pak_scan::PakScanDiagnostic;
 pub(crate) use pak_scan::{
-    analyze_conflicts, list_pak_entries, normalize_entry_path, validate_conflict_winners,
+    analyze_conflicts, extract_pak_entry, list_pak_entries, normalize_entry_path, pack_pak,
+    validate_conflict_winners, ConflictAnalysis,
 };
 
 #[derive(Debug, Default)]

@@ -1064,8 +1064,8 @@ export function ServerScreen({
               }}
               onPointerDownCapture={() => setActivePanel(panel)}
             >
-              <header className="server-panel-bar">
-                {layoutEditing ? (
+              {layoutEditing ? (
+                <div className="server-panel-edit-handle">
                   <button
                     type="button"
                     className="server-panel-drag"
@@ -1081,17 +1081,11 @@ export function ServerScreen({
                     <Icon name="drag" size={13} />
                     <span>{t(PANEL_LABEL_KEYS[panel])}</span>
                   </button>
-                ) : (
-                  <div className="server-panel-drag is-locked">
-                    <span>{t(PANEL_LABEL_KEYS[panel])}</span>
-                  </div>
-                )}
-                {layoutEditing ? (
                   <span className="server-panel-size">
                     {Math.round(rect.w * 100)}% × {Math.round(rect.h * 100)}%
                   </span>
-                ) : null}
-              </header>
+                </div>
+              ) : null}
               <div className="server-panel-content">{panels[panel]}</div>
               {layoutEditing ? (
                 <button

@@ -4,8 +4,8 @@ use crate::launcher;
 use crate::models::{
     AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, DetectPathsResult, DownloadResult,
     GameStatus, ImportConflict, ImportResult, InstallUpdateResult, LibrarySnapshot, LocaleBundle,
-    RemoteFile, RemoteMod, RuntimeLog, SftpAccountInput, SftpConflictReport, SftpConnectionResult,
-    SftpOperationResult, UploadResult,
+    RemoteFile, RemoteMod, RuntimeLog, SftpAccountInput, SftpApplyResult, SftpConflictReport,
+    SftpConnectionResult, SftpOperationResult, UploadResult,
 };
 use crate::paths::path_string;
 use crate::sftp;
@@ -613,6 +613,55 @@ pub async fn analyze_sftp_conflicts(
         let result =
             sftp::analyze_remote_conflicts(&state.paths, &settings, &account_id, progress)?;
         state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn apply_sftp_mod_layout(
+    app: AppHandle,
+    account_id: String,
+    order: Vec<String>,
+    disabled: Vec<String>,
+    winners: BTreeMap<String, String>,
+) -> Result<SftpApplyResult, String> {
+    let progress_app = app.clone();
+    let progress: sftp::SftpConflictProgressCallback = Arc::new(move |payload| {
+        let _ = progress_app.emit("sftp-conflict-progress", payload);
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::apply_remote_layout(
+            &state.paths,
+            &settings,
+            &account_id,
+            &order,
+            &disabled,
+            &winners,
+            progress,
+        )?;
+        state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn restore_sftp_mod_layout(
+    app: AppHandle,
+    account_id: String,
+) -> Result<SftpOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::restore_remote_layout(&state.paths, &settings, &account_id)?;
+        state.log("warn", "sftp", &result.message);
         Ok::<_, anyhow::Error>(result)
     })
     .await

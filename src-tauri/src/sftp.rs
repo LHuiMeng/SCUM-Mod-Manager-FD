@@ -1,7 +1,9 @@
+use crate::metadata::MetadataFile;
 use crate::models::{
-    AppSettings, RemoteFile, SftpAccount, SftpConflictGroup, SftpConflictOwner,
-    SftpConflictProgress, SftpConflictReport, SftpConnectionResult, SftpOperationResult,
-    UploadResult,
+    AppSettings, ModEntry, RemoteFile, SftpAccount, SftpApplyResult, SftpConflictGroup,
+    SftpConflictOwner, SftpConflictProgress, SftpConflictReport, SftpConnectionResult,
+    SftpManagedBackup, SftpManagedManifest, SftpManagedRename, SftpManagedSource,
+    SftpOperationResult, UploadResult,
 };
 use crate::paths::{safe_file_component, AppPaths};
 use anyhow::{bail, Context, Result};
@@ -33,6 +35,11 @@ const CONFLICT_PARSE_WORKERS: usize = 4;
 const CONFLICT_DOWNLOAD_CHUNK_BYTES: usize = 512 * 1024;
 const CONFLICT_PROGRESS_INTERVAL: Duration = Duration::from_millis(140);
 const MAX_CONFLICT_ENTRIES_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const REMOTE_MERGED_FILE: &str = "999_SCUM_Mod_Desk_Merged.pak";
+const REMOTE_MERGED_MANIFEST: &str = "999_SCUM_Mod_Desk_Merged.sources.json";
+const REMOTE_BACKUP_DIRECTORY: &str = "_SCUM_Mod_Desk_Backups";
+const MAX_REMOTE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REMOTE_UE4SS_CONFIG_BYTES: u64 = 1024 * 1024;
 
 pub type SftpConflictProgressCallback = Arc<dyn Fn(SftpConflictProgress) + Send + Sync>;
 
@@ -89,6 +96,7 @@ pub fn test_connection(
                 ue4ss_mods: Vec::new(),
                 scanned_directories: 0,
                 home_path: None,
+                managed_manifest: None,
                 host_key_fingerprint: Some(fingerprint),
                 requires_trust: true,
             });
@@ -111,6 +119,15 @@ pub fn test_connection(
         .as_deref()
         .map(|path| list_ue4ss_mods(&sftp, path))
         .unwrap_or_default();
+    let managed_manifest = detected.pak_mods_path.as_deref().and_then(|path| {
+        let ue4ss_path = detected
+            .ue4ss_mods_path
+            .as_deref()
+            .unwrap_or(&account.ue4ss_path);
+        read_managed_manifest(&sftp, path, ue4ss_path)
+            .ok()
+            .flatten()
+    });
     let mut found = Vec::new();
     if let Some(path) = &detected.pak_mods_path {
         found.push(format!("PAK {path}"));
@@ -139,6 +156,7 @@ pub fn test_connection(
         ue4ss_mods,
         scanned_directories: detected.scanned_directories,
         home_path,
+        managed_manifest,
         host_key_fingerprint: Some(fingerprint),
         requires_trust: false,
     })
@@ -179,6 +197,7 @@ pub fn trust_host(
         ue4ss_mods: Vec::new(),
         scanned_directories: 0,
         home_path: None,
+        managed_manifest: None,
         host_key_fingerprint: Some(fingerprint),
         requires_trust: false,
     })
@@ -423,6 +442,9 @@ pub fn analyze_remote_conflicts(
     if account.mods_path.trim().is_empty() {
         bail!("尚未定位远端 PAK 模组目录");
     }
+    if normalize_remote_path(&account.mods_path) == "/" {
+        bail!("无法在服务器根目录分析模组冲突，请先定位具体的 ~mods 目录");
+    }
     let cache_dir = paths
         .root
         .join("cache")
@@ -468,6 +490,810 @@ pub fn analyze_remote_conflicts(
             Err(error)
         }
     }
+}
+
+struct RemoteUe4ssConfigPlan {
+    path: String,
+    existing_file: Option<RemoteFile>,
+    desired: String,
+}
+
+fn plan_remote_ue4ss_config(
+    paths: &AppPaths,
+    account: &SftpAccount,
+    order: &[String],
+    disabled: &HashSet<String>,
+) -> Result<Option<RemoteUe4ssConfigPlan>> {
+    if account.ue4ss_path.trim().is_empty() {
+        return Ok(None);
+    }
+    with_sftp(paths, account, |sftp| {
+        let files = list_ue4ss_mods(sftp, &account.ue4ss_path);
+        if !files.iter().any(|file| file.is_directory) {
+            return Ok(None);
+        }
+        let path = remote_join(&account.ue4ss_path, "mods.txt");
+        let existing = read_remote_text_file(sftp, &path, MAX_REMOTE_UE4SS_CONFIG_BYTES)?;
+        let existing_content = existing
+            .as_ref()
+            .map(|(_, content)| content.as_str())
+            .unwrap_or_default();
+        let built = build_remote_ue4ss_mods_txt(&files, order, disabled, existing_content);
+        let desired = if built.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", built.trim_end_matches(['\r', '\n']))
+        };
+        if existing_content.trim_end_matches(['\r', '\n']) == desired.trim_end_matches(['\r', '\n'])
+        {
+            return Ok(None);
+        }
+        Ok(Some(RemoteUe4ssConfigPlan {
+            path,
+            existing_file: existing.map(|(file, _)| file),
+            desired,
+        }))
+    })
+}
+
+pub fn apply_remote_layout(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    order: &[String],
+    disabled: &[String],
+    winners: &BTreeMap<String, String>,
+    progress: SftpConflictProgressCallback,
+) -> Result<SftpApplyResult> {
+    let account = active_account(settings, Some(account_id))?;
+    if account.mods_path.trim().is_empty() {
+        bail!("尚未定位远端 PAK 模组目录");
+    }
+    if normalize_remote_path(&account.mods_path) == "/" {
+        bail!("拒绝在服务器根目录应用模组布局，请先定位具体的 ~mods 目录");
+    }
+    send_conflict_progress(
+        &progress,
+        "preparing",
+        0,
+        0,
+        0,
+        0,
+        None,
+        "正在检查服务器现有托管状态",
+    );
+    if let Some(existing) = with_sftp(paths, account, |sftp| {
+        read_managed_manifest(sftp, &account.mods_path, &account.ue4ss_path)
+    })? {
+        with_sftp(paths, account, |sftp| {
+            restore_managed_manifest(sftp, &account.mods_path, &existing)
+        })?;
+    }
+
+    let cache_dir = paths
+        .root
+        .join("cache")
+        .join("sftp_conflicts")
+        .join(safe_file_component(account_id));
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("无法创建冲突分析缓存 {}", cache_dir.display()))?;
+    // The conflict scan fills the local cache and verifies every PAK before any
+    // server mutation. Existing managed backups were restored above.
+    analyze_remote_conflicts_inner(paths, account, &cache_dir, &progress)?;
+
+    let pak_files = with_sftp(paths, account, |sftp| {
+        Ok(list_pak_mods(sftp, &account.mods_path))
+    })?;
+    let order_index = order
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let disabled = disabled.iter().cloned().collect::<HashSet<_>>();
+    let mut sorted_paks = pak_files;
+    sorted_paks.sort_by(|left, right| {
+        order_index
+            .get(&left.path)
+            .copied()
+            .unwrap_or(usize::MAX)
+            .cmp(&order_index.get(&right.path).copied().unwrap_or(usize::MAX))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    let mut metadata = MetadataFile::default();
+    let mut mods = Vec::new();
+    let mut files_by_path = BTreeMap::new();
+    for (load_order, file) in sorted_paks.iter().enumerate() {
+        files_by_path.insert(file.path.clone(), file.clone());
+        if disabled.contains(&file.path) || is_managed_merged_name(&file.name) {
+            continue;
+        }
+        let cache_name = conflict_cache_name(file);
+        let local = cache_dir.join(&cache_name);
+        if !local.is_file() {
+            bail!("远端 PAK 尚未完成缓存，无法应用布局：{}", file.name);
+        }
+        let entries_path = cache_dir.join(conflict_entries_cache_name(&cache_name));
+        let entries = match read_conflict_entries_cache(&entries_path) {
+            Some(entries) => entries,
+            None => crate::mods::list_pak_entries(paths, &local)?,
+        };
+        metadata.entry_mut(&file.path).pak_entries = entries;
+        mods.push(ModEntry {
+            id: file.path.clone(),
+            name: file.name.clone(),
+            file_name: file.name.clone(),
+            file_path: local.to_string_lossy().into_owned(),
+            file_size: file.size,
+            last_modified: file.modified_at.clone().unwrap_or_default(),
+            enabled: true,
+            mod_type: "clientPak".to_string(),
+            load_order,
+            description: String::new(),
+            origin_source: "local".to_string(),
+            ..ModEntry::default()
+        });
+    }
+
+    let mut valid_winners = BTreeMap::new();
+    let mut analysis = crate::mods::analyze_conflicts(&metadata, &mods);
+    for (key, winner) in winners {
+        if analysis
+            .groups
+            .iter()
+            .any(|group| group.key == *key && group.owners.iter().any(|owner| owner.id == *winner))
+        {
+            valid_winners.insert(key.clone(), winner.clone());
+        }
+    }
+    metadata.conflict_winners = valid_winners.clone();
+    analysis = crate::mods::analyze_conflicts(&metadata, &mods);
+    crate::mods::validate_conflict_winners(&analysis.groups, &valid_winners)?;
+
+    let conflicting_paths = analysis
+        .groups
+        .iter()
+        .flat_map(|group| group.owners.iter().map(|owner| owner.id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut to_backup = BTreeMap::<String, String>::new();
+    for path in &disabled {
+        if files_by_path.contains_key(path) {
+            to_backup.insert(path.clone(), "disabled".to_string());
+        }
+    }
+    for path in &conflicting_paths {
+        if files_by_path.contains_key(path) {
+            to_backup.insert(path.clone(), "merged".to_string());
+        }
+    }
+    if let Some(previous) = files_by_path
+        .values()
+        .find(|file| is_managed_merged_name(&file.name))
+    {
+        to_backup
+            .entry(previous.path.clone())
+            .or_insert_with(|| "previous-merged".to_string());
+    }
+    let prefix_width = remote_deployment_prefix_width(sorted_paks.len());
+    let merged_remote_name = if prefix_width == 3 {
+        REMOTE_MERGED_FILE.to_string()
+    } else {
+        format!("{}_SCUM_Mod_Desk_Merged.pak", "9".repeat(prefix_width))
+    };
+    let rename_candidates = plan_remote_pak_renames(
+        &sorted_paks,
+        &disabled,
+        &conflicting_paths,
+        &account.mods_path,
+        prefix_width,
+    );
+    let ue4ss_plan = plan_remote_ue4ss_config(paths, account, order, &disabled)?;
+    let ue4ss_changed = ue4ss_plan.is_some();
+    if to_backup.is_empty()
+        && conflicting_paths.is_empty()
+        && rename_candidates.is_empty()
+        && !ue4ss_changed
+    {
+        let message = "服务器模组没有冲突、启停或排序变化，无需应用变更".to_string();
+        send_conflict_progress(&progress, "completed", 1, 1, 0, 0, None, &message);
+        return Ok(SftpApplyResult {
+            message,
+            manifest: SftpManagedManifest::default(),
+        });
+    }
+
+    let stage_root = paths
+        .root
+        .join("~remote-merge")
+        .join(Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&stage_root)?;
+    let merged_local = stage_root.join(REMOTE_MERGED_FILE);
+    let build_merged = (|| -> Result<bool> {
+        if conflicting_paths.is_empty() {
+            return Ok(false);
+        }
+        build_remote_merged_pak(paths, &mods, &analysis, &metadata, &merged_local)
+    })();
+    let merged_created = match build_merged {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&stage_root);
+            return Err(error);
+        }
+    };
+    if !conflicting_paths.is_empty() && !merged_created {
+        let _ = std::fs::remove_dir_all(&stage_root);
+        bail!("冲突分析完成，但未能生成合并 PAK");
+    }
+
+    let created_at = Utc::now().to_rfc3339();
+    let sources = conflicting_paths
+        .iter()
+        .filter_map(|path| {
+            files_by_path.get(path).map(|file| SftpManagedSource {
+                name: file.name.clone(),
+                path: path.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let backup_files = to_backup
+        .keys()
+        .filter_map(|path| files_by_path.get(path).cloned())
+        .collect::<Vec<_>>();
+    let manifest = with_sftp(paths, account, |sftp| {
+        let mut planned_renames = Vec::new();
+        for (file, target_path) in &rename_candidates {
+            if sftp.lstat(Path::new(target_path)).is_ok() {
+                bail!("服务器排序目标已存在，拒绝覆盖：{target_path}");
+            }
+            let source_signature = remote_with_extension(&file.path, "sig");
+            let target_signature = remote_with_extension(target_path, "sig");
+            let has_signature = sftp
+                .lstat(Path::new(&source_signature))
+                .map(|stat| !stat.is_dir())
+                .unwrap_or(false);
+            if has_signature && sftp.lstat(Path::new(&target_signature)).is_ok() {
+                bail!("服务器排序签名目标已存在，拒绝覆盖：{target_signature}");
+            }
+            planned_renames.push((
+                file.clone(),
+                target_path.clone(),
+                source_signature,
+                target_signature,
+                has_signature,
+            ));
+        }
+        let backup_name = format!(
+            "{REMOTE_BACKUP_DIRECTORY}/{}",
+            Utc::now().format("%Y%m%d-%H%M%S-%3f")
+        );
+        let backup_dir = remote_join(&account.mods_path, &backup_name);
+        let ue4ss_backup_dir = remote_join(&account.ue4ss_path, &backup_name);
+        if !backup_files.is_empty() {
+            ensure_remote_dir(sftp, &backup_dir)?;
+        }
+        if ue4ss_plan
+            .as_ref()
+            .is_some_and(|plan| plan.existing_file.is_some())
+        {
+            ensure_remote_dir(sftp, &ue4ss_backup_dir)?;
+        }
+        let mut manifest = SftpManagedManifest {
+            version: 1,
+            created_at: created_at.clone(),
+            merged_path: merged_created
+                .then(|| remote_join(&account.mods_path, &merged_remote_name)),
+            merged_name: merged_created.then(|| merged_remote_name.clone()),
+            sources,
+            backups: Vec::new(),
+            renames: Vec::new(),
+            created_paths: Vec::new(),
+            winners: valid_winners.clone(),
+        };
+        let mutation = (|| -> Result<()> {
+            for file in &backup_files {
+                let reason = to_backup
+                    .get(&file.path)
+                    .cloned()
+                    .unwrap_or_else(|| "disabled".to_string());
+                manifest
+                    .backups
+                    .push(backup_remote_file(sftp, file, &backup_dir, &reason)?);
+                if file.name.to_ascii_lowercase().ends_with(".pak") {
+                    let signature = remote_with_extension(&file.path, "sig");
+                    if let Ok(stat) = sftp.lstat(Path::new(&signature)) {
+                        if !stat.is_dir() {
+                            let signature_file = RemoteFile {
+                                name: entry_name(&signature),
+                                path: signature,
+                                is_directory: false,
+                                size: stat.size.unwrap_or(0),
+                                modified_at: None,
+                            };
+                            manifest.backups.push(backup_remote_file(
+                                sftp,
+                                &signature_file,
+                                &backup_dir,
+                                "signature",
+                            )?);
+                        }
+                    }
+                }
+            }
+            for (file, target_path, source_signature, target_signature, has_signature) in
+                &planned_renames
+            {
+                manifest.renames.push(SftpManagedRename {
+                    name: file.name.clone(),
+                    original_path: file.path.clone(),
+                    deployed_path: target_path.clone(),
+                    has_signature: *has_signature,
+                });
+                sftp.rename(Path::new(&file.path), Path::new(target_path), None)
+                    .with_context(|| {
+                        format!("无法调整服务器 PAK 顺序 {} -> {target_path}", file.path)
+                    })?;
+                if *has_signature {
+                    sftp.rename(
+                        Path::new(source_signature),
+                        Path::new(target_signature),
+                        None,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "无法调整服务器签名顺序 {} -> {target_signature}",
+                            source_signature
+                        )
+                    })?;
+                }
+            }
+            if let Some(plan) = &ue4ss_plan {
+                if let Some(file) = &plan.existing_file {
+                    manifest.backups.push(backup_remote_file(
+                        sftp,
+                        file,
+                        &ue4ss_backup_dir,
+                        "ue4ss-config",
+                    )?);
+                } else {
+                    manifest.created_paths.push(plan.path.clone());
+                }
+                write_remote_text_file(sftp, &plan.path, &plan.desired)?;
+            }
+            if merged_created {
+                let merged_path = remote_join(&account.mods_path, &merged_remote_name);
+                if sftp.lstat(Path::new(&merged_path)).is_ok() {
+                    bail!("服务器合并包目标已存在，拒绝覆盖：{merged_path}");
+                }
+                upload_local_file(sftp, &merged_local, &merged_path)?;
+            }
+            write_managed_manifest(sftp, &account.mods_path, &manifest)?;
+            Ok(())
+        })();
+        if let Err(error) = mutation {
+            let _ = restore_managed_manifest(sftp, &account.mods_path, &manifest);
+            return Err(error);
+        }
+        Ok(manifest)
+    });
+    let _ = std::fs::remove_dir_all(&stage_root);
+    let manifest = manifest?;
+
+    let merged_backup_count = manifest
+        .backups
+        .iter()
+        .filter(|item| item.reason == "merged")
+        .count();
+    let disabled_backup_count = manifest
+        .backups
+        .iter()
+        .filter(|item| item.reason == "disabled")
+        .count();
+    let mut actions = Vec::new();
+    if merged_created {
+        actions.push(format!(
+            "已备份 {merged_backup_count} 个冲突 PAK 并上传合并包（来源 {} 个）",
+            manifest.sources.len()
+        ));
+    }
+    if disabled_backup_count > 0 {
+        actions.push(format!("已备份 {disabled_backup_count} 个禁用 PAK"));
+    }
+    if !manifest.renames.is_empty() {
+        actions.push(format!(
+            "已调整 {} 个 PAK 的加载顺序",
+            manifest.renames.len()
+        ));
+    }
+    if ue4ss_changed {
+        actions.push("已更新 UE4SS 模组启停与加载顺序".to_string());
+    }
+    let message = if actions.is_empty() {
+        "服务器托管布局已更新".to_string()
+    } else {
+        actions.join("；")
+    };
+    send_conflict_progress(&progress, "completed", 1, 1, 0, 0, None, &message);
+    Ok(SftpApplyResult { message, manifest })
+}
+
+pub fn restore_remote_layout(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+) -> Result<SftpOperationResult> {
+    let account = active_account(settings, Some(account_id))?;
+    if account.mods_path.trim().is_empty() {
+        bail!("尚未定位远端 PAK 模组目录");
+    }
+    if normalize_remote_path(&account.mods_path) == "/" {
+        bail!("拒绝在服务器根目录恢复模组布局，请先定位具体的 ~mods 目录");
+    }
+    let restored = with_sftp(paths, account, |sftp| {
+        let Some(manifest) = read_managed_manifest(sftp, &account.mods_path, &account.ue4ss_path)?
+        else {
+            bail!("服务器上没有可恢复的托管备份");
+        };
+        let count = manifest.backups.len() + manifest.renames.len() + manifest.created_paths.len();
+        restore_managed_manifest(sftp, &account.mods_path, &manifest)?;
+        Ok(count)
+    })?;
+    Ok(SftpOperationResult {
+        message: format!("已恢复 {restored} 项服务器托管文件变更"),
+        path: account.mods_path.clone(),
+    })
+}
+
+fn read_managed_manifest(
+    sftp: &Sftp,
+    mods_path: &str,
+    ue4ss_path: &str,
+) -> Result<Option<SftpManagedManifest>> {
+    let manifest_path = remote_join(mods_path, REMOTE_MERGED_MANIFEST);
+    let Ok(stat) = sftp.stat(Path::new(&manifest_path)) else {
+        return Ok(None);
+    };
+    if stat.is_dir() || stat.size.unwrap_or(0) > MAX_REMOTE_MANIFEST_BYTES {
+        return Ok(None);
+    }
+    let file = sftp
+        .open(Path::new(&manifest_path))
+        .with_context(|| format!("无法读取服务器托管清单 {manifest_path}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REMOTE_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_REMOTE_MANIFEST_BYTES {
+        return Ok(None);
+    }
+    let manifest = serde_json::from_slice::<SftpManagedManifest>(&bytes).ok();
+    if let Some(manifest) = &manifest {
+        validate_managed_manifest_paths(mods_path, ue4ss_path, manifest)?;
+    }
+    Ok(manifest)
+}
+
+fn read_remote_text_file(
+    sftp: &Sftp,
+    path: &str,
+    max_bytes: u64,
+) -> Result<Option<(RemoteFile, String)>> {
+    let Ok(stat) = sftp.lstat(Path::new(path)) else {
+        return Ok(None);
+    };
+    if !stat.is_file() {
+        bail!("远端配置路径不是文件：{path}");
+    }
+    if stat.size.unwrap_or(0) > max_bytes {
+        bail!("远端配置文件超过大小限制：{path}");
+    }
+    let file = sftp
+        .open(Path::new(path))
+        .with_context(|| format!("无法读取远端配置文件 {path}"))?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("远端配置文件超过大小限制：{path}");
+    }
+    let content =
+        String::from_utf8(bytes).with_context(|| format!("远端配置文件不是 UTF-8：{path}"))?;
+    Ok(Some((
+        RemoteFile {
+            name: entry_name(path),
+            path: path.to_string(),
+            is_directory: false,
+            size: stat.size.unwrap_or(content.len() as u64),
+            modified_at: stat.mtime.map(|seconds| {
+                Utc.timestamp_opt(seconds as i64, 0)
+                    .single()
+                    .unwrap_or_else(Utc::now)
+                    .to_rfc3339()
+            }),
+        },
+        content,
+    )))
+}
+
+fn write_remote_text_file(sftp: &Sftp, path: &str, content: &str) -> Result<()> {
+    if let Ok(stat) = sftp.lstat(Path::new(path)) {
+        if !stat.is_file() {
+            bail!("拒绝写入非普通远端配置文件：{path}");
+        }
+    }
+    let mut remote = sftp
+        .create(Path::new(path))
+        .with_context(|| format!("无法创建远端配置文件 {path}"))?;
+    remote.write_all(content.as_bytes())?;
+    remote.flush()?;
+    Ok(())
+}
+
+fn write_managed_manifest(
+    sftp: &Sftp,
+    mods_path: &str,
+    manifest: &SftpManagedManifest,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    let path = remote_join(mods_path, REMOTE_MERGED_MANIFEST);
+    if let Ok(stat) = sftp.lstat(Path::new(&path)) {
+        if !stat.is_file() {
+            bail!("服务器托管清单路径不是普通文件：{path}");
+        }
+    }
+    let mut remote = sftp
+        .create(Path::new(&path))
+        .with_context(|| format!("无法创建服务器托管清单 {path}"))?;
+    remote.write_all(&bytes)?;
+    remote.write_all(b"\n")?;
+    remote.flush()?;
+    Ok(())
+}
+
+fn backup_remote_file(
+    sftp: &Sftp,
+    file: &RemoteFile,
+    backup_dir: &str,
+    reason: &str,
+) -> Result<SftpManagedBackup> {
+    let name = validate_remote_name(&file.name)?;
+    let backup_path = remote_join(backup_dir, &format!("{name}.bak"));
+    if sftp.lstat(Path::new(&backup_path)).is_ok() {
+        bail!("服务器备份目标已存在：{backup_path}");
+    }
+    sftp.rename(Path::new(&file.path), Path::new(&backup_path), None)
+        .with_context(|| format!("无法备份远端文件 {} -> {backup_path}", file.path))?;
+    Ok(SftpManagedBackup {
+        name,
+        original_path: file.path.clone(),
+        backup_path,
+        reason: reason.to_string(),
+    })
+}
+
+fn restore_managed_manifest(
+    sftp: &Sftp,
+    mods_path: &str,
+    manifest: &SftpManagedManifest,
+) -> Result<()> {
+    for rename in manifest.renames.iter().rev() {
+        if rename.has_signature {
+            let original_signature = remote_with_extension(&rename.original_path, "sig");
+            let deployed_signature = remote_with_extension(&rename.deployed_path, "sig");
+            if let Ok(stat) = sftp.lstat(Path::new(&deployed_signature)) {
+                if stat.is_dir() {
+                    bail!("托管排序签名路径不是文件：{deployed_signature}");
+                }
+                if sftp.lstat(Path::new(&original_signature)).is_ok() {
+                    bail!("恢复排序签名时发现原路径已存在：{original_signature}");
+                }
+                sftp.rename(
+                    Path::new(&deployed_signature),
+                    Path::new(&original_signature),
+                    None,
+                )
+                .with_context(|| {
+                    format!("无法恢复排序签名 {deployed_signature} -> {original_signature}")
+                })?;
+            }
+        }
+        if let Ok(stat) = sftp.lstat(Path::new(&rename.deployed_path)) {
+            if stat.is_dir() {
+                bail!("托管排序路径不是文件：{}", rename.deployed_path);
+            }
+            if sftp.lstat(Path::new(&rename.original_path)).is_ok() {
+                bail!("恢复排序文件名时发现原路径已存在：{}", rename.original_path);
+            }
+            sftp.rename(
+                Path::new(&rename.deployed_path),
+                Path::new(&rename.original_path),
+                None,
+            )
+            .with_context(|| {
+                format!(
+                    "无法恢复排序文件名 {} -> {}",
+                    rename.deployed_path, rename.original_path
+                )
+            })?;
+        }
+    }
+    for backup in manifest.backups.iter().rev() {
+        let Ok(stat) = sftp.lstat(Path::new(&backup.backup_path)) else {
+            continue;
+        };
+        if stat.is_dir() {
+            bail!("服务器托管备份路径不是文件：{}", backup.backup_path);
+        }
+        if sftp.lstat(Path::new(&backup.original_path)).is_ok() {
+            bail!("恢复备份时发现原路径已存在：{}", backup.original_path);
+        }
+        sftp.rename(
+            Path::new(&backup.backup_path),
+            Path::new(&backup.original_path),
+            None,
+        )
+        .with_context(|| {
+            format!(
+                "无法恢复服务器备份 {} -> {}",
+                backup.backup_path, backup.original_path
+            )
+        })?;
+    }
+    for path in manifest.created_paths.iter().rev() {
+        if let Ok(stat) = sftp.lstat(Path::new(path)) {
+            if stat.is_dir() {
+                bail!("托管创建路径不是文件：{path}");
+            }
+            sftp.unlink(Path::new(path))
+                .with_context(|| format!("无法删除托管创建的配置文件 {path}"))?;
+        }
+    }
+    if let Some(merged_path) = &manifest.merged_path {
+        if let Ok(stat) = sftp.lstat(Path::new(merged_path)) {
+            if stat.is_dir() {
+                bail!("合并包路径不是文件：{merged_path}");
+            }
+            sftp.unlink(Path::new(merged_path))
+                .with_context(|| format!("无法删除合并包 {merged_path}"))?;
+        }
+    }
+    let manifest_path = remote_join(mods_path, REMOTE_MERGED_MANIFEST);
+    if let Ok(stat) = sftp.lstat(Path::new(&manifest_path)) {
+        if stat.is_dir() {
+            bail!("服务器托管清单路径不是文件：{manifest_path}");
+        }
+        sftp.unlink(Path::new(&manifest_path))
+            .with_context(|| format!("无法删除服务器托管清单 {manifest_path}"))?;
+    }
+    Ok(())
+}
+
+fn build_remote_merged_pak(
+    paths: &AppPaths,
+    mods: &[ModEntry],
+    analysis: &crate::mods::ConflictAnalysis,
+    metadata: &MetadataFile,
+    output: &Path,
+) -> Result<bool> {
+    let conflicting_ids = analysis
+        .groups
+        .iter()
+        .flat_map(|group| group.owners.iter().map(|owner| owner.id.as_str()))
+        .collect::<HashSet<_>>();
+    if conflicting_ids.is_empty() {
+        return Ok(false);
+    }
+    let mods_by_id = mods
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected_entries = BTreeMap::<String, (String, PathBuf)>::new();
+    for group in &analysis.groups {
+        let winner = mods_by_id
+            .get(group.winner_id.as_str())
+            .with_context(|| format!("找不到冲突合并胜者：{}", group.winner_id))?;
+        let pak_path = PathBuf::from(&winner.file_path);
+        if !pak_path.is_file() {
+            bail!("冲突合并胜者缓存不存在：{}", pak_path.display());
+        }
+        let available = metadata
+            .entries
+            .get(&winner.id)
+            .into_iter()
+            .flat_map(|entry| entry.pak_entries.iter())
+            .filter_map(|entry| crate::mods::normalize_entry_path(entry))
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        for resource in &group.paths {
+            if !available.contains(&resource.to_ascii_lowercase()) {
+                bail!("冲突合并失败：{} 缺少资源 {}", winner.name, resource);
+            }
+            let key = resource.to_ascii_lowercase();
+            if let Some((existing, _)) = selected_entries.get(&key) {
+                if !existing.eq_ignore_ascii_case(&winner.file_path) {
+                    bail!("资源 {resource} 同时被多个冲突胜者选中");
+                }
+            } else {
+                selected_entries.insert(key, (resource.clone(), pak_path.clone()));
+            }
+        }
+    }
+    let mut conflicting_mods = mods
+        .iter()
+        .filter(|item| conflicting_ids.contains(item.id.as_str()))
+        .collect::<Vec<_>>();
+    conflicting_mods.sort_by(|left, right| {
+        left.load_order
+            .cmp(&right.load_order)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for item in conflicting_mods {
+        let pak_path = PathBuf::from(&item.file_path);
+        let Some(entry) = metadata.entries.get(&item.id) else {
+            bail!("参与合并的模组缺少资源清单：{}", item.name);
+        };
+        for raw in &entry.pak_entries {
+            let Some(resource) = crate::mods::normalize_entry_path(raw) else {
+                continue;
+            };
+            selected_entries
+                .entry(resource.to_ascii_lowercase())
+                .or_insert((resource, pak_path.clone()));
+        }
+    }
+    if selected_entries.is_empty() {
+        return Ok(false);
+    }
+
+    let stage = output
+        .parent()
+        .context("合并包输出缺少父目录")?
+        .join("tree");
+    std::fs::create_dir_all(&stage)?;
+    let result = (|| -> Result<()> {
+        let mut expected = BTreeSet::new();
+        for (_, (resource, pak_path)) in &selected_entries {
+            let destination = stage.join(safe_pak_relative_path(resource)?);
+            if !destination.starts_with(&stage) {
+                bail!("合并暂存路径越界：{resource}");
+            }
+            crate::mods::extract_pak_entry(paths, pak_path, resource, &destination)?;
+            expected.insert(resource.to_ascii_lowercase());
+        }
+        crate::mods::pack_pak(paths, &stage, output)?;
+        let packed = crate::mods::list_pak_entries(paths, output)?
+            .into_iter()
+            .map(|entry| entry.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        if !expected.is_subset(&packed) {
+            bail!("合并包校验失败：输出缺少预期资源");
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    result?;
+    Ok(true)
+}
+
+fn safe_pak_relative_path(resource: &str) -> Result<PathBuf> {
+    let mut relative = PathBuf::new();
+    for component in Path::new(resource).components() {
+        let Component::Normal(name) = component else {
+            bail!("拒绝不安全的 PAK 资源路径：{resource}");
+        };
+        let name = name.to_string_lossy();
+        if name.is_empty() || name.contains(':') || name.chars().any(char::is_control) {
+            bail!("拒绝不安全的 PAK 资源路径：{resource}");
+        }
+        relative.push(name.as_ref());
+    }
+    if relative.as_os_str().is_empty() {
+        bail!("PAK 资源路径为空");
+    }
+    Ok(relative)
 }
 
 fn upload_pak_files(
@@ -1681,17 +2507,231 @@ fn remote_join(parent: &str, child: &str) -> String {
     }
 }
 
+fn is_managed_merged_name(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .ends_with("_scum_mod_desk_merged.pak")
+}
+
+fn remote_deployment_prefix_width(pak_count: usize) -> usize {
+    pak_count.to_string().len().max(3)
+}
+
+fn numbered_remote_pak_file_name(index: usize, original: &str, width: usize) -> String {
+    format!("{index:0width$}_{original}")
+}
+
+fn plan_remote_pak_renames(
+    sorted_paks: &[RemoteFile],
+    disabled: &HashSet<String>,
+    conflicting_paths: &BTreeSet<String>,
+    mods_path: &str,
+    prefix_width: usize,
+) -> Vec<(RemoteFile, String)> {
+    sorted_paks
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| {
+            !disabled.contains(&file.path)
+                && !conflicting_paths.contains(&file.path)
+                && !is_managed_merged_name(&file.name)
+        })
+        .filter_map(|(load_order, file)| {
+            let target_name = numbered_remote_pak_file_name(load_order, &file.name, prefix_width);
+            (target_name != file.name).then(|| (file.clone(), remote_join(mods_path, &target_name)))
+        })
+        .collect()
+}
+
+fn build_remote_ue4ss_mods_txt(
+    files: &[RemoteFile],
+    order: &[String],
+    disabled: &HashSet<String>,
+    existing: &str,
+) -> String {
+    let order_index = order
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut mods = files
+        .iter()
+        .filter(|file| file.is_directory)
+        .collect::<Vec<_>>();
+    mods.sort_by(|left, right| {
+        order_index
+            .get(left.path.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+            .cmp(
+                &order_index
+                    .get(right.path.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let managed_names = mods
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut kept = existing
+        .lines()
+        .filter(|line| {
+            let name = line.split(':').next().unwrap_or_default().trim();
+            !managed_names.contains(name)
+        })
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let managed_lines = mods
+        .iter()
+        .map(|file| {
+            let enabled = usize::from(!disabled.contains(&file.path));
+            format!("{} : {enabled}", file.name)
+        })
+        .collect::<Vec<_>>();
+    let insert_at = kept
+        .iter()
+        .position(|line| line.to_ascii_lowercase().starts_with("keybinds"))
+        .unwrap_or(kept.len());
+    let tail = kept.split_off(insert_at);
+    kept.extend(managed_lines);
+    kept.extend(tail);
+    kept.join("\n")
+}
+
+fn validate_managed_manifest_paths(
+    mods_path: &str,
+    ue4ss_path: &str,
+    manifest: &SftpManagedManifest,
+) -> Result<()> {
+    if manifest.version != 1 {
+        bail!("不支持的服务器托管清单版本：{}", manifest.version);
+    }
+    let roots = [mods_path, ue4ss_path]
+        .into_iter()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        bail!("服务器托管清单缺少可用的模组根目录");
+    }
+    let mods_root = normalize_remote_path(mods_path);
+    let backup_roots = roots
+        .iter()
+        .map(|root| normalize_remote_path(root))
+        .filter(|root| root != "/")
+        .map(|root| remote_join(&root, REMOTE_BACKUP_DIRECTORY))
+        .collect::<Vec<_>>();
+
+    let require_file_in_root = |path: &str| -> Result<()> {
+        if !is_clean_remote_path(path) || !roots.iter().any(|root| remote_path_within(root, path)) {
+            bail!("服务器托管清单包含越界文件路径：{path}");
+        }
+        Ok(())
+    };
+    let require_backup_path = |path: &str| -> Result<()> {
+        if !is_clean_remote_path(path)
+            || !backup_roots
+                .iter()
+                .any(|root| remote_path_within(root, path))
+            || backup_roots
+                .iter()
+                .any(|root| normalize_remote_path(path) == *root)
+        {
+            bail!("服务器托管清单包含越界备份路径：{path}");
+        }
+        Ok(())
+    };
+
+    if let Some(merged_path) = &manifest.merged_path {
+        if !is_clean_remote_path(merged_path)
+            || !remote_path_within(&mods_root, merged_path)
+            || normalize_remote_path(merged_path) == mods_root
+        {
+            bail!("服务器托管清单包含越界合并包路径：{merged_path}");
+        }
+    }
+    for source in &manifest.sources {
+        if !is_clean_remote_path(&source.path) || !remote_path_within(&mods_root, &source.path) {
+            bail!("服务器托管清单包含越界合并来源：{}", source.path);
+        }
+    }
+
+    let mut originals = HashSet::new();
+    let mut backups = HashSet::new();
+    for backup in &manifest.backups {
+        require_file_in_root(&backup.original_path)?;
+        require_backup_path(&backup.backup_path)?;
+        if !originals.insert(backup.original_path.clone())
+            || !backups.insert(backup.backup_path.clone())
+        {
+            bail!("服务器托管清单包含重复文件或备份路径");
+        }
+        if entry_name(&backup.original_path) != backup.name {
+            bail!("服务器托管清单中的文件名与原始路径不一致：{}", backup.name);
+        }
+    }
+
+    let mut deployed_paths = HashSet::new();
+    for rename in &manifest.renames {
+        require_file_in_root(&rename.original_path)?;
+        require_file_in_root(&rename.deployed_path)?;
+        if !originals.insert(rename.original_path.clone()) {
+            bail!("服务器托管清单包含重复原始路径：{}", rename.original_path);
+        }
+        if !deployed_paths.insert(rename.deployed_path.clone()) {
+            bail!("服务器托管清单包含重复排序目标：{}", rename.deployed_path);
+        }
+        if remote_parent(&rename.original_path) != remote_parent(&rename.deployed_path) {
+            bail!("服务器排序重命名不能跨目录：{}", rename.deployed_path);
+        }
+        if entry_name(&rename.original_path) != rename.name {
+            bail!("服务器托管清单中的文件名与排序路径不一致：{}", rename.name);
+        }
+        validate_remote_name(&entry_name(&rename.deployed_path))?;
+    }
+    let mut created_paths = HashSet::new();
+    for path in &manifest.created_paths {
+        require_file_in_root(path)?;
+        if roots
+            .iter()
+            .any(|root| normalize_remote_path(root) == normalize_remote_path(path))
+        {
+            bail!("服务器托管清单不能把模组根目录标记为创建文件：{path}");
+        }
+        if !created_paths.insert(path.clone()) {
+            bail!("服务器托管清单包含重复创建路径：{path}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        active_account, conflict_entries_cache_name, download_file,
-        ensure_remote_operation_allowed, load_remote_notes, move_remote_notes, pak_path_candidates,
-        read_conflict_entries_cache, remote_join, remove_remote_notes_under, root_from_pak_path,
-        root_from_ue4ss_path, save_remote_notes, ue4ss_path_candidates, validate_remote_name,
-        write_conflict_entries_cache, RemoteNotesFile,
+        active_account, build_remote_merged_pak, build_remote_ue4ss_mods_txt,
+        conflict_entries_cache_name, download_file, ensure_remote_operation_allowed,
+        load_remote_notes, move_remote_notes, numbered_remote_pak_file_name, pak_path_candidates,
+        plan_remote_pak_renames, read_conflict_entries_cache, remote_deployment_prefix_width,
+        remote_join, remove_remote_notes_under, root_from_pak_path, root_from_ue4ss_path,
+        safe_pak_relative_path, save_remote_notes, ue4ss_path_candidates,
+        validate_managed_manifest_paths, validate_remote_name, write_conflict_entries_cache,
+        RemoteNotesFile,
     };
-    use crate::models::{AppSettings, SftpAccount};
+    use crate::metadata::MetadataFile;
+    use crate::models::{
+        AppSettings, ModEntry, RemoteFile, SftpAccount, SftpManagedBackup, SftpManagedManifest,
+        SftpManagedRename,
+    };
     use crate::test_support::TempRoot;
+    use std::collections::{BTreeSet, HashSet};
+    use std::path::Path;
+    use std::process::Command;
 
     fn account(id: &str) -> SftpAccount {
         SftpAccount {
@@ -1807,6 +2847,135 @@ mod tests {
     }
 
     #[test]
+    fn creates_stable_remote_pak_order_prefixes() {
+        assert_eq!(remote_deployment_prefix_width(1), 3);
+        assert_eq!(remote_deployment_prefix_width(1_250), 4);
+        assert_eq!(
+            numbered_remote_pak_file_name(12, "Weapons.pak", 3),
+            "012_Weapons.pak"
+        );
+    }
+
+    #[test]
+    fn plans_remote_pak_renames_in_the_requested_order() {
+        let mods_root = "/srv/scum/SCUM/Content/Paks/~mods";
+        let file = |name: &str| RemoteFile {
+            name: name.to_string(),
+            path: remote_join(mods_root, name),
+            is_directory: false,
+            size: 1,
+            modified_at: None,
+        };
+        let files = vec![
+            file("Alpha.pak"),
+            file("Beta.pak"),
+            file("Gamma.pak"),
+            file("Delta.pak"),
+            file("999_SCUM_Mod_Desk_Merged.pak"),
+        ];
+        let disabled = HashSet::from([remote_join(mods_root, "Beta.pak")]);
+        let conflicting = BTreeSet::from([remote_join(mods_root, "Delta.pak")]);
+        let planned = plan_remote_pak_renames(
+            &files,
+            &disabled,
+            &conflicting,
+            mods_root,
+            remote_deployment_prefix_width(files.len()),
+        );
+        assert_eq!(
+            planned
+                .iter()
+                .map(|(file, target)| (file.name.as_str(), target.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "Alpha.pak",
+                    "/srv/scum/SCUM/Content/Paks/~mods/000_Alpha.pak"
+                ),
+                (
+                    "Gamma.pak",
+                    "/srv/scum/SCUM/Content/Paks/~mods/002_Gamma.pak"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_remote_ue4ss_enable_and_order_config() {
+        let ue4ss_root = "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods";
+        let file = |name: &str, is_directory: bool| RemoteFile {
+            name: name.to_string(),
+            path: remote_join(ue4ss_root, name),
+            is_directory,
+            size: 0,
+            modified_at: None,
+        };
+        let files = vec![
+            file("BPModLoaderMod", true),
+            file("SCUMTweaks", true),
+            file("loose.lua", false),
+        ];
+        let order = vec![
+            "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/SCUMTweaks".to_string(),
+            "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/BPModLoaderMod".to_string(),
+        ];
+        let disabled = HashSet::from([remote_join(ue4ss_root, "BPModLoaderMod")]);
+        let output = build_remote_ue4ss_mods_txt(
+            &files,
+            &order,
+            &disabled,
+            "OtherMod : 1\nBPModLoaderMod : 1\nKeybinds : 1\n",
+        );
+        assert_eq!(
+            output,
+            "OtherMod : 1\nSCUMTweaks : 1\nBPModLoaderMod : 0\nKeybinds : 1"
+        );
+    }
+
+    #[test]
+    fn rejects_managed_manifest_paths_outside_mod_roots() {
+        let mods_root = "/srv/scum/SCUM/Content/Paks/~mods";
+        let ue4ss_root = "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods";
+        let valid = SftpManagedManifest {
+            version: 1,
+            merged_path: Some(remote_join(mods_root, "999_SCUM_Mod_Desk_Merged.pak")),
+            backups: vec![SftpManagedBackup {
+                name: "Alpha.pak".to_string(),
+                original_path: remote_join(mods_root, "Alpha.pak"),
+                backup_path: remote_join(
+                    mods_root,
+                    "_SCUM_Mod_Desk_Backups/20260101-000000-000/Alpha.pak.bak",
+                ),
+                reason: "merged".to_string(),
+            }],
+            renames: vec![SftpManagedRename {
+                name: "Beta.pak".to_string(),
+                original_path: remote_join(mods_root, "Beta.pak"),
+                deployed_path: remote_join(mods_root, "001_Beta.pak"),
+                has_signature: false,
+            }],
+            ..SftpManagedManifest::default()
+        };
+        assert!(validate_managed_manifest_paths(mods_root, ue4ss_root, &valid).is_ok());
+
+        let mut escaped_backup = valid.clone();
+        escaped_backup.backups[0].backup_path = "/srv/scum/outside/Alpha.pak.bak".to_string();
+        assert!(validate_managed_manifest_paths(mods_root, ue4ss_root, &escaped_backup).is_err());
+
+        let mut escaped_restore = valid;
+        escaped_restore.renames[0].original_path =
+            "/srv/scum/SCUM/Config/ServerSettings.ini".to_string();
+        assert!(validate_managed_manifest_paths(mods_root, ue4ss_root, &escaped_restore).is_err());
+
+        let mut escaped_created = SftpManagedManifest {
+            created_paths: vec!["/srv/scum/SCUM/Config/ServerSettings.ini".to_string()],
+            ..SftpManagedManifest::default()
+        };
+        escaped_created.version = 1;
+        assert!(validate_managed_manifest_paths(mods_root, ue4ss_root, &escaped_created).is_err());
+    }
+
+    #[test]
     fn validates_download_paths_before_opening_a_connection() {
         let temp = TempRoot::new("sftp-download-validation");
         let paths = temp.paths();
@@ -1841,6 +3010,86 @@ mod tests {
     }
 
     #[test]
+    fn builds_a_merged_pak_with_selected_winner_and_unique_files() {
+        let temp = TempRoot::new("sftp-merged-pak");
+        let paths = temp.paths();
+        let alpha = build_test_pak(
+            temp.path(),
+            &paths,
+            "Alpha",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"alpha"),
+                ("SCUM/Content/Assets/AlphaOnly.uexp", b"alpha-only"),
+            ],
+        );
+        let beta = build_test_pak(
+            temp.path(),
+            &paths,
+            "Beta",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"beta"),
+                ("SCUM/Content/Assets/BetaOnly.uexp", b"beta-only"),
+            ],
+        );
+        let alpha_entries = crate::mods::list_pak_entries(&paths, &alpha).unwrap();
+        let beta_entries = crate::mods::list_pak_entries(&paths, &beta).unwrap();
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut("alpha").pak_entries = alpha_entries;
+        metadata.entry_mut("beta").pak_entries = beta_entries;
+        metadata.conflict_winners.insert(
+            "scum/content/assets/shared".to_string(),
+            "alpha".to_string(),
+        );
+        let mods = vec![
+            ModEntry {
+                id: "alpha".to_string(),
+                name: "Alpha.pak".to_string(),
+                file_name: "Alpha.pak".to_string(),
+                file_path: alpha.to_string_lossy().into_owned(),
+                enabled: true,
+                mod_type: "clientPak".to_string(),
+                load_order: 0,
+                ..ModEntry::default()
+            },
+            ModEntry {
+                id: "beta".to_string(),
+                name: "Beta.pak".to_string(),
+                file_name: "Beta.pak".to_string(),
+                file_path: beta.to_string_lossy().into_owned(),
+                enabled: true,
+                mod_type: "clientPak".to_string(),
+                load_order: 1,
+                ..ModEntry::default()
+            },
+        ];
+        let analysis = crate::mods::analyze_conflicts(&metadata, &mods);
+        let output = temp.path().join("Merged.pak");
+
+        assert!(build_remote_merged_pak(&paths, &mods, &analysis, &metadata, &output).unwrap());
+        let entries = crate::mods::list_pak_entries(&paths, &output).unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry.ends_with("AlphaOnly.uexp")));
+        assert!(entries.iter().any(|entry| entry.ends_with("BetaOnly.uexp")));
+        let extracted = temp.path().join("Shared.uasset");
+        crate::mods::extract_pak_entry(
+            &paths,
+            &output,
+            "SCUM/Content/Assets/Shared.uasset",
+            &extracted,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(extracted).unwrap(), b"alpha");
+    }
+
+    #[test]
+    fn rejects_unsafe_merged_pak_paths() {
+        assert!(safe_pak_relative_path("SCUM/Content/Shared.uasset").is_ok());
+        assert!(safe_pak_relative_path("../escape.uasset").is_err());
+        assert!(safe_pak_relative_path("SCUM/Content/C:escape.uasset").is_err());
+    }
+
+    #[test]
     fn moves_and_removes_remote_notes_with_the_mod_entry() {
         let temp = TempRoot::new("sftp-remote-notes");
         let paths = temp.paths();
@@ -1863,5 +3112,34 @@ mod tests {
 
         remove_remote_notes_under(&paths, "server", target).unwrap();
         assert!(load_remote_notes(&paths).unwrap().accounts["server"].is_empty());
+    }
+
+    fn build_test_pak(
+        root: &Path,
+        paths: &crate::paths::AppPaths,
+        label: &str,
+        entries: &[(&str, &[u8])],
+    ) -> std::path::PathBuf {
+        let input = root.join(format!("{label}-input"));
+        for (relative, body) in entries {
+            let path = input.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let pak = root.join(format!("{label}.pak"));
+        let output = Command::new(paths.resource("repak.exe"))
+            .arg("pack")
+            .arg("-m")
+            .arg("../../../")
+            .arg(&input)
+            .arg(&pak)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "repak pack failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        pak
     }
 }

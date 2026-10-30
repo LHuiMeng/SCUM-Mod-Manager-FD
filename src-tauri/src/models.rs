@@ -372,6 +372,8 @@ pub struct SftpConnectionResult {
     #[serde(default)]
     pub home_path: Option<String>,
     #[serde(default)]
+    pub managed_manifest: Option<SftpManagedManifest>,
+    #[serde(default)]
     pub host_key_fingerprint: Option<String>,
     #[serde(default)]
     pub requires_trust: bool,
@@ -419,6 +421,52 @@ pub struct SftpConflictProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_file: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SftpManagedSource {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SftpManagedBackup {
+    pub name: String,
+    pub original_path: String,
+    pub backup_path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SftpManagedRename {
+    pub name: String,
+    pub original_path: String,
+    pub deployed_path: String,
+    pub has_signature: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SftpManagedManifest {
+    pub version: u32,
+    pub created_at: String,
+    pub merged_path: Option<String>,
+    pub merged_name: Option<String>,
+    pub sources: Vec<SftpManagedSource>,
+    pub backups: Vec<SftpManagedBackup>,
+    pub renames: Vec<SftpManagedRename>,
+    pub created_paths: Vec<String>,
+    pub winners: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpApplyResult {
+    pub message: String,
+    pub manifest: SftpManagedManifest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

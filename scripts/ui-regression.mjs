@@ -905,16 +905,203 @@ async function connect(url, appUrl) {
     return { rows: await evaluate("document.querySelectorAll('.remote-file-row').length") };
   });
 
+  await test("服务器模组库排序、冲突托管与合并来源", async () => {
+    await navigate("模组库");
+    const localFirstId = await evaluate(
+      "document.querySelector('.mod-row')?.dataset.modId ?? ''",
+    );
+    await waitFor(
+      "document.querySelector('.library-source-switch button:not(:disabled)') !== null",
+    );
+    await clickText("服务器模组", ".library-source-switch button");
+    await waitFor("document.querySelector('h1')?.innerText === '服务器模组库'");
+    await waitFor("document.querySelectorAll('.mod-row').length >= 4");
+
+    const initialOrder = await evaluate(
+      "[...document.querySelectorAll('.mod-row')].map(row => row.dataset.modId)",
+    );
+    await evaluate(`(() => {
+      const row = document.querySelector(".mod-row");
+      row?.focus();
+      row?.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "ArrowDown",
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }));
+      return true;
+    })()`);
+    await waitFor(
+      `document.querySelector(".mod-row")?.dataset.modId !== ${JSON.stringify(initialOrder[0])}`,
+    );
+    const reordered = await evaluate(
+      "[...document.querySelectorAll('.mod-row')].map(row => row.dataset.modId)",
+    );
+    if (reordered[0] === initialOrder[0] || reordered[1] !== initialOrder[0]) {
+      throw new Error(`服务器模组未按 Alt+↓ 调整顺序：${JSON.stringify({ initialOrder, reordered })}`);
+    }
+
+    await clickText("本地模组", ".library-source-switch button");
+    await waitFor("document.querySelector('h1')?.innerText === '模组库'");
+    const localAfterReorder = await evaluate(
+      "document.querySelector('.mod-row')?.dataset.modId ?? ''",
+    );
+    if (localAfterReorder !== localFirstId) {
+      throw new Error(`服务器排序串改本地顺序：${localFirstId} -> ${localAfterReorder}`);
+    }
+
+    await clickText("服务器模组", ".library-source-switch button");
+    await waitFor("document.querySelectorAll('.mod-row').length >= 4");
+    await evaluate("document.querySelector('.mod-row')?.click()");
+    await waitFor("document.querySelector('.conflict-health-trigger') !== null");
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('.conflict-panel') !== null");
+    await evaluate("document.querySelector('.conflict-choice')?.click()");
+    await clickText("保存覆盖选择", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+    await waitFor("document.body.innerText.includes('覆盖选择已保存')");
+
+    await clickText("备份并应用合并");
+    await waitFor("document.body.innerText.includes('服务器布局已应用')", 10000);
+    await waitFor(
+      "document.body.innerText.includes('服务器已应用托管布局') && document.body.innerText.includes('SCUM Mod Desk 合并模组')",
+      10000,
+    );
+    const managedCopy = await evaluate(
+      "document.querySelector('.server-library-strip-copy')?.innerText ?? ''",
+    );
+    if (
+      !managedCopy.includes("SCUM_WeaponPack_Elite.pak") ||
+      !managedCopy.includes("LootBalance_Plus.pak")
+    ) {
+      throw new Error(`服务器模组库未显示合并来源：${managedCopy}`);
+    }
+    await waitFor(`(() => {
+      const button = [...document.querySelectorAll("button")]
+        .find(item => item.innerText.includes("备份并应用合并"));
+      return Boolean(button?.disabled);
+    })()`, 10000);
+    const applyDisabled = await evaluate(`(() => {
+      const button = [...document.querySelectorAll("button")]
+        .find(item => item.innerText.includes("备份并应用合并"));
+      return Boolean(button?.disabled);
+    })()`);
+    if (!applyDisabled) {
+      throw new Error("已有托管布局时仍可重复应用，可能覆盖原始排序");
+    }
+    screenshots.push(await screenshot("1440-light-server-library-merged"));
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1100,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(240);
+    const serverLibraryWidth = await evaluate(`(() => {
+      const layout = document.querySelector(".library-layout");
+      const strip = document.querySelector(".server-library-strip");
+      const layoutRect = layout?.getBoundingClientRect();
+      const stripRect = strip?.getBoundingClientRect();
+      return {
+        viewport: window.innerWidth,
+        documentWidth: document.documentElement.scrollWidth,
+        layoutRight: layoutRect?.right ?? 0,
+        stripRight: stripRect?.right ?? 0,
+      };
+    })()`);
+    if (
+      serverLibraryWidth.documentWidth > serverLibraryWidth.viewport + 1 ||
+      serverLibraryWidth.layoutRight > serverLibraryWidth.viewport + 1 ||
+      serverLibraryWidth.stripRight > serverLibraryWidth.viewport + 1
+    ) {
+      throw new Error(`1100 宽服务器模组库横向溢出：${JSON.stringify(serverLibraryWidth)}`);
+    }
+    screenshots.push(await screenshot("1100-light-server-library-merged"));
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1440,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(160);
+
+    await clickText("本地模组", ".library-source-switch button");
+    await waitFor("document.querySelector('h1')?.innerText === '模组库'");
+    await navigate("服务器");
+    await waitFor(
+      "document.querySelector('.remote-viewer-inspector')?.innerText.includes('合并 PAK')",
+      10000,
+    );
+    const mergedViewer = await evaluate(
+      "document.querySelector('.remote-viewer-inspector')?.innerText ?? ''",
+    );
+    if (
+      !mergedViewer.includes("合并来源") ||
+      !mergedViewer.includes("SCUM_WeaponPack_Elite.pak") ||
+      !mergedViewer.includes("LootBalance_Plus.pak")
+    ) {
+      throw new Error(`服务器查看器缺少合并来源：${mergedViewer.slice(0, 300)}`);
+    }
+    const managedActions = await evaluate(`(() => {
+      const buttons = [...document.querySelectorAll(".remote-viewer-inspector-actions button")];
+      return {
+        disabled: buttons.map(button => Boolean(button.disabled)),
+        note: document.querySelector(".remote-viewer-managed-note")?.innerText ?? "",
+      };
+    })()`);
+    if (
+      managedActions.disabled.length !== 2 ||
+      managedActions.disabled.some(value => !value) ||
+      !managedActions.note.includes("服务器托管")
+    ) {
+      throw new Error(`托管合并包仍可重命名或删除：${JSON.stringify(managedActions)}`);
+    }
+
+    await navigate("模组库");
+    await clickText("服务器模组", ".library-source-switch button");
+    await waitFor("document.body.innerText.includes('服务器已应用托管布局')");
+    await clickText("恢复服务器原状");
+    await waitFor("document.body.innerText.includes('服务器原始模组已恢复')", 10000);
+    await waitFor(
+      "document.body.innerText.includes('尚未应用服务器布局') && document.body.innerText.includes('SCUM_WeaponPack_Elite.pak')",
+      10000,
+    );
+    const mergedGone = await evaluate(
+      "![...document.querySelectorAll('.mod-row-main > b')].some(item => item.innerText.includes('合并模组'))",
+    );
+    if (!mergedGone) {
+      throw new Error("恢复服务器原状后仍显示合并模组");
+    }
+    await clickText("本地模组", ".library-source-switch button");
+    await waitFor("document.querySelector('h1')?.innerText === '模组库'");
+    const localFinalId = await evaluate(
+      "document.querySelector('.mod-row')?.dataset.modId ?? ''",
+    );
+    if (localFinalId !== localFirstId) {
+      throw new Error(`服务器托管流程串改本地顺序：${localFirstId} -> ${localFinalId}`);
+    }
+
+    return {
+      initialOrder,
+      reordered,
+      managedCopy,
+      applyDisabled,
+      localFirstId,
+    };
+  });
+
   await test("SFTP 路径导航、全类型文件与布局编辑", async () => {
+    await navigate("服务器");
     const initial = await evaluate(`(() => ({
-      lockedPanels: document.querySelectorAll(".server-panel-drag.is-locked").length,
+      panelBars: document.querySelectorAll(".server-panel-bar").length,
+      dragHandles: document.querySelectorAll(".server-panel-drag").length,
       resizers: document.querySelectorAll(".server-panel-resizer").length,
       path: document.querySelector(".remote-path-controls input")?.value ?? "",
       files: [...document.querySelectorAll(".remote-file-row")]
         .map(row => row.innerText)
         .slice(0, 6),
     }))()`);
-    if (initial.lockedPanels !== 3 || initial.resizers !== 0) {
+    if (initial.panelBars !== 0 || initial.dragHandles !== 0 || initial.resizers !== 0) {
       throw new Error(`默认布局未锁定：${JSON.stringify(initial)}`);
     }
     if (!initial.path.includes("/~mods")) {
@@ -923,7 +1110,21 @@ async function connect(url, appUrl) {
     if (!initial.files.some(text => text.includes("PAK"))) {
       throw new Error(`文件树未展示 PAK 类型：${JSON.stringify(initial.files)}`);
     }
-    await evaluate("document.querySelector('.remote-file-row:not(.is-browsable)')?.click()");
+    const selectedRow = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".remote-file-row")]
+        .find(item => !item.classList.contains("is-browsable"));
+      if (!row) return null;
+      const result = {
+        title: row.title,
+        className: row.className,
+        text: row.innerText,
+      };
+      row.click();
+      return result;
+    })()`);
+    if (!selectedRow) {
+      throw new Error("文件树中没有可选择文件");
+    }
     await waitFor("document.querySelector('.remote-file-selection') !== null");
     const selectedFile = await evaluate(`(() => ({
       text: document.querySelector(".remote-file-selection")?.innerText ?? "",
@@ -933,7 +1134,11 @@ async function connect(url, appUrl) {
       throw new Error(`文件详情或下载入口缺失：${JSON.stringify(selectedFile)}`);
     }
 
-    await clickText("上级目录");
+    await setInput(
+      "/srv/scum/SCUM/Content/Paks/~mods",
+      "/srv/scum/SCUM/Content/Paks",
+    );
+    await clickText("前往", ".remote-path-form button");
     await waitFor(
       "document.querySelector('.remote-path-controls input')?.value === '/srv/scum/SCUM/Content/Paks'",
     );
@@ -1066,7 +1271,7 @@ async function connect(url, appUrl) {
 
     await clickText("完成编辑");
     await waitFor(
-      "document.querySelectorAll('.server-panel-resizer').length === 0 && document.querySelectorAll('.server-panel-drag.is-locked').length === 3",
+      "document.querySelectorAll('.server-panel-resizer').length === 0 && document.querySelectorAll('.server-panel-drag').length === 0 && document.querySelectorAll('.server-panel-bar').length === 0",
     );
     await clickText("恢复布局");
     await wait(120);
@@ -1076,8 +1281,8 @@ async function connect(url, appUrl) {
       afterMove,
       resizeStart,
       resizeEnd,
-      lockedAfterFinish: await evaluate(
-        "document.querySelectorAll('.server-panel-drag.is-locked').length",
+      panelBarsAfterFinish: await evaluate(
+        "document.querySelectorAll('.server-panel-bar').length",
       ),
     };
   });

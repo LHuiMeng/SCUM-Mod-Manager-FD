@@ -24,6 +24,7 @@ interface ModTableProps {
   selectedId: string | null;
   search: string;
   locked: boolean;
+  lockedMessage?: string;
   lastDeployedAt: string | null;
   conflictCount: number;
   removingId: string | null;
@@ -69,6 +70,7 @@ export function ModTable({
   selectedId,
   search,
   locked,
+  lockedMessage,
   lastDeployedAt,
   conflictCount,
   removingId,
@@ -230,7 +232,7 @@ export function ModTable({
   const dragHint = canDrag
     ? t("library.dragHint.active")
     : locked
-      ? t("library.dragHint.locked")
+      ? lockedMessage ?? t("library.dragHint.locked")
       : sortMode !== "load"
       ? t("library.dragHint.loadOrder")
       : search.trim()
@@ -597,6 +599,7 @@ export function ModTable({
                 sortable={canDrag}
                 showLoadOrder={sortMode === "load"}
                 locked={locked}
+                lockedTitle={lockedMessage}
                 dragging={dragging}
                 dragShift={dragShiftFor(index)}
                 dragOffsetY={dragging ? dragPreview?.offsetY ?? null : null}

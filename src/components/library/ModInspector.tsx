@@ -8,6 +8,7 @@ import { Tag } from "../ui/Tag";
 
 interface ModInspectorProps {
   mod: ModEntry | null;
+  serverMode?: boolean;
   onEdit: () => void;
   onDelete: () => void;
   onOpenFolder: () => void;
@@ -16,6 +17,7 @@ interface ModInspectorProps {
 
 export function ModInspector({
   mod,
+  serverMode = false,
   onEdit,
   onDelete,
   onOpenFolder,
@@ -75,7 +77,13 @@ export function ModInspector({
       <div className="inspector-body">
         <span className="inspector-kicker">
           {t(modTypeKey(mod.type))} ·{" "}
-          {t(mod.originSource === "cloud" ? "inspector.originCloud" : "inspector.originLocal")}
+          {t(
+            serverMode
+              ? "inspector.originServer"
+              : mod.originSource === "cloud"
+                ? "inspector.originCloud"
+                : "inspector.originLocal",
+          )}
         </span>
         <h2>{mod.name}</h2>
         {mod.author ? (
@@ -90,9 +98,11 @@ export function ModInspector({
             <Tag>{t("common.uncategorized")}</Tag>
           )}
         </div>
-        <Button className="detail-action" trailingIcon="edit" onClick={onEdit}>
-          {t("inspector.edit")}
-        </Button>
+        {!serverMode ? (
+          <Button className="detail-action" trailingIcon="edit" onClick={onEdit}>
+            {t("inspector.edit")}
+          </Button>
+        ) : null}
 
         <section className="inspector-section">
           <div className="section-title">
@@ -199,22 +209,30 @@ export function ModInspector({
       </div>
       <div className="inspector-footer">
         <div className="inspector-footer-meta">
-          <span>
-            SHA-256 {compactHash(mod.sha256, t("common.notCalculated"))}
-          </span>
-          <button type="button" onClick={onOpenFolder}>
-            {t("inspector.openFolder")}
-          </button>
+          {serverMode ? (
+            <span>{t("inspector.serverManaged")}</span>
+          ) : (
+            <>
+              <span>
+                SHA-256 {compactHash(mod.sha256, t("common.notCalculated"))}
+              </span>
+              <button type="button" onClick={onOpenFolder}>
+                {t("inspector.openFolder")}
+              </button>
+            </>
+          )}
         </div>
-        <Button
-          className="inspector-delete-button"
-          size="sm"
-          variant="danger"
-          icon="trash"
-          onClick={onDelete}
-        >
-          {t("inspector.delete")}
-        </Button>
+        {!serverMode ? (
+          <Button
+            className="inspector-delete-button"
+            size="sm"
+            variant="danger"
+            icon="trash"
+            onClick={onDelete}
+          >
+            {t("inspector.delete")}
+          </Button>
+        ) : null}
       </div>
     </aside>
   );
