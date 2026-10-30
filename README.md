@@ -45,7 +45,9 @@
 - 拖拽调整 PAK 加载顺序，编辑标签与本地备注，或把模组安全移入删除备份
 - 从 Steam 注册表和 `libraryfolders.vdf` 检测游戏路径
 - 浏览云模组目录，云目录提供 SHA-256 时强制校验，缺少时明确提示未校验
-- SFTP 浏览、主机指纹确认、连接测试与服务器模组上传
+- SFTP 链接解析、PAK / UE4SS 目录扫描、主机指纹确认与连接测试
+- 可拖拽排序和调高的服务器工作区，固定高度查看远端模组列表
+- 远端 PAK / UE4SS 上传、重命名、递归删除、PAK 资源冲突分析与本地备注
 - 亮色纸张主题与中性石墨暗色主题
 - 简体中文 / English 界面切换，支持用户覆盖翻译文件
 
@@ -146,6 +148,7 @@ app-data/
   config.json
   mods_meta.json
   deployment_manifest.json
+  sftp_remote_notes.json    远端模组本地备注
   ~mods/
   ue4ss_runtime/
   backups/deploy/

@@ -410,8 +410,7 @@ async function connect(url, appUrl) {
         ).transform`),
       );
     }
-    if (transitionSamples[0] === transitionSamples[2] ||
-        transitionSamples[1] === transitionSamples[2]) {
+    if (new Set(transitionSamples).size < 2) {
       throw new Error(`让位过程没有连续过渡：${JSON.stringify(transitionSamples)}`);
     }
     screenshots.push(await screenshot("1440-light-drag-preview"));
@@ -876,6 +875,32 @@ async function connect(url, appUrl) {
     await waitFor("document.body.innerText.includes('SFTP 账户已安全保存')", 10000);
     await clickText("测试连接");
     await waitFor("document.querySelectorAll('.remote-file-row').length > 0", 10000);
+    await waitFor("document.querySelector('.remote-viewer-item') !== null", 10000);
+    await clickText("检查冲突");
+    await waitFor("document.body.innerText.includes('已分析 2 个远端 PAK')", 10000);
+    await setInput(
+      "记录用途、版本、测试结果或回滚说明...",
+      "QA remote note",
+      "textarea",
+    );
+    await clickText("保存备注");
+    await waitFor("document.body.innerText.includes('备注已保存')", 10000);
+    await clickText("重命名");
+    await waitFor(
+      "document.querySelector('#modal-title')?.innerText === '重命名远端模组'",
+    );
+    await clickText("取消", ".modal-foot button");
+    await clickText("删除");
+    await waitFor(
+      "document.querySelector('#modal-title')?.innerText === '删除远端模组'",
+    );
+    await clickText("取消", ".modal-foot button");
+    const viewerHeight = await evaluate(
+      "document.querySelector('.panel-viewer')?.getBoundingClientRect().height ?? 0",
+    );
+    if (viewerHeight <= 0 || viewerHeight > 760) {
+      throw new Error(`模组查看器高度异常：${viewerHeight}`);
+    }
     screenshots.push(await screenshot("1440-light-server"));
     return { rows: await evaluate("document.querySelectorAll('.remote-file-row').length") };
   });

@@ -390,13 +390,13 @@ const remoteMods: RemoteMod[] = [
   },
 ];
 
-const remoteFiles: RemoteFile[] = [
+let remoteFiles: RemoteFile[] = [
   { name: "~mods", path: "/srv/scum/SCUM/Content/Paks/~mods", isDirectory: true, size: 0, modifiedAt: null },
   { name: "SCUM_WeaponPack_Elite.pak", path: "/srv/scum/SCUM/Content/Paks/~mods/SCUM_WeaponPack_Elite.pak", isDirectory: false, size: 1374389535, modifiedAt: new Date(now - 2 * 86400000).toISOString() },
   { name: "LootBalance_Plus.pak", path: "/srv/scum/SCUM/Content/Paks/~mods/LootBalance_Plus.pak", isDirectory: false, size: 13421772, modifiedAt: new Date(now - 4 * 86400000).toISOString() },
 ];
 
-const remoteUe4ssMods: RemoteFile[] = [
+let remoteUe4ssMods: RemoteFile[] = [
   {
     name: "BPModLoaderMod",
     path: "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/BPModLoaderMod",
@@ -412,6 +412,11 @@ const remoteUe4ssMods: RemoteFile[] = [
     modifiedAt: new Date(now - 5 * 86400000).toISOString(),
   },
 ];
+
+let remoteNotes: Record<string, string> = {
+  "/srv/scum/SCUM/Content/Paks/~mods/SCUM_WeaponPack_Elite.pak":
+    "服务器主武器包，更新前先备份。",
+};
 
 export function mockSnapshot(): LibrarySnapshot {
   recomputeMockConflicts();
@@ -640,6 +645,76 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
     }
     case "upload_server_mods":
       return { uploaded: 0, message: "演示环境未执行上传" } as T;
+    case "rename_sftp_entry": {
+      const path = String(args?.path ?? "");
+      const newName = String(args?.newName ?? "").trim();
+      const collection = remoteFiles.some((file) => file.path === path)
+        ? remoteFiles
+        : remoteUe4ssMods;
+      const item = collection.find((file) => file.path === path);
+      if (!item || !newName || /[\\/]/.test(newName)) {
+        throw new Error("无法重命名远端模组");
+      }
+      const parent = path.slice(0, path.lastIndexOf("/"));
+      const nextPath = `${parent}/${newName}`;
+      item.name = newName;
+      item.path = nextPath;
+      if (remoteNotes[path]) {
+        remoteNotes[nextPath] = remoteNotes[path];
+        delete remoteNotes[path];
+      }
+      return { message: `已重命名为 ${newName}`, path: nextPath } as T;
+    }
+    case "delete_sftp_entry": {
+      const path = String(args?.path ?? "");
+      remoteFiles = remoteFiles.filter(
+        (file) => file.path !== path && !file.path.startsWith(`${path}/`),
+      );
+      remoteUe4ssMods = remoteUe4ssMods.filter(
+        (file) => file.path !== path && !file.path.startsWith(`${path}/`),
+      );
+      remoteNotes = Object.fromEntries(
+        Object.entries(remoteNotes).filter(
+          ([notePath]) => notePath !== path && !notePath.startsWith(`${path}/`),
+        ),
+      );
+      return { message: "已删除远端模组", path } as T;
+    }
+    case "get_sftp_remote_notes":
+      return structuredClone(remoteNotes) as T;
+    case "save_sftp_remote_note": {
+      const path = String(args?.path ?? "");
+      const note = String(args?.note ?? "");
+      if (note.trim()) remoteNotes[path] = note;
+      else delete remoteNotes[path];
+      return structuredClone(remoteNotes) as T;
+    }
+    case "analyze_sftp_conflicts": {
+      const pakMods = remoteFiles.filter(
+        (file) => !file.isDirectory && file.name.endsWith(".pak"),
+      );
+      const groups =
+        pakMods.length >= 2
+          ? [
+              {
+                resourcePath: "SCUM/Content/Items/Weapons/WeaponConfig",
+                owners: pakMods.slice(0, 2).map((file) => ({
+                  name: file.name,
+                  path: file.path,
+                  kind: "pak",
+                })),
+              },
+            ]
+          : [];
+      return {
+        groups,
+        analyzedMods: pakMods.length,
+        skippedMods: 0,
+        message: groups.length
+          ? `已分析 ${pakMods.length} 个远端 PAK，发现 ${groups.length} 组资源冲突`
+          : `已分析 ${pakMods.length} 个远端 PAK，未发现资源冲突`,
+      } as T;
+    }
     case "inspect_mod_import": {
       const paths = (args?.paths as string[] | undefined) ?? [];
       const conflicts = paths.flatMap((sourcePath) => {

@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, chooseDirectory, chooseFiles, isTauri } from "./api/tauri";
+import {
+  api,
+  chooseDirectory,
+  chooseFiles,
+  chooseServerPakFiles,
+  isTauri,
+} from "./api/tauri";
 import type {
   AppInfo,
   AppSettings,
@@ -16,7 +22,9 @@ import type {
   RemoteMod,
   RuntimeLog,
   SftpAccount,
+  SftpConflictReport,
   SftpConnectionResult,
+  SftpUploadKind,
   ThemeMode,
   ToastMessage,
 } from "./types";
@@ -96,6 +104,9 @@ function LocalizedApp() {
   const [sftpTrustPrompt, setSftpTrustPrompt] = useState<SftpTrustPrompt | null>(null);
   const [sftpScan, setSftpScan] = useState<SftpConnectionResult | null>(null);
   const [sftpScanAccountId, setSftpScanAccountId] = useState<string | null>(null);
+  const [remoteNotes, setRemoteNotes] = useState<Record<string, string>>({});
+  const [remoteConflicts, setRemoteConflicts] = useState<SftpConflictReport | null>(null);
+  const [remoteConflictLoading, setRemoteConflictLoading] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [updatePhase, setUpdatePhase] = useState<AppUpdatePhase>("idle");
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
@@ -1000,6 +1011,8 @@ function LocalizedApp() {
       setSftpTrustPrompt(null);
       setSftpScan(null);
       setSftpScanAccountId(null);
+      setRemoteNotes({});
+      setRemoteConflicts(null);
       setRemoteFiles([]);
       notify(t("toast.sftpSaved.title"), t("toast.sftpSaved.detail"), "success");
     } catch (error) {
@@ -1008,7 +1021,7 @@ function LocalizedApp() {
     }
   }
 
-  async function handleTestSftp(accountId: string) {
+  async function handleTestSftp(accountId: string, silent = false) {
     setServerError(null);
     setBusy(true);
     try {
@@ -1016,6 +1029,8 @@ function LocalizedApp() {
       if (result.requiresTrust && result.hostKeyFingerprint) {
         setSftpScan(null);
         setSftpScanAccountId(null);
+        setRemoteNotes({});
+        setRemoteConflicts(null);
         setSftpTrustPrompt({
           accountId,
           fingerprint: result.hostKeyFingerprint,
@@ -1032,7 +1047,13 @@ function LocalizedApp() {
       setSnapshot(await api.getSnapshot());
       setSftpScan(result);
       setSftpScanAccountId(accountId);
-      notify(t("toast.connectionDone.title"), result.message, "success");
+      setRemoteConflicts(null);
+      try {
+        setRemoteNotes(await api.getSftpRemoteNotes(accountId));
+      } catch {
+        setRemoteNotes({});
+      }
+      if (!silent) notify(t("toast.connectionDone.title"), result.message, "success");
       if (result.detectedModsPath) {
         await handleLoadRemoteFiles(result.detectedModsPath);
       } else {
@@ -1041,6 +1062,8 @@ function LocalizedApp() {
     } catch (error) {
       setSftpScan(null);
       setSftpScanAccountId(null);
+      setRemoteNotes({});
+      setRemoteConflicts(null);
       setServerError(String(error));
       notify(t("toast.sftpFailed.title"), String(error), "error");
     } finally {
@@ -1075,22 +1098,96 @@ function LocalizedApp() {
     }
   }
 
-  async function handleUpload(accountId: string, paths: string[]) {
-    const selected = paths.length > 0 ? paths : await chooseFiles();
+  async function handleUpload(accountId: string, kind: SftpUploadKind) {
+    const selected =
+      kind === "pak"
+        ? await chooseServerPakFiles()
+        : await chooseDirectory().then((path) => (path ? [path] : []));
     if (selected.length === 0) {
       notify(t("toast.noServerMods.title"), t("toast.noServerMods.detail"));
       return;
     }
     setBusy(true);
     try {
-      const result = await api.uploadServerMods(accountId, selected);
+      const result = await api.uploadServerMods(accountId, kind, selected);
       notify(t("toast.uploadDone.title"), result.message, "success");
-      const account = snapshot?.settings.sftpAccounts.find((item) => item.id === accountId);
-      if (account) await handleLoadRemoteFiles(account.modsPath);
+      await handleTestSftp(accountId, true);
     } catch (error) {
       setServerError(String(error));
       notify(t("toast.uploadFailed.title"), String(error), "error");
     } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRenameSftpEntry(
+    accountId: string,
+    path: string,
+    newName: string,
+  ): Promise<string | null> {
+    setBusy(true);
+    try {
+      const result = await api.renameSftpEntry(accountId, path, newName);
+      notify(t("toast.remoteRenameDone.title"), result.message, "success");
+      await handleTestSftp(accountId, true);
+      return result.path;
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.remoteRenameFailed.title"), String(error), "error");
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDeleteSftpEntry(accountId: string, path: string): Promise<boolean> {
+    setBusy(true);
+    try {
+      const result = await api.deleteSftpEntry(accountId, path);
+      notify(t("toast.remoteDeleteDone.title"), result.message, "success");
+      await handleTestSftp(accountId, true);
+      return true;
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.remoteDeleteFailed.title"), String(error), "error");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveRemoteNote(
+    accountId: string,
+    path: string,
+    note: string,
+  ): Promise<boolean> {
+    try {
+      setRemoteNotes(await api.saveSftpRemoteNote(accountId, path, note));
+      notify(t("toast.remoteNoteSaved.title"), t("toast.remoteNoteSaved.detail"), "success");
+      return true;
+    } catch (error) {
+      notify(t("toast.remoteNoteFailed.title"), String(error), "error");
+      return false;
+    }
+  }
+
+  async function handleAnalyzeSftpConflicts(accountId: string) {
+    if (busy || remoteConflictLoading) return;
+    setBusy(true);
+    setRemoteConflictLoading(true);
+    try {
+      const report = await api.analyzeSftpConflicts(accountId);
+      setRemoteConflicts(report);
+      notify(
+        t("toast.remoteConflictDone.title"),
+        report.message,
+        report.groups.length > 0 ? "default" : "success",
+      );
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.remoteConflictFailed.title"), String(error), "error");
+    } finally {
+      setRemoteConflictLoading(false);
       setBusy(false);
     }
   }
@@ -1203,6 +1300,9 @@ function LocalizedApp() {
               trustPrompt={sftpTrustPrompt}
               scan={sftpScanAccountId === snapshot.settings.activeSftpAccountId ? sftpScan : null}
               connectedAccountId={sftpScanAccountId}
+              notes={remoteNotes}
+              conflicts={remoteConflicts}
+              conflictLoading={remoteConflictLoading}
               onSaveAccount={(account, password) =>
                 void handleSaveSftpAccount(account, password)
               }
@@ -1210,7 +1310,11 @@ function LocalizedApp() {
               onTrustHost={() => void handleTrustSftpHost()}
               onDismissTrust={() => setSftpTrustPrompt(null)}
               onLoadFiles={(_id, path) => void handleLoadRemoteFiles(path)}
-              onUpload={(id, paths) => void handleUpload(id, paths)}
+              onUpload={(id, kind) => handleUpload(id, kind)}
+              onRename={handleRenameSftpEntry}
+              onDelete={handleDeleteSftpEntry}
+              onSaveNote={handleSaveRemoteNote}
+              onAnalyzeConflicts={handleAnalyzeSftpConflicts}
               onOpenSettings={() => setSection("settings")}
             />
           ) : null}

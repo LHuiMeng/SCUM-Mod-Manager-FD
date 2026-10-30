@@ -170,6 +170,31 @@ export interface SftpConnectionResult {
   requiresTrust: boolean;
 }
 
+export type SftpUploadKind = "pak" | "ue4ss";
+
+export interface SftpOperationResult {
+  message: string;
+  path: string;
+}
+
+export interface SftpConflictOwner {
+  name: string;
+  path: string;
+  kind: "pak" | "ue4ss";
+}
+
+export interface SftpConflictGroup {
+  resourcePath: string;
+  owners: SftpConflictOwner[];
+}
+
+export interface SftpConflictReport {
+  groups: SftpConflictGroup[];
+  analyzedMods: number;
+  skippedMods: number;
+  message: string;
+}
+
 export interface ImportResult {
   imported: number;
   skipped: number;

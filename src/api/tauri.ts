@@ -12,7 +12,10 @@ import type {
   RemoteFile,
   RemoteMod,
   RuntimeLog,
+  SftpConflictReport,
   SftpConnectionResult,
+  SftpOperationResult,
+  SftpUploadKind,
   ThemeMode,
 } from "../types";
 
@@ -79,8 +82,22 @@ export const api = {
     },
     password: string,
   ) => call<LibrarySnapshot>("save_sftp_account", { account, password }),
-  uploadServerMods: (accountId: string, paths: string[]) =>
-    call<{ uploaded: number; message: string }>("upload_server_mods", { accountId, paths }),
+  uploadServerMods: (accountId: string, kind: SftpUploadKind, paths: string[]) =>
+    call<{ uploaded: number; message: string }>("upload_server_mods", {
+      accountId,
+      kind,
+      paths,
+    }),
+  renameSftpEntry: (accountId: string, path: string, newName: string) =>
+    call<SftpOperationResult>("rename_sftp_entry", { accountId, path, newName }),
+  deleteSftpEntry: (accountId: string, path: string) =>
+    call<SftpOperationResult>("delete_sftp_entry", { accountId, path }),
+  getSftpRemoteNotes: (accountId: string) =>
+    call<Record<string, string>>("get_sftp_remote_notes", { accountId }),
+  saveSftpRemoteNote: (accountId: string, path: string, note: string) =>
+    call<Record<string, string>>("save_sftp_remote_note", { accountId, path, note }),
+  analyzeSftpConflicts: (accountId: string) =>
+    call<SftpConflictReport>("analyze_sftp_conflicts", { accountId }),
   minimize: () => call<void>("window_minimize"),
   toggleMaximize: () => call<void>("window_toggle_maximize"),
   close: () => call<void>("window_close"),
@@ -93,6 +110,18 @@ export async function chooseFiles(): Promise<string[]> {
     multiple: true,
     directory: false,
     filters: [{ name: "SCUM Mods", extensions: ["pak", "zip"] }],
+  });
+  if (!selected) return [];
+  return Array.isArray(selected) ? selected : [selected];
+}
+
+export async function chooseServerPakFiles(): Promise<string[]> {
+  if (!isTauri()) return [];
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    multiple: true,
+    directory: false,
+    filters: [{ name: "SCUM PAK Mods", extensions: ["pak"] }],
   });
   if (!selected) return [];
   return Array.isArray(selected) ? selected : [selected];

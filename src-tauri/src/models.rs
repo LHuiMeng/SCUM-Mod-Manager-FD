@@ -377,6 +377,37 @@ pub struct SftpConnectionResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SftpOperationResult {
+    pub message: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpConflictOwner {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpConflictGroup {
+    pub resource_path: String,
+    pub owners: Vec<SftpConflictOwner>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpConflictReport {
+    pub groups: Vec<SftpConflictGroup>,
+    pub analyzed_mods: usize,
+    pub skipped_mods: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadResult {
     pub uploaded: usize,
     pub message: String,

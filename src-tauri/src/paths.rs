@@ -16,6 +16,7 @@ pub struct AppPaths {
     pub deployment_manifest: PathBuf,
     pub logs_dir: PathBuf,
     pub sftp_known_hosts: PathBuf,
+    pub sftp_remote_notes: PathBuf,
     pub backups_dir: PathBuf,
     resource_dir: PathBuf,
 }
@@ -51,6 +52,7 @@ impl AppPaths {
             deployment_manifest: root.join("deployment_manifest.json"),
             logs_dir: root.join("logs"),
             sftp_known_hosts: root.join("secrets").join("sftp_known_hosts.json"),
+            sftp_remote_notes: root.join("sftp_remote_notes.json"),
             backups_dir: root.join("backups"),
             resource_dir,
             root,
@@ -135,6 +137,7 @@ impl AppPaths {
             deployment_manifest: root.join("deployment_manifest.json"),
             logs_dir: root.join("logs"),
             sftp_known_hosts: root.join("secrets").join("sftp_known_hosts.json"),
+            sftp_remote_notes: root.join("sftp_remote_notes.json"),
             backups_dir: root.join("backups"),
             resource_dir: root.clone(),
             root,

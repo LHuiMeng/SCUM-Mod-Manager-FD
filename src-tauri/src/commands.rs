@@ -4,7 +4,8 @@ use crate::launcher;
 use crate::models::{
     AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, DetectPathsResult, DownloadResult,
     GameStatus, ImportConflict, ImportResult, InstallUpdateResult, LibrarySnapshot, LocaleBundle,
-    RemoteFile, RemoteMod, RuntimeLog, SftpAccountInput, SftpConnectionResult, UploadResult,
+    RemoteFile, RemoteMod, RuntimeLog, SftpAccountInput, SftpConflictReport, SftpConnectionResult,
+    SftpOperationResult, UploadResult,
 };
 use crate::paths::path_string;
 use crate::sftp;
@@ -494,12 +495,99 @@ pub async fn save_sftp_account(
 pub async fn upload_server_mods(
     app: AppHandle,
     account_id: String,
+    kind: String,
     paths: Vec<String>,
 ) -> Result<UploadResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
-        let result = sftp::upload_files(&state.paths, &settings, &account_id, &paths)?;
+        let result = sftp::upload_files(&state.paths, &settings, &account_id, &kind, &paths)?;
+        state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn rename_sftp_entry(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+    new_name: String,
+) -> Result<SftpOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::rename_entry(&state.paths, &settings, &account_id, &path, &new_name)?;
+        state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn delete_sftp_entry(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+) -> Result<SftpOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::delete_entry(&state.paths, &settings, &account_id, &path)?;
+        state.log("warn", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn get_sftp_remote_notes(
+    app: AppHandle,
+    account_id: String,
+) -> Result<BTreeMap<String, String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        sftp::read_remote_notes(&state.paths, &settings, &account_id)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn save_sftp_remote_note(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+    note: String,
+) -> Result<BTreeMap<String, String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        sftp::save_remote_note(&state.paths, &settings, &account_id, &path, &note)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn analyze_sftp_conflicts(
+    app: AppHandle,
+    account_id: String,
+) -> Result<SftpConflictReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::analyze_remote_conflicts(&state.paths, &settings, &account_id)?;
         state.log("info", "sftp", &result.message);
         Ok::<_, anyhow::Error>(result)
     })

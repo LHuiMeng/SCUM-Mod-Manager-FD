@@ -1,19 +1,29 @@
-use crate::models::{AppSettings, RemoteFile, SftpAccount, SftpConnectionResult, UploadResult};
-use crate::paths::AppPaths;
+use crate::models::{
+    AppSettings, RemoteFile, SftpAccount, SftpConflictGroup, SftpConflictOwner, SftpConflictReport,
+    SftpConnectionResult, SftpOperationResult, UploadResult,
+};
+use crate::paths::{safe_disk_name, AppPaths};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssh2::{Session, Sftp};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fs::File;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
+use walkdir::WalkDir;
 
 const MAX_REMOTE_SCAN_DIRECTORIES: usize = 96;
 const MAX_REMOTE_SCAN_DEPTH: usize = 7;
 const MAX_REMOTE_SCAN_ENTRIES_PER_DIRECTORY: usize = 300;
+const MAX_REMOTE_TREE_ENTRIES: usize = 20_000;
+const MAX_REMOTE_CONFLICT_MODS: usize = 64;
+const MAX_REMOTE_CONFLICT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_REMOTE_NOTE_CHARS: usize = 20_000;
 
 pub fn active_account<'a>(
     settings: &'a AppSettings,
@@ -174,38 +184,351 @@ pub fn upload_files(
     paths: &AppPaths,
     settings: &AppSettings,
     account_id: &str,
+    kind: &str,
     local_paths: &[String],
 ) -> Result<UploadResult> {
     let account = active_account(settings, Some(account_id))?;
+    match kind {
+        "pak" => upload_pak_files(paths, account, local_paths),
+        "ue4ss" => upload_ue4ss_directories(paths, account, local_paths),
+        _ => bail!("不支持的远端模组类型：{kind}"),
+    }
+}
+
+pub fn rename_entry(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+    new_name: &str,
+) -> Result<SftpOperationResult> {
+    let account = active_account(settings, Some(account_id))?;
+    ensure_remote_operation_allowed(account, remote_path)?;
+    if normalize_remote_path(remote_path) == normalize_remote_path(&account.mods_path)
+        || normalize_remote_path(remote_path) == normalize_remote_path(&account.ue4ss_path)
+    {
+        bail!("不能重命名模组根目录");
+    }
+    let new_name = validate_remote_name(new_name)?;
+    let source = normalize_remote_path(remote_path);
+    let parent = remote_parent(&source).context("远端模组路径缺少父目录")?;
+    let target = remote_join(&parent, &new_name);
+    ensure_remote_operation_allowed(account, &target)?;
+    if source.eq_ignore_ascii_case(&target) {
+        return Ok(SftpOperationResult {
+            message: "远端模组名称未变化".to_string(),
+            path: source,
+        });
+    }
+    if source.to_ascii_lowercase().ends_with(".pak")
+        && !target.to_ascii_lowercase().ends_with(".pak")
+    {
+        bail!("PAK 模组必须保留 .pak 扩展名");
+    }
+
+    with_sftp(paths, account, |sftp| {
+        if sftp.lstat(Path::new(&target)).is_ok() {
+            bail!("目标名称已存在：{target}");
+        }
+        let signature_pair = source.to_ascii_lowercase().ends_with(".pak").then(|| {
+            (
+                remote_with_extension(&source, "sig"),
+                remote_with_extension(&target, "sig"),
+            )
+        });
+        if let Some((source_sig, target_sig)) = &signature_pair {
+            if sftp.lstat(Path::new(source_sig)).is_ok()
+                && sftp.lstat(Path::new(target_sig)).is_ok()
+            {
+                bail!("目标签名文件已存在：{target_sig}");
+            }
+        }
+        sftp.rename(Path::new(&source), Path::new(&target), None)
+            .with_context(|| format!("无法重命名远端模组 {source} -> {target}"))?;
+        if let Some((source_sig, target_sig)) = signature_pair {
+            if sftp.lstat(Path::new(&source_sig)).is_ok() {
+                sftp.rename(Path::new(&source_sig), Path::new(&target_sig), None)
+                    .with_context(|| {
+                        format!("无法重命名远端签名文件 {source_sig} -> {target_sig}")
+                    })?;
+            }
+        }
+        Ok(())
+    })?;
+    let _ = move_remote_notes(paths, account_id, &source, &target);
+    Ok(SftpOperationResult {
+        message: format!("已重命名为 {}", entry_name(&target)),
+        path: target,
+    })
+}
+
+pub fn delete_entry(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+) -> Result<SftpOperationResult> {
+    let account = active_account(settings, Some(account_id))?;
+    ensure_remote_operation_allowed(account, remote_path)?;
+    let target = normalize_remote_path(remote_path);
+    if target == normalize_remote_path(&account.mods_path)
+        || target == normalize_remote_path(&account.ue4ss_path)
+    {
+        bail!("不能删除模组根目录");
+    }
+    let name = entry_name(&target);
+    with_sftp(paths, account, |sftp| {
+        let mut visited = 0;
+        remove_remote_tree(sftp, &target, 0, &mut visited)?;
+        if target.to_ascii_lowercase().ends_with(".pak") {
+            let signature = remote_with_extension(&target, "sig");
+            if sftp.lstat(Path::new(&signature)).is_ok() {
+                sftp.unlink(Path::new(&signature))
+                    .with_context(|| format!("无法删除远端签名文件 {signature}"))?;
+            }
+        }
+        Ok(())
+    })?;
+    let _ = remove_remote_notes_under(paths, account_id, &target);
+    Ok(SftpOperationResult {
+        message: format!("已删除远端模组 {name}"),
+        path: target,
+    })
+}
+
+pub fn read_remote_notes(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+) -> Result<BTreeMap<String, String>> {
+    active_account(settings, Some(account_id))?;
+    Ok(load_remote_notes(paths)?
+        .accounts
+        .remove(account_id)
+        .unwrap_or_default())
+}
+
+pub fn save_remote_note(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+    note: &str,
+) -> Result<BTreeMap<String, String>> {
+    active_account(settings, Some(account_id))?;
+    let remote_path = normalize_remote_path(remote_path);
+    if !is_clean_remote_path(&remote_path) {
+        bail!("远端模组路径无效");
+    }
+    if note.chars().count() > MAX_REMOTE_NOTE_CHARS {
+        bail!("备注不能超过 {MAX_REMOTE_NOTE_CHARS} 个字符");
+    }
+    let mut notes = load_remote_notes(paths)?;
+    let account_notes = {
+        let account_notes = notes.accounts.entry(account_id.to_string()).or_default();
+        if note.trim().is_empty() {
+            account_notes.remove(&remote_path);
+        } else {
+            account_notes.insert(remote_path, note.to_string());
+        }
+        account_notes.clone()
+    };
+    save_remote_notes(paths, &notes)?;
+    Ok(account_notes)
+}
+
+pub fn analyze_remote_conflicts(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+) -> Result<SftpConflictReport> {
+    let account = active_account(settings, Some(account_id))?;
+    if account.mods_path.trim().is_empty() {
+        bail!("尚未定位远端 PAK 模组目录");
+    }
+    let temp = paths
+        .root
+        .join("downloads")
+        .join(format!("sftp-conflicts-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp)
+        .with_context(|| format!("无法创建冲突分析缓存 {}", temp.display()))?;
+    let result = analyze_remote_conflicts_inner(paths, account, &temp);
+    let _ = std::fs::remove_dir_all(&temp);
+    result
+}
+
+fn upload_pak_files(
+    paths: &AppPaths,
+    account: &SftpAccount,
+    local_paths: &[String],
+) -> Result<UploadResult> {
     if account.mods_path.trim().is_empty() {
         bail!("尚未设置服务器远端 ~mods 路径");
     }
     let uploaded = with_sftp(paths, account, |sftp| {
+        if !remote_dir_exists(sftp, &account.mods_path) {
+            bail!("远端 PAK 目录不存在：{}", account.mods_path);
+        }
         let mut uploaded = 0;
         for local in local_paths {
             let local = Path::new(local);
             if !local.is_file() {
                 continue;
             }
-            let name = local
-                .file_name()
-                .context("上传文件缺少文件名")?
-                .to_string_lossy();
+            if !local
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pak"))
+            {
+                bail!("仅支持上传 .pak 文件：{}", local.display());
+            }
+            let name = validate_remote_name(
+                &local
+                    .file_name()
+                    .context("上传文件缺少文件名")?
+                    .to_string_lossy(),
+            )?;
             let remote = remote_join(&account.mods_path, &name);
-            let mut source = std::fs::File::open(local)
-                .with_context(|| format!("无法读取 {}", local.display()))?;
-            let mut target = sftp
-                .create(Path::new(&remote))
-                .with_context(|| format!("无法创建远端文件 {remote}"))?;
-            std::io::copy(&mut source, &mut target)?;
+            upload_local_file(sftp, local, &remote)?;
+            let local_signature = local.with_extension("sig");
+            if local_signature.is_file() {
+                upload_local_file(
+                    sftp,
+                    &local_signature,
+                    &remote_with_extension(&remote, "sig"),
+                )?;
+            }
             uploaded += 1;
         }
         Ok(uploaded)
     })?;
     Ok(UploadResult {
         uploaded,
-        message: format!("已上传 {uploaded} 个文件到 {}", account.mods_path),
+        message: format!("已上传 {uploaded} 个 PAK 到 {}", account.mods_path),
     })
+}
+
+fn upload_ue4ss_directories(
+    paths: &AppPaths,
+    account: &SftpAccount,
+    local_paths: &[String],
+) -> Result<UploadResult> {
+    if account.ue4ss_path.trim().is_empty() {
+        bail!("尚未设置服务器远端 UE4SS Mods 路径");
+    }
+    let uploaded = with_sftp(paths, account, |sftp| {
+        if !remote_dir_exists(sftp, &account.ue4ss_path) {
+            bail!("远端 UE4SS Mods 目录不存在：{}", account.ue4ss_path);
+        }
+        let mut uploaded = 0;
+        for local in local_paths {
+            let local = Path::new(local);
+            if !local.is_dir() {
+                continue;
+            }
+            let name = validate_remote_name(
+                &local
+                    .file_name()
+                    .context("上传目录缺少名称")?
+                    .to_string_lossy(),
+            )?;
+            let target = remote_join(&account.ue4ss_path, &name);
+            uploaded += upload_remote_tree(sftp, local, &target)?;
+        }
+        Ok(uploaded)
+    })?;
+    Ok(UploadResult {
+        uploaded,
+        message: format!("已上传 {uploaded} 个 UE4SS 文件到 {}", account.ue4ss_path),
+    })
+}
+
+fn upload_remote_tree(sftp: &Sftp, local_root: &Path, remote_root: &str) -> Result<usize> {
+    ensure_remote_dir(sftp, remote_root)?;
+    let mut uploaded = 0;
+    for entry in WalkDir::new(local_root).follow_links(false) {
+        let entry = entry.with_context(|| format!("无法遍历 {}", local_root.display()))?;
+        if entry.path() == local_root {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(local_root)
+            .context("UE4SS 上传路径越界")?;
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!("UE4SS 上传路径包含非法目录");
+        }
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let remote = remote_join(remote_root, &relative);
+        if entry.file_type().is_dir() {
+            ensure_remote_dir(sftp, &remote)?;
+        } else if entry.file_type().is_file() {
+            upload_local_file(sftp, entry.path(), &remote)?;
+            uploaded += 1;
+        }
+        if uploaded > MAX_REMOTE_TREE_ENTRIES {
+            bail!("UE4SS 上传文件数量超过 {MAX_REMOTE_TREE_ENTRIES} 个");
+        }
+    }
+    Ok(uploaded)
+}
+
+fn upload_local_file(sftp: &Sftp, local: &Path, remote: &str) -> Result<()> {
+    let mut source = File::open(local).with_context(|| format!("无法读取 {}", local.display()))?;
+    let mut target = sftp
+        .create(Path::new(remote))
+        .with_context(|| format!("无法创建远端文件 {remote}"))?;
+    std::io::copy(&mut source, &mut target)?;
+    Ok(())
+}
+
+fn ensure_remote_dir(sftp: &Sftp, path: &str) -> Result<()> {
+    if remote_dir_exists(sftp, path) {
+        return Ok(());
+    }
+    let parent = remote_parent(path);
+    if let Some(parent) = parent {
+        if parent != path {
+            ensure_remote_dir(sftp, &parent)?;
+        }
+    }
+    sftp.mkdir(Path::new(path), 0o755)
+        .with_context(|| format!("无法创建远端目录 {path}"))
+}
+
+fn remove_remote_tree(sftp: &Sftp, path: &str, depth: usize, visited: &mut usize) -> Result<()> {
+    if depth > 64 {
+        bail!("远端目录层级过深，已停止删除");
+    }
+    *visited += 1;
+    if *visited > MAX_REMOTE_TREE_ENTRIES {
+        bail!("远端目录条目过多，已停止删除");
+    }
+    let stat = sftp
+        .lstat(Path::new(path))
+        .with_context(|| format!("无法读取远端路径 {path}"))?;
+    if stat.file_type().is_symlink() || !stat.is_dir() {
+        return sftp
+            .unlink(Path::new(path))
+            .with_context(|| format!("无法删除远端文件 {path}"));
+    }
+    let entries = sftp
+        .readdir(Path::new(path))
+        .with_context(|| format!("无法读取远端目录 {path}"))?;
+    for (entry_path, _) in entries {
+        let name = entry_name(&entry_path.to_string_lossy());
+        if name == "." || name == ".." {
+            continue;
+        }
+        let child = normalize_remote_path(&entry_path.to_string_lossy());
+        if child != path {
+            remove_remote_tree(sftp, &child, depth + 1, visited)?;
+        }
+    }
+    sftp.rmdir(Path::new(path))
+        .with_context(|| format!("无法删除远端目录 {path}"))
 }
 
 fn with_sftp<T>(
@@ -575,6 +898,264 @@ fn should_skip_remote_scan_dir(name: &str) -> bool {
     )
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteNotesFile {
+    #[serde(default)]
+    accounts: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+fn load_remote_notes(paths: &AppPaths) -> Result<RemoteNotesFile> {
+    if !paths.sftp_remote_notes.exists() {
+        return Ok(RemoteNotesFile::default());
+    }
+    let raw = std::fs::read_to_string(&paths.sftp_remote_notes)
+        .with_context(|| format!("无法读取 {}", paths.sftp_remote_notes.display()))?;
+    serde_json::from_str(&raw).context("SFTP 远端备注文件格式无效")
+}
+
+fn save_remote_notes(paths: &AppPaths, notes: &RemoteNotesFile) -> Result<()> {
+    if let Some(parent) = paths.sftp_remote_notes.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(notes)?;
+    std::fs::write(&paths.sftp_remote_notes, format!("{json}\n"))
+        .with_context(|| format!("无法写入 {}", paths.sftp_remote_notes.display()))
+}
+
+fn move_remote_notes(paths: &AppPaths, account_id: &str, source: &str, target: &str) -> Result<()> {
+    let mut file = load_remote_notes(paths)?;
+    let Some(notes) = file.accounts.get_mut(account_id) else {
+        return Ok(());
+    };
+    let mut changed = false;
+    let moves = notes
+        .iter()
+        .filter(|(path, _)| {
+            path.as_str() == source
+                || path
+                    .strip_prefix(source)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        .map(|(path, note)| (path.clone(), note.clone()))
+        .collect::<Vec<_>>();
+    for (old_path, note) in moves {
+        notes.remove(&old_path);
+        let suffix = old_path.strip_prefix(source).unwrap_or_default();
+        notes.insert(format!("{target}{suffix}"), note);
+        changed = true;
+    }
+    if changed {
+        save_remote_notes(paths, &file)?;
+    }
+    Ok(())
+}
+
+fn remove_remote_notes_under(paths: &AppPaths, account_id: &str, remote_path: &str) -> Result<()> {
+    let mut file = load_remote_notes(paths)?;
+    let Some(notes) = file.accounts.get_mut(account_id) else {
+        return Ok(());
+    };
+    let before = notes.len();
+    notes.retain(|path, _| {
+        path != remote_path
+            && !path
+                .strip_prefix(remote_path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    });
+    if notes.len() != before {
+        save_remote_notes(paths, &file)?;
+    }
+    Ok(())
+}
+
+fn analyze_remote_conflicts_inner(
+    paths: &AppPaths,
+    account: &SftpAccount,
+    temp: &Path,
+) -> Result<SftpConflictReport> {
+    let mut downloaded: Vec<(RemoteFile, PathBuf)> = Vec::new();
+    let mut skipped_mods = 0usize;
+    let mut total_bytes = 0u64;
+    with_sftp(paths, account, |sftp| {
+        let pak_files = list_pak_mods(sftp, &account.mods_path);
+        for (index, file) in pak_files.into_iter().enumerate() {
+            if downloaded.len() >= MAX_REMOTE_CONFLICT_MODS {
+                skipped_mods += 1;
+                continue;
+            }
+            if total_bytes.saturating_add(file.size) > MAX_REMOTE_CONFLICT_BYTES {
+                skipped_mods += 1;
+                continue;
+            }
+            let stem = Path::new(&file.name)
+                .file_stem()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "mod".to_string());
+            let local = temp.join(format!("{index:03}-{}.pak", safe_disk_name(&stem, "mod")));
+            let downloaded_file = (|| -> Result<()> {
+                let mut remote = sftp
+                    .open(Path::new(&file.path))
+                    .with_context(|| format!("无法读取远端 PAK {}", file.path))?;
+                let mut output = File::create(&local)
+                    .with_context(|| format!("无法创建冲突分析缓存 {}", local.display()))?;
+                std::io::copy(&mut remote, &mut output)?;
+                Ok(())
+            })();
+            if downloaded_file.is_err() {
+                skipped_mods += 1;
+                let _ = std::fs::remove_file(&local);
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(file.size);
+            downloaded.push((file, local));
+        }
+        Ok(())
+    })?;
+
+    let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut display_paths: BTreeMap<String, String> = BTreeMap::new();
+    let mut owner_info: BTreeMap<String, SftpConflictOwner> = BTreeMap::new();
+    let mut analyzed_mods = 0usize;
+    for (file, local) in &downloaded {
+        let entries = match crate::mods::list_pak_entries(paths, local) {
+            Ok(entries) => entries,
+            Err(_) => {
+                skipped_mods += 1;
+                continue;
+            }
+        };
+        analyzed_mods += 1;
+        owner_info.insert(
+            file.path.clone(),
+            SftpConflictOwner {
+                name: file.name.clone(),
+                path: file.path.clone(),
+                kind: "pak".to_string(),
+            },
+        );
+        let mut seen = HashSet::new();
+        for raw in entries {
+            let Some(resource_path) = crate::mods::normalize_entry_path(&raw) else {
+                continue;
+            };
+            let key = resource_path.to_ascii_lowercase();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            display_paths.entry(key.clone()).or_insert(resource_path);
+            owners.entry(key).or_default().insert(file.path.clone());
+        }
+    }
+
+    let mut groups = owners
+        .into_iter()
+        .filter(|(_, mod_paths)| mod_paths.len() > 1)
+        .map(|(key, mod_paths)| SftpConflictGroup {
+            resource_path: display_paths.remove(&key).unwrap_or(key),
+            owners: mod_paths
+                .into_iter()
+                .filter_map(|path| owner_info.get(&path).cloned())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        left.resource_path
+            .to_ascii_lowercase()
+            .cmp(&right.resource_path.to_ascii_lowercase())
+            .then_with(|| left.resource_path.cmp(&right.resource_path))
+    });
+    let message = if groups.is_empty() {
+        format!(
+            "已分析 {analyzed_mods} 个远端 PAK，未发现资源冲突{}",
+            if skipped_mods > 0 {
+                format!("；跳过 {skipped_mods} 个")
+            } else {
+                String::new()
+            }
+        )
+    } else {
+        format!(
+            "已分析 {analyzed_mods} 个远端 PAK，发现 {} 组资源冲突{}",
+            groups.len(),
+            if skipped_mods > 0 {
+                format!("；跳过 {skipped_mods} 个")
+            } else {
+                String::new()
+            }
+        )
+    };
+    Ok(SftpConflictReport {
+        groups,
+        analyzed_mods,
+        skipped_mods,
+        message,
+    })
+}
+
+fn ensure_remote_operation_allowed(account: &SftpAccount, path: &str) -> Result<()> {
+    if !is_clean_remote_path(path) {
+        bail!("远端路径无效");
+    }
+    let roots = [&account.mods_path, &account.ue4ss_path]
+        .into_iter()
+        .filter(|root| !root.trim().is_empty())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        bail!("尚未定位远端模组目录");
+    }
+    if roots.into_iter().any(|root| remote_path_within(root, path)) {
+        return Ok(());
+    }
+    bail!("拒绝操作模组目录之外的远端路径：{path}")
+}
+
+fn is_clean_remote_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains('\0')
+        && !trimmed.contains('\\')
+        && trimmed
+            .split('/')
+            .all(|component| component != ".." && component != ".")
+}
+
+fn remote_path_within(root: &str, path: &str) -> bool {
+    let root = normalize_remote_path(root);
+    let path = normalize_remote_path(path);
+    if root == "/" {
+        return path.starts_with('/');
+    }
+    path == root || path.starts_with(&format!("{root}/"))
+}
+
+fn validate_remote_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("远端名称无效");
+    }
+    if name.len() > 255 || name.contains('/') || name.contains('\\') || name.contains('\0') {
+        bail!("远端名称不能包含路径分隔符");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("远端名称包含控制字符");
+    }
+    Ok(name.to_string())
+}
+
+fn remote_parent(path: &str) -> Option<String> {
+    let parent = Path::new(path).parent()?.to_string_lossy();
+    let parent = normalize_remote_path(&parent);
+    (!parent.is_empty()).then_some(parent)
+}
+
+fn remote_with_extension(path: &str, extension: &str) -> String {
+    Path::new(path)
+        .with_extension(extension)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn read_remote_files(sftp: &Sftp, path: &str) -> Vec<RemoteFile> {
     let Ok(entries) = sftp.readdir(Path::new(path)) else {
         return Vec::new();
@@ -665,10 +1246,13 @@ fn remote_join(parent: &str, child: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_account, pak_path_candidates, remote_join, root_from_pak_path, root_from_ue4ss_path,
-        ue4ss_path_candidates,
+        active_account, ensure_remote_operation_allowed, load_remote_notes, move_remote_notes,
+        pak_path_candidates, remote_join, remove_remote_notes_under, root_from_pak_path,
+        root_from_ue4ss_path, save_remote_notes, ue4ss_path_candidates, validate_remote_name,
+        RemoteNotesFile,
     };
     use crate::models::{AppSettings, SftpAccount};
+    use crate::test_support::TempRoot;
 
     fn account(id: &str) -> SftpAccount {
         SftpAccount {
@@ -744,5 +1328,67 @@ mod tests {
             Some("/srv/scum/SCUM".to_string())
         );
         assert_eq!(root_from_pak_path(""), None);
+    }
+
+    #[test]
+    fn limits_remote_mutations_to_configured_mod_roots() {
+        let mut account = account("server");
+        account.mods_path = "/srv/scum/SCUM/Content/Paks/~mods".to_string();
+        account.ue4ss_path = "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods".to_string();
+
+        assert!(ensure_remote_operation_allowed(
+            &account,
+            "/srv/scum/SCUM/Content/Paks/~mods/Test.pak"
+        )
+        .is_ok());
+        assert!(ensure_remote_operation_allowed(
+            &account,
+            "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/TestMod/main.lua"
+        )
+        .is_ok());
+        assert!(ensure_remote_operation_allowed(
+            &account,
+            "/srv/scum/SCUM/Config/ServerSettings.ini"
+        )
+        .is_err());
+        assert!(ensure_remote_operation_allowed(
+            &account,
+            "/srv/scum/SCUM/Content/Paks/~mods/../x"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validates_remote_entry_names() {
+        assert_eq!(validate_remote_name("NewMod.pak").unwrap(), "NewMod.pak");
+        assert!(validate_remote_name("../escape.pak").is_err());
+        assert!(validate_remote_name("bad/name.pak").is_err());
+        assert!(validate_remote_name("bad\\name.pak").is_err());
+        assert!(validate_remote_name("   ").is_err());
+    }
+
+    #[test]
+    fn moves_and_removes_remote_notes_with_the_mod_entry() {
+        let temp = TempRoot::new("sftp-remote-notes");
+        let paths = temp.paths();
+        let source = "/srv/scum/SCUM/Content/Paks/~mods/Old.pak";
+        let target = "/srv/scum/SCUM/Content/Paks/~mods/New.pak";
+        let mut file = RemoteNotesFile::default();
+        file.accounts
+            .entry("server".to_string())
+            .or_default()
+            .insert(source.to_string(), "keep this note".to_string());
+        save_remote_notes(&paths, &file).unwrap();
+
+        move_remote_notes(&paths, "server", source, target).unwrap();
+        let moved = load_remote_notes(&paths).unwrap();
+        assert_eq!(
+            moved.accounts["server"][target],
+            "keep this note".to_string()
+        );
+        assert!(!moved.accounts["server"].contains_key(source));
+
+        remove_remote_notes_under(&paths, "server", target).unwrap();
+        assert!(load_remote_notes(&paths).unwrap().accounts["server"].is_empty());
     }
 }

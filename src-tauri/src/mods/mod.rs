@@ -19,7 +19,9 @@ mod duplicates;
 mod pak_scan;
 
 pub use pak_scan::PakScanDiagnostic;
-pub(crate) use pak_scan::{analyze_conflicts, validate_conflict_winners};
+pub(crate) use pak_scan::{
+    analyze_conflicts, list_pak_entries, normalize_entry_path, validate_conflict_winners,
+};
 
 #[derive(Debug, Default)]
 pub struct LocalScanResult {
