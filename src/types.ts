@@ -84,6 +84,7 @@ export interface AppSettings {
   theme: ThemeMode;
   language: Language;
   keepDeployedModsOnExit: boolean;
+  autoMergeConflicts: boolean;
   launchOptions: LaunchOptions;
   cloud: CloudSettings;
   sftpAccounts: SftpAccount[];
@@ -246,6 +247,16 @@ export interface SftpApplyResult {
 export interface ImportResult {
   imported: number;
   skipped: number;
+  message: string;
+}
+
+export interface ConflictMergeResult {
+  required: boolean;
+  cacheHit: boolean;
+  rebuilt: boolean;
+  sourceMods: number;
+  entries: number;
+  bytes: number;
   message: string;
 }
 

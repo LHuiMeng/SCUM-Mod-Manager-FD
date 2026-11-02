@@ -62,6 +62,7 @@ const base: LibrarySnapshot = {
     theme: "light",
     language: "zh-CN",
     keepDeployedModsOnExit: false,
+    autoMergeConflicts: true,
     launchOptions: {
       log: false,
       fileOpenLog: true,

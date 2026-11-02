@@ -4,8 +4,8 @@ use crate::edition;
 use crate::launcher::ManagedProcess;
 use crate::metadata::{self, MetadataFile};
 use crate::models::{
-    AppInfo, AppSettings, ConflictGroup, GameStatus, LibrarySnapshot, ModEntry, RuntimeLog,
-    SftpAccount, SftpAccountInput,
+    AppInfo, AppSettings, ConflictGroup, ConflictMergeResult, GameStatus, LibrarySnapshot,
+    ModEntry, RuntimeLog, SftpAccount, SftpAccountInput,
 };
 use crate::mods::deploy::{
     deployed_file_names, read_manifest, reclaim_mods, rescue_mods_from_game, sync_ue4ss_state,
@@ -258,6 +258,27 @@ impl AppState {
         *self.conflicts.write().unwrap() = conflicts;
         self.log("info", "conflict", "冲突覆盖选择已保存");
         Ok(self.snapshot())
+    }
+
+    pub fn prepare_conflict_merge(&self) -> Result<ConflictMergeResult> {
+        if self.process_running() {
+            anyhow::bail!("游戏运行期间不能重新融合冲突模组");
+        }
+        let mods = self.mods.read().unwrap().clone();
+        let metadata = self.metadata.lock().unwrap().clone();
+        let result = crate::mods::merge_cache::prepare(&self.paths, &mods, &metadata)?;
+        let message = if result.rebuilt {
+            format!(
+                "已重建冲突融合缓存：{} 个模组，{} 个资源",
+                result.source_mods, result.entries
+            )
+        } else if result.required {
+            "冲突融合缓存已是最新".to_string()
+        } else {
+            "当前没有资源冲突，无需融合".to_string()
+        };
+        self.log("info", "conflict", &message);
+        Ok(result)
     }
 
     pub fn update_mod_metadata(

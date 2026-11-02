@@ -466,6 +466,87 @@ pub(crate) fn extract_pak_entry(
     Ok(())
 }
 
+pub(crate) fn extract_pak_entries(
+    paths: &AppPaths,
+    pak_path: &Path,
+    entries: &[String],
+    output: &Path,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let executable = paths.resource("repak.exe");
+    if !executable.is_file() {
+        bail!("找不到随包工具 {}", executable.display());
+    }
+    std::fs::create_dir_all(output)
+        .with_context(|| format!("无法创建批量解包目录 {}", output.display()))?;
+
+    let normalized = entries
+        .iter()
+        .map(|entry| {
+            normalize_entry_path(entry)
+                .with_context(|| format!("拒绝不安全的 PAK 资源路径：{entry}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0_usize;
+    for entry in normalized {
+        let entry_bytes = entry.len() + 4;
+        if !batch.is_empty() && (batch.len() >= 256 || batch_bytes + entry_bytes > 20_000) {
+            batches.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes += entry_bytes;
+        batch.push(entry);
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+
+    for batch in batches {
+        let mut command = Command::new(&executable);
+        command
+            .arg("unpack")
+            .arg("-q")
+            .arg("-f")
+            .arg("-o")
+            .arg(output)
+            .arg("-s")
+            .arg("../../../");
+        for entry in &batch {
+            command.arg("-i").arg(entry);
+        }
+        command
+            .arg(pak_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+
+        let result = command
+            .output()
+            .with_context(|| format!("无法启动 repak unpack：{}", pak_path.display()))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            bail!(
+                "repak unpack 失败（{}）：{}",
+                result.status,
+                truncate_error(detail)
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn pack_pak(paths: &AppPaths, input: &Path, output: &Path) -> Result<()> {
     let executable = paths.resource("repak.exe");
     if !executable.is_file() {

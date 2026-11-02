@@ -148,6 +148,7 @@ app-data/
   config.json
   mods_meta.json
   deployment_manifest.json
+  cache/conflict_merge/      冲突融合缓存
   sftp_remote_notes.json    远端模组本地备注
   ~mods/
   ue4ss_runtime/

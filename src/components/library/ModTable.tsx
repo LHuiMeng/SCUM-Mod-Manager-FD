@@ -13,10 +13,11 @@ import type {
 import type { ModEntry } from "../../types";
 import { useI18n } from "../../i18n";
 import { formatTimestamp } from "../../lib/format";
+import { reorderVisibleIds } from "../../lib/modOrder";
 import { EmptyState } from "../ui/EmptyState";
 import { ModRow } from "./ModRow";
 
-type FilterId = "all" | "client" | "ue4ss" | "updates";
+export type ModFilter = "all" | "client" | "ue4ss" | "updates" | "conflicts";
 type SortMode = "load" | "name" | "size";
 
 interface ModTableProps {
@@ -28,6 +29,8 @@ interface ModTableProps {
   lastDeployedAt: string | null;
   conflictCount: number;
   removingId: string | null;
+  filter: ModFilter;
+  onFilterChange: (filter: ModFilter) => void;
   onSelect: (id: string) => void;
   onToggle: (id: string, enabled: boolean) => void;
   onReorder: (ids: string[]) => void;
@@ -74,13 +77,14 @@ export function ModTable({
   lastDeployedAt,
   conflictCount,
   removingId,
+  filter,
+  onFilterChange,
   onSelect,
   onToggle,
   onReorder,
   onVisibleChange,
 }: ModTableProps) {
   const { t, language } = useI18n();
-  const [filter, setFilter] = useState<FilterId>("all");
   const [sortMode, setSortMode] = useState<SortMode>("load");
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragPreview, setDragPreview] = useState<DragPreview | null>(null);
@@ -100,6 +104,7 @@ export function ModTable({
   const reorderRef = useRef(onReorder);
   const positionsRef = useRef<Map<string, RowPosition>>(new Map());
   const dropPositionsRef = useRef<Map<string, RowPosition> | null>(null);
+  const visibleIdSetRef = useRef<Set<string>>(new Set());
   const initialReflowRef = useRef(true);
   const knownModIdsRef = useRef<Set<string> | null>(null);
   const enteringTimerRef = useRef<number | null>(null);
@@ -116,7 +121,8 @@ export function ModTable({
           filter === "all" ||
           (filter === "client" && mod.type === "clientPak") ||
           (filter === "ue4ss" && mod.type === "ue4ssMod") ||
-          (filter === "updates" && Boolean(mod.updateVersion));
+          (filter === "updates" && Boolean(mod.updateVersion)) ||
+          (filter === "conflicts" && mod.conflictCount > 0);
         const haystack = [mod.name, mod.description, mod.notes, ...mod.tags]
           .join(" ")
           .toLowerCase();
@@ -132,6 +138,7 @@ export function ModTable({
         return left.loadOrder - right.loadOrder;
       });
   }, [filter, language, mods, search, sortMode]);
+  visibleIdSetRef.current = new Set(filtered.map((mod) => mod.id));
 
   // 把可见条目交回上层，检查器据此判断当前选中项是否还在列表里。
   const visibleKeyRef = useRef<string>("");
@@ -223,12 +230,16 @@ export function ModTable({
       client: mods.filter((mod) => mod.type === "clientPak").length,
       ue4ss: mods.filter((mod) => mod.type === "ue4ssMod").length,
       updates: mods.filter((mod) => mod.updateVersion).length,
+      conflicts: mods.filter((mod) => mod.conflictCount > 0).length,
     }),
     [mods],
   );
 
   const canDrag =
-    sortMode === "load" && filter === "all" && !search.trim() && !locked;
+    sortMode === "load" &&
+    (filter === "all" || filter === "conflicts") &&
+    !search.trim() &&
+    !locked;
   const dragHint = canDrag
     ? t("library.dragHint.active")
     : locked
@@ -287,18 +298,14 @@ export function ModTable({
     const ordered = [...modsRef.current]
       .sort((a, b) => a.loadOrder - b.loadOrder)
       .map((mod) => mod.id);
-    const from = ordered.indexOf(sourceId);
-    if (
-      from < 0 ||
-      targetIndex < 0 ||
-      targetIndex >= ordered.length ||
-      from === targetIndex
-    ) {
-      return false;
-    }
-    ordered.splice(from, 1);
-    ordered.splice(targetIndex, 0, sourceId);
-    reorderRef.current(ordered);
+    const next = reorderVisibleIds(
+      ordered,
+      visibleIdSetRef.current,
+      sourceId,
+      targetIndex,
+    );
+    if (!next) return false;
+    reorderRef.current(next);
     return true;
   }
 
@@ -373,13 +380,19 @@ export function ModTable({
     const ordered = [...modsRef.current]
       .sort((a, b) => a.loadOrder - b.loadOrder)
       .map((mod) => mod.id);
-    const from = ordered.indexOf(id);
+    const visible = ordered.filter((item) => visibleIdSetRef.current.has(item));
+    const from = visible.indexOf(id);
     const to = from + delta;
-    if (from < 0 || to < 0 || to >= ordered.length) return;
+    if (from < 0 || to < 0 || to >= visible.length) return;
+    const next = reorderVisibleIds(
+      ordered,
+      visibleIdSetRef.current,
+      id,
+      to,
+    );
+    if (!next) return;
     dropPositionsRef.current = captureRowPositions();
-    ordered.splice(from, 1);
-    ordered.splice(to, 0, id);
-    reorderRef.current(ordered);
+    reorderRef.current(next);
     showDropSettled(id);
   }, []);
 
@@ -528,13 +541,14 @@ export function ModTable({
             ["client", t("library.filter.client"), counts.client],
             ["ue4ss", t("library.filter.ue4ss"), counts.ue4ss],
             ["updates", t("library.filter.updates"), counts.updates],
+            ["conflicts", t("library.filter.conflicts"), counts.conflicts],
           ] as const
         ).map(([id, label, count]) => (
           <button
             type="button"
             key={id}
             className={`filter-chip ${filter === id ? "is-active" : ""}`}
-            onClick={() => setFilter(id)}
+            onClick={() => onFilterChange(id)}
           >
             {label} {count}
           </button>

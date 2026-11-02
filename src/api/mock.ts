@@ -2,6 +2,7 @@ import type {
   AppInfo,
   AppSettings,
   AppUpdateInfo,
+  ConflictMergeResult,
   ConflictGroup,
   GameStatus,
   ImportConflict,
@@ -296,6 +297,7 @@ let settings: AppSettings = {
   theme: "light",
   language: "zh-CN",
   keepDeployedModsOnExit: false,
+  autoMergeConflicts: true,
   launchOptions: {
     log: false,
     fileOpenLog: true,
@@ -511,6 +513,23 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       conflictWinners = new Map(Object.entries(winners));
       recomputeMockConflicts();
       return mockSnapshot() as T;
+    }
+    case "prepare_conflict_merge": {
+      recomputeMockConflicts();
+      const required = conflicts.length > 0;
+      return {
+        required,
+        cacheHit: required,
+        rebuilt: false,
+        sourceMods: new Set(
+          conflicts.flatMap((group) => group.owners.map((owner) => owner.id)),
+        ).size,
+        entries: conflicts.reduce((sum, group) => sum + group.paths.length, 0),
+        bytes: required ? 1400000000 : 0,
+        message: required
+          ? "冲突融合已是最新（演示环境）"
+          : "当前没有资源冲突，无需融合",
+      } as ConflictMergeResult as T;
     }
     case "save_settings":
       settings = structuredClone(args?.settings as AppSettings);

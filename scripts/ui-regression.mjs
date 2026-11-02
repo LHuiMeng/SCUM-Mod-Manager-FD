@@ -465,6 +465,47 @@ async function connect(url, appUrl) {
     return { before, clientRows, allRows, reflowing };
   });
 
+  await test("冲突模组筛选与手动融合入口", async () => {
+    await clickText("冲突模组");
+    await waitFor("document.querySelector('.conflict-merge-strip') !== null");
+    await wait(240);
+    const detail = await evaluate(`(() => {
+      const activeFilter = [...document.querySelectorAll(".filter-chip")]
+        .find(item => item.classList.contains("is-active"));
+      const rows = [...document.querySelectorAll(".mod-row")];
+      const conflictRows = rows.filter(row =>
+        row.querySelector(".mod-conflict-pill.has-conflict, .mod-conflict-pill.is-full"));
+      const strip = document.querySelector(".conflict-merge-strip");
+      const mergeButton = [...strip.querySelectorAll("button")]
+        .find(item => item.innerText.includes("手动融合"));
+      const rect = strip.getBoundingClientRect();
+      return {
+        activeFilter: activeFilter?.innerText ?? "",
+        rowCount: rows.length,
+        conflictRowCount: conflictRows.length,
+        primaryCount: document.querySelectorAll(".page-transition .button-primary").length,
+        stripInsideViewport: rect.left >= 0 && rect.right <= innerWidth + 1,
+        hasMergeButton: Boolean(mergeButton),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+      };
+    })()`);
+    if (!detail.activeFilter.includes("冲突模组") || detail.rowCount === 0 ||
+        detail.rowCount !== detail.conflictRowCount) {
+      throw new Error(`冲突筛选结果异常：${JSON.stringify(detail)}`);
+    }
+    if (detail.primaryCount !== 1 || !detail.stripInsideViewport ||
+        !detail.hasMergeButton || detail.horizontalOverflow) {
+      throw new Error(`冲突融合入口布局异常：${JSON.stringify(detail)}`);
+    }
+    screenshots.push(await screenshot("1440-light-conflicts"));
+
+    await clickText("手动融合");
+    await waitFor("document.body.innerText.includes('冲突融合完成')");
+    await clickText("全部");
+    await waitFor("document.querySelector('.conflict-merge-strip') === null");
+    return detail;
+  });
+
   await test("三种排序循环", async () => {
     const label = () => evaluate("document.querySelector('.table-toolbar-right span')?.innerText");
     const seen = [await label()];
@@ -797,6 +838,16 @@ async function connect(url, appUrl) {
 
   await test("设置页路径检测、云源保存与保存反馈", async () => {
     await navigate("设置");
+    const autoMerge = await evaluate(`(() => {
+      const toggle = document.querySelector('button[aria-label="自动融合冲突"]');
+      return {
+        visible: Boolean(toggle?.getBoundingClientRect().width),
+        checked: toggle?.getAttribute("aria-checked"),
+      };
+    })()`);
+    if (!autoMerge.visible || autoMerge.checked !== "true") {
+      throw new Error(`自动融合设置未正确显示：${JSON.stringify(autoMerge)}`);
+    }
     await clickText("自动检测路径");
     await waitFor("document.body.innerText.includes('已填入检测到的路径')");
     await wait(400);
@@ -1461,11 +1512,19 @@ async function connect(url, appUrl) {
       ["设置", "settings"],
     ]) {
       await navigate(label);
+      if (page === "library") {
+        await clickText("冲突模组");
+        await waitFor("document.querySelector('.conflict-merge-strip') !== null");
+        await wait(240);
+      }
       const info = await layout();
       if (info.horizontalOverflow || info.clipped.length) {
         throw new Error(`${page} 越界：${JSON.stringify(info)}`);
       }
       report[page] = info;
+      if (page === "library") {
+        screenshots.push(await screenshot("1100-light-conflicts"));
+      }
     }
     screenshots.push(await screenshot("1100-light-settings"));
     return report;

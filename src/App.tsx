@@ -102,6 +102,7 @@ function LocalizedApp() {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [conflictMergeBusy, setConflictMergeBusy] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const toastId = useRef(0);
   const [cloudMods, setCloudMods] = useState<RemoteMod[]>([]);
@@ -903,6 +904,25 @@ function LocalizedApp() {
     }
   }
 
+  async function handleMergeConflicts() {
+    if (!snapshot || snapshot.gameStatus.running || busy) return;
+    setBusy(true);
+    setConflictMergeBusy(true);
+    try {
+      const result = await api.prepareConflictMerge();
+      notify(
+        t("toast.conflictMergeDone.title"),
+        result.message,
+        result.required ? "success" : "default",
+      );
+    } catch (error) {
+      notify(t("toast.conflictMergeFailed.title"), String(error), "error");
+    } finally {
+      setConflictMergeBusy(false);
+      setBusy(false);
+    }
+  }
+
   async function handleLaunch() {
     if (!snapshot || snapshot.gameStatus.running) return;
     if (!snapshot.settings.scumInstallPath.trim()) {
@@ -1539,6 +1559,9 @@ function LocalizedApp() {
               selectedId={selectedId}
               onSelect={setSelectedId}
               fileDragActive={fileDragActive}
+              busy={busy}
+              mergeBusy={conflictMergeBusy}
+              onMergeConflicts={() => void handleMergeConflicts()}
             />
           ) : null}
           {section === "cloud" ? (

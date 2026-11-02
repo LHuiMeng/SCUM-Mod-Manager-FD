@@ -4,6 +4,7 @@ import type {
   AppInfo,
   AppSettings,
   AppUpdateInfo,
+  ConflictMergeResult,
   ImportConflict,
   ImportResult,
   Language,
@@ -39,6 +40,8 @@ export const api = {
     call<LibrarySnapshot>("update_mod_metadata", { id, tags, notes }),
   saveConflictWinners: (winners: Record<string, string>) =>
     call<LibrarySnapshot>("save_conflict_winners", { winners }),
+  prepareConflictMerge: () =>
+    call<ConflictMergeResult>("prepare_conflict_merge"),
   deleteMod: (id: string) => call<LibrarySnapshot>("delete_mod", { id }),
   saveSettings: (settings: AppSettings) =>
     call<AppSettings>("save_settings", { settings }),

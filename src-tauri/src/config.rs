@@ -370,6 +370,9 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );
+        let settings = load_settings(&paths).unwrap();
+        assert!(settings.auto_merge_conflicts);
+        assert!(saved.contains("\"autoMergeConflicts\": true"));
         assert!(saved.contains("\"keepDeployedModsOnExit\": false"));
     }
 

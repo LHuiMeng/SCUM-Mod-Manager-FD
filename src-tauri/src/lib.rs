@@ -41,6 +41,7 @@ pub fn run() {
             commands::reorder_mods,
             commands::update_mod_metadata,
             commands::save_conflict_winners,
+            commands::prepare_conflict_merge,
             commands::delete_mod,
             commands::save_settings,
             commands::set_theme,

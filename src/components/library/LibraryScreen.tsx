@@ -17,7 +17,7 @@ import { LaunchStrip } from "./LaunchStrip";
 import { ConflictResolutionPanel } from "./ConflictResolutionPanel";
 import { ModEditPanel } from "./ModEditPanel";
 import { ModInspector } from "./ModInspector";
-import { ModTable } from "./ModTable";
+import { ModTable, type ModFilter } from "./ModTable";
 
 export interface ServerLibraryView {
   snapshot: LibrarySnapshot;
@@ -55,6 +55,9 @@ interface LibraryScreenProps {
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   fileDragActive: boolean;
+  busy: boolean;
+  mergeBusy: boolean;
+  onMergeConflicts: () => void;
 }
 
 export function LibraryScreen({
@@ -80,6 +83,9 @@ export function LibraryScreen({
   selectedId,
   onSelect,
   fileDragActive,
+  busy,
+  mergeBusy,
+  onMergeConflicts,
 }: LibraryScreenProps) {
   const { t } = useI18n();
   const [editing, setEditing] = useState<ModEntry | null>(null);
@@ -88,6 +94,7 @@ export function LibraryScreen({
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [conflictsOpen, setConflictsOpen] = useState(false);
   const [visibleIds, setVisibleIds] = useState<string[] | null>(null);
+  const [modFilter, setModFilter] = useState<ModFilter>("all");
   const serverMode = mode === "server" && server !== null;
   const activeSnapshot = serverMode ? server.snapshot : snapshot;
   const activeGameStatus = serverMode ? server.snapshot.gameStatus : gameStatus;
@@ -253,17 +260,42 @@ export function LibraryScreen({
             </div>
           </section>
         ) : (
-          <LaunchStrip
-            enabledCount={summary.enabled.length}
-            totalBytes={summary.totalBytes}
-            running={gameStatus.running}
-            keepDeployedModsOnExit={snapshot.settings.keepDeployedModsOnExit}
-            launchOptions={snapshot.settings.launchOptions}
-            onLaunch={onLaunch}
-            onKill={onKill}
-            onOptionsChange={onLaunchOptionsChange}
-            onOpenSettings={() => onNavigate("settings")}
-          />
+          <>
+            <LaunchStrip
+              enabledCount={summary.enabled.length}
+              totalBytes={summary.totalBytes}
+              running={gameStatus.running}
+              keepDeployedModsOnExit={snapshot.settings.keepDeployedModsOnExit}
+              launchOptions={snapshot.settings.launchOptions}
+              onLaunch={onLaunch}
+              onKill={onKill}
+              onOptionsChange={onLaunchOptionsChange}
+              onOpenSettings={() => onNavigate("settings")}
+            />
+            {modFilter === "conflicts" && summary.conflicts > 0 ? (
+              <section className="conflict-merge-strip" aria-live="polite">
+                <div className="conflict-merge-strip-copy">
+                  <b>{t("library.merge.title", { count: summary.conflicts })}</b>
+                  <span>
+                    {t(
+                      snapshot.settings.autoMergeConflicts
+                        ? "library.merge.autoOn"
+                        : "library.merge.autoOff",
+                    )}
+                  </span>
+                </div>
+                <Button
+                  icon="refresh"
+                  onClick={onMergeConflicts}
+                  disabled={busy || gameStatus.running}
+                >
+                  {mergeBusy
+                    ? t("library.merge.running")
+                    : t("library.merge.action")}
+                </Button>
+              </section>
+            ) : null}
+          </>
         )}
 
         <ModTable
@@ -282,6 +314,8 @@ export function LibraryScreen({
           lastDeployedAt={activeSnapshot.lastDeployedAt}
           conflictCount={summary.conflicts}
           removingId={serverMode ? null : removingId}
+          filter={modFilter}
+          onFilterChange={setModFilter}
           onSelect={onSelect}
           onToggle={(id, enabled) => activeToggle(id, enabled)}
           onReorder={activeReorder}

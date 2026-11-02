@@ -2,10 +2,11 @@ use crate::app_update;
 use crate::cloud;
 use crate::launcher;
 use crate::models::{
-    AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, DetectPathsResult, DownloadResult,
-    GameStatus, ImportConflict, ImportResult, InstallUpdateResult, LibrarySnapshot, LocaleBundle,
-    RemoteFile, RemoteMod, RuntimeLog, SftpAccountInput, SftpApplyResult, SftpConflictReport,
-    SftpConnectionResult, SftpOperationResult, UploadResult,
+    AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, ConflictMergeResult,
+    DetectPathsResult, DownloadResult, GameStatus, ImportConflict, ImportResult,
+    InstallUpdateResult, LibrarySnapshot, LocaleBundle, RemoteFile, RemoteMod, RuntimeLog,
+    SftpAccountInput, SftpApplyResult, SftpConflictReport, SftpConnectionResult,
+    SftpOperationResult, UploadResult,
 };
 use crate::paths::path_string;
 use crate::sftp;
@@ -110,6 +111,14 @@ pub async fn save_conflict_winners(
     .await
     .map_err(error_text)?
     .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn prepare_conflict_merge(app: AppHandle) -> Result<ConflictMergeResult, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().prepare_conflict_merge())
+        .await
+        .map_err(error_text)?
+        .map_err(error_text)
 }
 
 #[tauri::command]

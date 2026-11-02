@@ -12,6 +12,10 @@ fn default_language() -> String {
     "zh-CN".to_string()
 }
 
+fn default_auto_merge_conflicts() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LaunchOptions {
@@ -123,6 +127,8 @@ pub struct AppSettings {
     #[serde(alias = "cloud", alias = "cloud_sources")]
     pub cloud: CloudSettings,
     pub keep_deployed_mods_on_exit: bool,
+    #[serde(default = "default_auto_merge_conflicts")]
+    pub auto_merge_conflicts: bool,
     #[serde(alias = "sftpAccounts", alias = "sftp_accounts")]
     pub sftp_accounts: Vec<SftpAccount>,
     #[serde(
@@ -143,6 +149,7 @@ impl Default for AppSettings {
             launch_options: LaunchOptions::default(),
             cloud: CloudSettings::default(),
             keep_deployed_mods_on_exit: false,
+            auto_merge_conflicts: true,
             sftp_accounts: Vec::new(),
             active_sftp_account_id: None,
         }
@@ -481,6 +488,18 @@ pub struct UploadResult {
 pub struct ImportResult {
     pub imported: usize,
     pub skipped: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictMergeResult {
+    pub required: bool,
+    pub cache_hit: bool,
+    pub rebuilt: bool,
+    pub source_mods: usize,
+    pub entries: usize,
+    pub bytes: u64,
     pub message: String,
 }
 

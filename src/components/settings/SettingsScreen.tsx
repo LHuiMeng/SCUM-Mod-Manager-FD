@@ -249,6 +249,17 @@ export function SettingsScreen({
             </label>
             <label>
               <span>
+                <b>{t("settings.startup.autoMergeConflicts")}</b>
+                <small>{t("settings.startup.autoMergeConflictsDetail")}</small>
+              </span>
+              <Toggle
+                checked={draft.autoMergeConflicts}
+                onChange={(autoMergeConflicts) => update({ autoMergeConflicts })}
+                label={t("settings.startup.autoMergeConflicts")}
+              />
+            </label>
+            <label>
+              <span>
                 <b>{t("settings.startup.port")}</b>
                 <small>{t("settings.startup.portDetail")}</small>
               </span>

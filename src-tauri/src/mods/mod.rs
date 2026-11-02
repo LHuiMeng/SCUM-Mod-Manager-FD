@@ -16,6 +16,7 @@ use zip::ZipArchive;
 
 pub mod deploy;
 mod duplicates;
+pub(crate) mod merge_cache;
 mod pak_scan;
 
 pub use pak_scan::PakScanDiagnostic;

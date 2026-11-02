@@ -6,17 +6,20 @@ describe("browser preview settings", () => {
     const settings = mockSnapshot().settings as unknown as Record<string, unknown>;
 
     expect(settings.keepDeployedModsOnExit).toBe(false);
+    expect(settings.autoMergeConflicts).toBe(true);
   });
 
-  it("persists the deployment retention setting", async () => {
+  it("persists deployment and conflict merge settings", async () => {
     const next = {
       ...mockSnapshot().settings,
       keepDeployedModsOnExit: true,
+      autoMergeConflicts: false,
     };
 
     await mockInvoke("save_settings", { settings: next });
 
     const saved = mockSnapshot().settings as unknown as Record<string, unknown>;
     expect(saved.keepDeployedModsOnExit).toBe(true);
+    expect(saved.autoMergeConflicts).toBe(false);
   });
 });
