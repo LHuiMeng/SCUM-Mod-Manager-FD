@@ -772,7 +772,10 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       if (!name) throw new Error("无效的远端路径");
       const isUe4ss = path.startsWith("/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods");
       const id = `server-import-${name.toLowerCase()}`;
-      const size = remoteFiles.find((file) => file.path === path)?.size ?? 0;
+      const size =
+        remoteFiles.find((file) => file.path === path)?.size ??
+        remoteUe4ssMods.find((file) => file.path === path)?.size ??
+        0;
       const existing = mods.find((mod) => mod.id === id);
       const imported: ModEntry = existing
         ? { ...existing, lastModified: new Date().toISOString() }

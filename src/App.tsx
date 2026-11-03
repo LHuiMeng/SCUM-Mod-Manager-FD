@@ -1300,6 +1300,82 @@ function LocalizedApp() {
     }
   }
 
+  async function handleMkdirSftpEntry(
+    accountId: string,
+    targetPath: string,
+  ): Promise<boolean> {
+    setBusy(true);
+    try {
+      const result = await api.mkdirSftpEntry(accountId, targetPath);
+      notify(t("toast.remoteMkdirDone.title"), result.message, "success");
+      await handleTestSftp(accountId, true);
+      return true;
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.remoteMkdirFailed.title"), String(error), "error");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleMoveSftpEntry(
+    accountId: string,
+    path: string,
+    newPath: string,
+  ): Promise<boolean> {
+    setBusy(true);
+    try {
+      const result = await api.moveSftpEntry(accountId, path, newPath);
+      notify(t("toast.remoteMoveDone.title"), result.message, "success");
+      await handleTestSftp(accountId, true);
+      return true;
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.remoteMoveFailed.title"), String(error), "error");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDownloadSftpModToLibrary(
+    accountId: string,
+    path: string,
+  ) {
+    setBusy(true);
+    try {
+      setSnapshot(await api.downloadSftpModToLibrary(accountId, path));
+      notify(
+        t("toast.serverImportDone.title"),
+        t("toast.serverImportDone.detail"),
+        "success",
+      );
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.serverImportFailed.title"), String(error), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSwitchSftpAccount(accountId: string) {
+    if (!snapshot || snapshot.settings.activeSftpAccountId === accountId) return;
+    try {
+      const saved = await api.saveSettings({
+        ...snapshot.settings,
+        activeSftpAccountId: accountId,
+      });
+      setSnapshot((current) =>
+        current ? { ...current, settings: saved } : current,
+      );
+    } catch (error) {
+      notify(t("toast.settingsSaveFailed.title"), String(error), "error");
+      return;
+    }
+    await handleTestSftp(accountId);
+  }
+
   async function handleSaveRemoteNote(
     accountId: string,
     path: string,
@@ -1610,6 +1686,10 @@ function LocalizedApp() {
               onSaveNote={handleSaveRemoteNote}
               onAnalyzeConflicts={handleAnalyzeSftpConflicts}
               onOpenSettings={() => setSection("settings")}
+              onMkdir={handleMkdirSftpEntry}
+              onMove={handleMoveSftpEntry}
+              onDownloadToLibrary={handleDownloadSftpModToLibrary}
+              onSwitchAccount={(id) => void handleSwitchSftpAccount(id)}
             />
           ) : null}
           {section === "logs" ? (

@@ -2119,208 +2119,249 @@ body.is-row-dragging {
   overflow: auto;
 }
 
-.server-workspace-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
-  margin-bottom: 12px;
-  padding: 10px 12px;
-  border: 1px dashed var(--line-strong);
-  border-radius: var(--radius-md);
-  background: var(--soft-fill);
+.server-workspace-grid {
+  display: grid;
+  grid-template-columns: minmax(420px, 46%) minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+  height: clamp(560px, calc(100vh - 240px), 760px);
 }
 
-.server-workspace-toolbar > div:first-child {
-  min-width: 0;
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.server-workspace-toolbar b {
-  font-size: var(--type-body);
-  font-weight: 600;
-}
-
-.server-workspace-toolbar > div:first-child > span {
-  overflow: hidden;
-  color: var(--muted);
-  font-size: var(--type-meta);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.server-layout-actions {
-  flex: none;
-  display: flex;
-  gap: 7px;
-}
-
-.server-layout-actions .button.is-active {
-  border-color: color-mix(in srgb, var(--accent) 52%, var(--line));
-  color: var(--accent);
-  background: var(--accent-soft);
-}
-
-.server-panel-stage {
-  position: relative;
-  width: 100%;
-  height: clamp(620px, calc(100vh - 220px), 920px);
-  min-height: 620px;
-  overflow: hidden;
-  border-radius: var(--radius-lg);
-  transition: background-color 160ms ease;
-}
-
-.server-panel-stage.is-editing {
-  background-color: color-mix(in srgb, var(--accent) 2.5%, var(--paper-lo));
-  background-image:
-    linear-gradient(
-      color-mix(in srgb, var(--line) 58%, transparent) 1px,
-      transparent 1px
-    ),
-    linear-gradient(
-      90deg,
-      color-mix(in srgb, var(--line) 58%, transparent) 1px,
-      transparent 1px
-    );
-  background-size: 24px 24px;
-  outline: 1px dashed color-mix(in srgb, var(--accent) 32%, var(--line));
-  outline-offset: 4px;
-}
-
-.server-panel-slot {
-  position: absolute;
+.server-workspace-grid .server-pane {
   min-width: 0;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+  overflow: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--soft-fill);
-  box-shadow: 0 1px 0 color-mix(in srgb, var(--ink) 3%, transparent);
-  transition:
-    border-color 160ms ease,
-    box-shadow 160ms ease;
+  padding: 10px 12px;
+  /* 查看器内部的 @container 自适应（工具栏换行/双栏堆叠）依赖容器上下文，
+     旧 .server-panel-content 的 inline-size 容器随浮动面板系统一起删除了，
+     这里必须重新提供，否则窄栏里 viewer 会横向溢出。 */
+  container-type: inline-size;
 }
 
-.server-panel-slot.is-active {
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+.server-pane-files {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.server-panel-slot.is-editable {
-  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
-  box-shadow:
-    0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent),
-    0 12px 28px color-mix(in srgb, var(--ink) 8%, transparent);
+.server-disconnected {
+  display: grid;
+  grid-template-columns: minmax(360px, 480px) 1fr;
+  gap: 12px;
+  align-items: start;
 }
 
-.server-panel-edit-handle {
-  position: absolute;
-  top: 6px;
-  left: 6px;
-  z-index: 4;
+.server-account-bar-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.server-account-bar-controls {
+  flex: none;
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 3px 6px 3px 4px;
-  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--line));
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--paper-hi) 94%, var(--accent));
-  box-shadow: 0 3px 10px color-mix(in srgb, var(--ink) 10%, transparent);
+  gap: 6px;
 }
 
-.server-panel-drag {
+.server-account-bar-controls select {
+  flex: 1 1 auto;
   min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 3px 5px;
-  border: 0;
+}
+
+.server-account-bar-host {
+  overflow: hidden;
   color: var(--muted);
-  background: transparent;
   font-family: var(--mono);
   font-size: var(--type-micro);
-  cursor: default;
-  touch-action: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.server-panel-drag:not(.is-locked) {
-  cursor: grab;
+.server-account-bar-roots {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 10px;
+  margin: 0;
+  min-width: 0;
 }
 
-.server-panel-drag:not(.is-locked):active {
-  cursor: grabbing;
+.server-account-bar-roots dt {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.04em;
 }
 
-.server-panel-drag span {
+.server-account-bar-roots dd {
+  margin: 0;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-account-bar-actions {
+  flex: none;
+}
+
+.sftp-connection-state.is-offline i {
+  background: var(--muted);
+}
+
+.remote-browser {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.remote-toolbar {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.remote-mkdir-row {
+  flex: none;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.remote-mkdir-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.remote-table {
+  flex: 1;
+  min-height: 120px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.remote-table-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 56px 96px 124px;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper-lo);
+}
+
+.remote-table-sort {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: var(--type-meta);
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.remote-table-sort.is-active {
+  color: var(--ink);
+}
+
+.remote-table-actions-label {
+  color: var(--muted);
+  font-size: var(--type-meta);
+  font-weight: 600;
+  text-align: right;
+}
+
+.remote-table .remote-file-row {
+  grid-template-columns: minmax(0, 1fr) 56px 96px 124px;
+  min-height: 44px;
+  padding: 0 10px;
+}
+
+.remote-file-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.remote-file-namebox {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.remote-file-namebox b {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.server-panel-size {
-  flex: none;
+.remote-file-namebox small {
+  overflow: hidden;
   color: var(--muted);
   font-family: var(--mono);
-  font-size: 9px;
-  letter-spacing: 0.01em;
+  font-size: var(--type-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.server-panel-content {
-  min-height: 0;
-  flex: 1;
+.remote-file-namebox input {
+  width: 100%;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--paper-hi);
+  font-size: var(--type-meta);
+}
+
+.remote-file-size,
+.remote-file-date {
   overflow: hidden;
-  container-type: inline-size;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  text-align: right;
+  white-space: nowrap;
 }
 
-.server-panel-content > .server-form,
-.server-panel-content > .server-browser,
-.server-panel-content > .server-viewer-panel {
-  height: 100%;
+/* 旧规则会给行内任意 span 套 mono/margin，表格里只有图标 span，复位之。 */
+.remote-table .remote-file-row .file-symbol {
+  margin-top: 0;
+  color: inherit;
 }
 
-.server-panel-resizer {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  cursor: nwse-resize;
-  touch-action: none;
-  z-index: 2;
+.remote-table .remote-file-row .file-symbol.is-folder {
+  color: var(--accent);
 }
 
-.server-panel-resizer span {
-  position: absolute;
-  right: 5px;
-  bottom: 5px;
-  width: 9px;
-  height: 9px;
-  border-right: 2px solid var(--accent);
-  border-bottom: 2px solid var(--accent);
-  border-radius: 1px;
+.remote-row-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 120ms ease;
 }
 
-.server-panel-resizer:hover span {
-  border-color: var(--ink);
-}
-
-body.is-moving-server-panel,
-body.is-moving-server-panel * {
-  cursor: grabbing !important;
-  user-select: none !important;
-}
-
-body.is-resizing-server-panel,
-body.is-resizing-server-panel * {
-  cursor: nwse-resize !important;
-  user-select: none !important;
+.remote-file-row:hover .remote-row-actions,
+.remote-file-row:focus-within .remote-row-actions,
+.remote-file-row.is-selected .remote-row-actions {
+  opacity: 1;
 }
 
 .server-form,
@@ -4550,25 +4591,13 @@ body.is-resizing-server-panel * {
     min-height: 300px;
   }
 
-  .server-workspace-toolbar {
-    align-items: flex-start;
-    flex-direction: column;
+  .server-workspace-grid {
+    grid-template-columns: 1fr;
+    height: auto;
   }
 
-  .server-workspace-toolbar > div:first-child {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 3px;
-  }
-
-  .server-workspace-toolbar > div:first-child > span {
-    white-space: normal;
-  }
-
-  .server-layout-actions {
-    width: 100%;
-    justify-content: flex-end;
-    flex-wrap: wrap;
+  .server-disconnected {
+    grid-template-columns: 1fr;
   }
 }
 
