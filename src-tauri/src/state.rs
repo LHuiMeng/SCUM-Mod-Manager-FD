@@ -103,6 +103,7 @@ impl AppState {
     }
 
     pub fn scan(&self, rescue: bool) -> Result<LibrarySnapshot> {
+        let started = std::time::Instant::now();
         let settings = self.settings.lock().unwrap().clone();
         if !self.process_running() {
             if rescue {
@@ -152,12 +153,16 @@ impl AppState {
         self.log(
             "info",
             "library",
-            &format!("扫描完成，共发现 {count} 个本地模组"),
+            &format!(
+                "扫描完成，共发现 {count} 个本地模组（耗时 {}ms）",
+                started.elapsed().as_millis()
+            ),
         );
         Ok(self.snapshot())
     }
 
     pub fn refresh_files(&self) -> Result<LibrarySnapshot> {
+        let started = std::time::Instant::now();
         let mut metadata = self.metadata.lock().unwrap();
         let deployed = deployed_file_names(&self.paths);
         let scan = scan_local_mods_with_diagnostics(&self.paths, &mut metadata, &deployed)?;
@@ -176,6 +181,11 @@ impl AppState {
                 &format!("已按云端目录回填 {named} 个模组的显示名"),
             );
         }
+        self.log(
+            "info",
+            "library",
+            &format!("文件刷新完成（耗时 {}ms）", started.elapsed().as_millis()),
+        );
         Ok(self.snapshot())
     }
 

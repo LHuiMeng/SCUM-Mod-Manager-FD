@@ -45,6 +45,18 @@ pub fn launch(app: AppHandle, state: &AppState, mode: &str) -> Result<GameStatus
     let found_after = started.elapsed();
     let deployed_at = deploy_local_mods(&state.paths, &settings, &mods, is_server)?;
     let deploy_after = started.elapsed();
+    let fingerprint_note = match (&deployed_at, &previous_manifest) {
+        (Some(_), _) => "fingerprint=hit".to_string(),
+        (None, None) => "fingerprint=miss reason=missing".to_string(),
+        (None, Some(previous)) => {
+            let files_missing = previous
+                .files
+                .iter()
+                .any(|file| !std::path::Path::new(file).exists());
+            let reason = if files_missing { "missing" } else { "mtime" };
+            format!("fingerprint=miss reason={reason}")
+        }
+    };
     if let Some(time) = deployed_at {
         *state.last_deployed_at.lock().unwrap() = Some(time);
     }
