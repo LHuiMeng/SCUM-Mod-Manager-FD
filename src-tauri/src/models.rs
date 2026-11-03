@@ -31,7 +31,8 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
             log: false,
-            file_open_log: true,
+            // 文件打开日志是 cook 调试开关，默认关闭；有 PAK 模组也不再强制。
+            file_open_log: false,
             no_battl_eye: true,
             port: "7042".to_string(),
         }
@@ -43,9 +44,11 @@ impl LaunchOptions {
         if self.log {
             args.push("-log".to_string());
         }
+        // 有 PAK 模组时强制文件打开日志（PAK 挂载顺序依赖）；无 PAK 时只跟随用户设置。
         if self.file_open_log || has_pak_mods {
             args.push("-fileopenlog".to_string());
         }
+        // UE4SS 需要关闭 BattlEye；有 PAK 模组时同样强制。
         if self.no_battl_eye || has_pak_mods {
             args.push("-nobattleye".to_string());
         }
