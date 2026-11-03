@@ -576,6 +576,62 @@ pub async fn delete_sftp_entry(
 }
 
 #[tauri::command]
+pub async fn sftp_mkdir(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+) -> Result<SftpOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::mkdir_entry(&state.paths, &settings, &account_id, &path)?;
+        state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn move_sftp_entry(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+    new_path: String,
+) -> Result<SftpOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::move_entry(&state.paths, &settings, &account_id, &path, &new_path)?;
+        state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn download_sftp_mod_to_library(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+) -> Result<LibrarySnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::download_mod_to_library(&state.paths, &settings, &account_id, &path)?;
+        state.log("info", "sftp", &result.message);
+        let snapshot = state.refresh_files()?;
+        Ok::<_, anyhow::Error>(snapshot)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
 pub async fn get_sftp_remote_notes(
     app: AppHandle,
     account_id: String,

@@ -106,6 +106,12 @@ export const api = {
     call<SftpOperationResult>("rename_sftp_entry", { accountId, path, newName }),
   deleteSftpEntry: (accountId: string, path: string) =>
     call<SftpOperationResult>("delete_sftp_entry", { accountId, path }),
+  mkdirSftpEntry: (accountId: string, path: string) =>
+    call<SftpOperationResult>("sftp_mkdir", { accountId, path }),
+  moveSftpEntry: (accountId: string, path: string, newPath: string) =>
+    call<SftpOperationResult>("move_sftp_entry", { accountId, path, newPath }),
+  downloadSftpModToLibrary: (accountId: string, path: string) =>
+    call<LibrarySnapshot>("download_sftp_mod_to_library", { accountId, path }),
   getSftpRemoteNotes: (accountId: string) =>
     call<Record<string, string>>("get_sftp_remote_notes", { accountId }),
   saveSftpRemoteNote: (accountId: string, path: string, note: string) =>

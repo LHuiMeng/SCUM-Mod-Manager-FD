@@ -727,6 +727,81 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       );
       return { message: "已删除远端模组", path } as T;
     }
+    case "sftp_mkdir": {
+      const target = String(args?.path ?? "").replace(/\/+$/, "");
+      const name = target.split("/").filter(Boolean).pop() ?? "";
+      if (!name || name === "..") throw new Error("无效的远端目录路径");
+      const collection = target.startsWith("/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods")
+        ? remoteUe4ssMods
+        : remoteFiles;
+      if (!collection.some((file) => file.path === target)) {
+        collection.splice(1, 0, {
+          name,
+          path: target,
+          isDirectory: true,
+          size: 0,
+          modifiedAt: new Date().toISOString(),
+        });
+      }
+      return { message: `已创建远端目录 ${name}`, path: target } as T;
+    }
+    case "move_sftp_entry": {
+      const sourcePath = String(args?.path ?? "");
+      const targetPath = String(args?.newPath ?? "").replace(/\/+$/, "");
+      const name = targetPath.split("/").filter(Boolean).pop() ?? "";
+      if (!sourcePath || !name) throw new Error("无效的移动路径");
+      if (sourcePath.endsWith(".pak") && !targetPath.endsWith(".pak")) {
+        throw new Error("PAK 模组必须保留 .pak 扩展名");
+      }
+      for (const collection of [remoteFiles, remoteUe4ssMods]) {
+        const item = collection.find((file) => file.path === sourcePath);
+        if (item) {
+          item.name = name;
+          item.path = targetPath;
+        }
+      }
+      if (remoteNotes[sourcePath]) {
+        remoteNotes[targetPath] = remoteNotes[sourcePath];
+        delete remoteNotes[sourcePath];
+      }
+      return { message: `已移动 ${name}`, path: targetPath } as T;
+    }
+    case "download_sftp_mod_to_library": {
+      const path = String(args?.path ?? "");
+      const name = path.split("/").filter(Boolean).pop() ?? "";
+      if (!name) throw new Error("无效的远端路径");
+      const isUe4ss = path.startsWith("/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods");
+      const id = `server-import-${name.toLowerCase()}`;
+      const size = remoteFiles.find((file) => file.path === path)?.size ?? 0;
+      const existing = mods.find((mod) => mod.id === id);
+      const imported: ModEntry = existing
+        ? { ...existing, lastModified: new Date().toISOString() }
+        : {
+            id,
+            name,
+            fileName: name,
+            filePath: isUe4ss ? `ue4ss_runtime/ue4ss/Mods/${name}` : `~mods/${name}`,
+            fileSize: size,
+            lastModified: new Date().toISOString(),
+            enabled: false,
+            type: isUe4ss ? "ue4ssMod" : "clientPak",
+            loadOrder: mods.length,
+            tags: ["服务器"],
+            notes: "",
+            sha256: "",
+            originSource: "local",
+            deployed: false,
+            description: "从服务器模组库导入",
+            conflictCount: 0,
+            fileCount: 0,
+            overriddenFileCount: 0,
+            overridingFileCount: 0,
+            fullyOverridden: false,
+          };
+      mods = existing ? mods.map((mod) => (mod.id === id ? imported : mod)) : [...mods, imported];
+      recomputeMockConflicts();
+      return mockSnapshot() as T;
+    }
     case "get_sftp_remote_notes":
       return structuredClone(remoteNotes) as T;
     case "save_sftp_remote_note": {

@@ -1,9 +1,9 @@
 use crate::metadata::MetadataFile;
 use crate::models::{
-    AppSettings, ModEntry, RemoteFile, SftpAccount, SftpApplyResult, SftpConflictGroup,
-    SftpConflictOwner, SftpConflictProgress, SftpConflictReport, SftpConnectionResult,
-    SftpManagedBackup, SftpManagedManifest, SftpManagedRename, SftpManagedSource,
-    SftpOperationResult, UploadResult,
+    AppSettings, ImportResult, ModEntry, RemoteFile, SftpAccount, SftpApplyResult,
+    SftpConflictGroup, SftpConflictOwner, SftpConflictProgress, SftpConflictReport,
+    SftpConnectionResult, SftpManagedBackup, SftpManagedManifest, SftpManagedRename,
+    SftpManagedSource, SftpOperationResult, UploadResult,
 };
 use crate::paths::{safe_file_component, AppPaths};
 use anyhow::{bail, Context, Result};
@@ -389,6 +389,320 @@ pub fn delete_entry(
         message: format!("已删除远端模组 {name}"),
         path: target,
     })
+}
+
+pub fn mkdir_entry(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    path: &str,
+) -> Result<SftpOperationResult> {
+    let account = active_account(settings, Some(account_id))?;
+    let target = normalize_remote_path(path);
+    ensure_remote_operation_allowed(&account, &target)?;
+    // 根目录没有名称，validate 会拒绝；已存在的目录视为幂等成功。
+    let name = validate_remote_name(&entry_name(&target))?;
+    with_sftp(paths, &account, |sftp| {
+        let parent =
+            remote_parent(&target).context("远端目录路径缺少父目录")?;
+        if !remote_dir_exists(sftp, &parent) {
+            ensure_remote_dir(sftp, &parent)?;
+        }
+        if remote_dir_exists(sftp, &target) {
+            return Ok(());
+        }
+        sftp.mkdir(Path::new(&target), 0o755)
+            .with_context(|| format!("无法创建远端目录 {target}"))?;
+        Ok(())
+    })?;
+    Ok(SftpOperationResult {
+        message: format!("已创建远端目录 {name}"),
+        path: target,
+    })
+}
+
+pub fn move_entry(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+    new_path: &str,
+) -> Result<SftpOperationResult> {
+    let account = active_account(settings, Some(account_id))?;
+    let plan = plan_move(&account, remote_path, new_path)?;
+    with_sftp(paths, &account, |sftp| {
+        if sftp.lstat(Path::new(&plan.target)).is_ok() {
+            bail!("移动目标已存在：{}", plan.target);
+        }
+        sftp.rename(Path::new(&plan.source), Path::new(&plan.target), None)
+            .with_context(|| {
+                format!("无法移动远端条目 {} -> {}", plan.source, plan.target)
+            })?;
+        if let Some((source_sig, target_sig)) = &plan.signature_pair {
+            if sftp.lstat(Path::new(source_sig)).is_ok() {
+                sftp.rename(Path::new(source_sig), Path::new(target_sig), None)
+                    .with_context(|| format!("无法移动远端签名 {source_sig}"))?;
+            }
+        }
+        Ok(())
+    })?;
+    let _ = move_remote_notes(paths, account_id, &plan.source, &plan.target);
+    Ok(SftpOperationResult {
+        message: format!(
+            "已移动 {} -> {}",
+            entry_name(&plan.source),
+            entry_name(&plan.target)
+        ),
+        path: plan.target,
+    })
+}
+
+/// 把服务器上的 PAK / UE4SS 模组直接导入本地模组库。
+///
+/// PAK 落在 `~mods`（覆盖前旧文件进 `backups/imports`），UE4SS 目录落在
+/// `ue4ss_runtime/ue4ss/Mods`（沿用 `.staging/.retired` 语义，中途崩溃不会被扫描成模组）。
+pub fn download_mod_to_library(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+) -> Result<ImportResult> {
+    let account = active_account(settings, Some(account_id))?;
+    let (kind, remote, name) = plan_library_download(&account, remote_path)?;
+    with_sftp(paths, &account, |sftp| {
+        if kind == DownloadKind::Pak {
+            download_library_pak(sftp, paths, &remote, &name)
+        } else {
+            download_library_ue4ss_dir(sftp, paths, &remote, &name)
+        }
+    })
+}
+
+pub(crate) fn plan_move(
+    account: &SftpAccount,
+    source_raw: &str,
+    target_raw: &str,
+) -> Result<MovePlan> {
+    let source = normalize_remote_path(source_raw);
+    let target = normalize_remote_path(target_raw);
+    ensure_remote_operation_allowed(account, &source)?;
+    ensure_remote_operation_allowed(account, &target)?;
+    if source == target {
+        bail!("源路径与目标路径相同");
+    }
+    if source == normalize_remote_path(&account.mods_path)
+        || source == normalize_remote_path(&account.ue4ss_path)
+    {
+        bail!("不能移动模组根目录");
+    }
+    validate_remote_name(&entry_name(&target))?;
+    if source
+        .to_ascii_lowercase()
+        .ends_with(".pak")
+        && !target.to_ascii_lowercase().ends_with(".pak")
+    {
+        bail!("PAK 模组必须保留 .pak 扩展名");
+    }
+    let signature_pair = source.to_ascii_lowercase().ends_with(".pak").then(|| {
+        (
+            remote_with_extension(&source, "sig"),
+            remote_with_extension(&target, "sig"),
+        )
+    });
+    Ok(MovePlan {
+        source,
+        target,
+        signature_pair,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MovePlan {
+    pub source: String,
+    pub target: String,
+    pub signature_pair: Option<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadKind {
+    Pak,
+    Ue4ss,
+}
+
+pub(crate) fn plan_library_download(
+    account: &SftpAccount,
+    remote_path: &str,
+) -> Result<(DownloadKind, String, String)> {
+    let remote = normalize_remote_path(remote_path);
+    if !is_clean_remote_path(&remote) {
+        bail!("远端文件路径无效");
+    }
+    let in_ue4ss = !account.ue4ss_path.trim().is_empty()
+        && remote_path_within(&account.ue4ss_path, &remote);
+    let in_pak = remote_path_within(&account.mods_path, &remote);
+    if in_ue4ss {
+        let name = validate_remote_name(&entry_name(&remote))?;
+        Ok((DownloadKind::Ue4ss, remote, name))
+    } else if in_pak {
+        if !remote.to_ascii_lowercase().ends_with(".pak") {
+            bail!("仅支持把 PAK 目录下的 .pak 文件导入本地模组库");
+        }
+        let name = validate_remote_name(&entry_name(&remote))?;
+        Ok((DownloadKind::Pak, remote, name))
+    } else {
+        bail!("远端路径不在已配置的模组目录内：{remote}");
+    }
+}
+
+fn download_library_pak(
+    sftp: &Sftp,
+    paths: &AppPaths,
+    remote: &str,
+    name: &str,
+) -> Result<ImportResult> {
+    let stat = sftp
+        .stat(Path::new(remote))
+        .with_context(|| format!("无法读取远端文件 {remote}"))?;
+    if stat.is_dir() {
+        bail!("不能把目录导入为 PAK 模组：{remote}");
+    }
+    let destination = paths.local_mods.join(name);
+    std::fs::create_dir_all(&paths.local_mods)
+        .with_context(|| "无法创建本地模组库目录")?;
+    if destination.exists() {
+        let backup_root = paths.backups_dir.join("imports");
+        std::fs::create_dir_all(&backup_root)?;
+        let backup = backup_root.join(format!(
+            "{}-{name}",
+            Uuid::new_v4()
+        ));
+        std::fs::rename(&destination, &backup)
+            .with_context(|| format!("无法备份已存在的模组文件 {destination:?}"))?;
+    }
+    let partial = destination.with_file_name(format!(".{name}.part"));
+    let download = (|| -> Result<()> {
+        let mut remote_file = sftp
+            .open(Path::new(remote))
+            .with_context(|| format!("无法读取远端 PAK {remote}"))?;
+        let mut output = File::create(&partial)
+            .with_context(|| format!("无法创建本地文件 {partial:?}"))?;
+        std::io::copy(&mut remote_file, &mut output)
+            .with_context(|| format!("无法下载远端 PAK {remote}"))?;
+        output.flush()?;
+        std::fs::rename(&partial, &destination)
+            .with_context(|| "无法提交本地 PAK 文件")?;
+        Ok(())
+    })();
+    if download.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    download?;
+    Ok(ImportResult {
+        imported: 1,
+        skipped: 0,
+        message: format!("已从服务器下载 {name} 到本地模组库"),
+    })
+}
+
+fn download_library_ue4ss_dir(
+    sftp: &Sftp,
+    paths: &AppPaths,
+    remote_root: &str,
+    name: &str,
+) -> Result<ImportResult> {
+    let stat = sftp
+        .lstat(Path::new(remote_root))
+        .with_context(|| format!("无法读取远端目录 {remote_root}"))?;
+    if !stat.is_dir() {
+        bail!("远端 UE4SS 模组不是目录：{remote_root}");
+    }
+    let destination = paths.ue4ss_mods.join(name);
+    std::fs::create_dir_all(&paths.ue4ss_mods)
+        .with_context(|| "无法创建本地 UE4SS 模组目录")?;
+    let process_id = std::process::id();
+    let staging = paths
+        .ue4ss_mods
+        .join(format!(".staging-{process_id}-{name}"));
+    let retired = paths
+        .ue4ss_mods
+        .join(format!(".retired-{process_id}-{name}"));
+    if destination.exists() {
+        let _ = std::fs::remove_dir_all(&retired);
+        if destination.exists() {
+            std::fs::rename(&destination, &retired)
+                .with_context(|| "无法暂退已存在的 UE4SS 模组目录")?;
+        }
+    }
+    let mut visited = 0usize;
+    let result = (|| -> Result<()> {
+        download_remote_tree(sftp, remote_root, &staging, 0, &mut visited)?;
+        std::fs::rename(&staging, &destination)
+            .with_context(|| "无法提交本地 UE4SS 模组目录")?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    if result.is_err() {
+        if let Some(old) = std::fs::rename(&retired, &destination).ok() {
+            let _ = old;
+        }
+        let _ = std::fs::remove_dir_all(&retired);
+    }
+    result?;
+    Ok(ImportResult {
+        imported: 1,
+        skipped: 0,
+        message: format!("已从服务器下载 UE4SS 模组 {name} 到本地库（{visited} 个文件）"),
+    })
+}
+
+fn download_remote_tree(
+    sftp: &Sftp,
+    remote_path: &str,
+    local_path: &Path,
+    depth: usize,
+    visited: &mut usize,
+) -> Result<()> {
+    if depth > 64 {
+        bail!("远端目录层级过深，已停止下载");
+    }
+    *visited += 1;
+    if *visited > MAX_REMOTE_TREE_ENTRIES {
+        bail!("远端目录条目过多，已停止下载");
+    }
+    let stat = sftp
+        .lstat(Path::new(remote_path))
+        .with_context(|| format!("无法读取远端路径 {remote_path}"))?;
+    if !stat.is_dir() {
+        if let Some(parent) = local_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut remote_file = sftp
+            .open(Path::new(remote_path))
+            .with_context(|| format!("无法读取远端文件 {remote_path}"))?;
+        let mut output = File::create(local_path)
+            .with_context(|| format!("无法写入本地文件 {local_path:?}"))?;
+        std::io::copy(&mut remote_file, &mut output)?;
+        output.flush()?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(local_path)?;
+    let entries = sftp
+        .readdir(Path::new(remote_path))
+        .with_context(|| format!("无法读取远端目录 {remote_path}"))?;
+    for (entry_path, _stat) in entries {
+        let name = entry_name(&entry_path.to_string_lossy());
+        if name == "." || name == ".." {
+            continue;
+        }
+        download_remote_tree(
+            sftp,
+            &remote_join(remote_path, &name),
+            &local_path.join(&name),
+            depth + 1,
+            visited,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn read_remote_notes(
@@ -2715,11 +3029,11 @@ fn validate_managed_manifest_paths(
 mod tests {
     use super::{
         active_account, build_remote_merged_pak, build_remote_ue4ss_mods_txt,
-        conflict_entries_cache_name, download_file, ensure_remote_operation_allowed,
+        conflict_entries_cache_name, download_file, DownloadKind, ensure_remote_operation_allowed,
         load_remote_notes, move_remote_notes, numbered_remote_pak_file_name, pak_path_candidates,
-        plan_remote_pak_renames, read_conflict_entries_cache, remote_deployment_prefix_width,
-        remote_join, remove_remote_notes_under, root_from_pak_path, root_from_ue4ss_path,
-        safe_pak_relative_path, save_remote_notes, ue4ss_path_candidates,
+        plan_library_download, plan_move, plan_remote_pak_renames, read_conflict_entries_cache,
+        remote_deployment_prefix_width, remote_join, remove_remote_notes_under, root_from_pak_path,
+        root_from_ue4ss_path, safe_pak_relative_path, save_remote_notes, ue4ss_path_candidates,
         validate_managed_manifest_paths, validate_remote_name, write_conflict_entries_cache,
         RemoteNotesFile,
     };
@@ -3112,6 +3426,61 @@ mod tests {
 
         remove_remote_notes_under(&paths, "server", target).unwrap();
         assert!(load_remote_notes(&paths).unwrap().accounts["server"].is_empty());
+    }
+
+    #[test]
+    fn plans_remote_moves_within_mod_roots() {
+        let mut account = account("server");
+        account.mods_path = "/srv/scum/SCUM/Content/Paks/~mods".to_string();
+        account.ue4ss_path = "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods".to_string();
+        let mods_root = account.mods_path.clone();
+
+        let plan = plan_move(
+            &account,
+            &format!("{mods_root}/A.pak"),
+            &format!("{mods_root}/sub/B.pak"),
+        )
+        .expect("根目录内移动应被允许");
+        assert_eq!(plan.target, format!("{mods_root}/sub/B.pak"));
+        assert!(plan.signature_pair.is_some());
+
+        assert!(plan_move(
+            &account,
+            &format!("{mods_root}/A.pak"),
+            &format!("{mods_root}/A.txt")
+        )
+        .is_err());
+        assert!(plan_move(
+            &account,
+            &format!("{mods_root}/A.pak"),
+            "/srv/scum/SCUM/Config/x.pak"
+        )
+        .is_err());
+        assert!(plan_move(&account, &mods_root, "/srv/scum/SCUM/Content/Paks/x").is_err());
+        assert!(plan_move(&account, &format!("{mods_root}/A.pak"), &format!("{mods_root}/A.pak")).is_err());
+    }
+
+    #[test]
+    fn plans_library_downloads_by_root_membership() {
+        let mut account = account("server");
+        account.mods_path = "/srv/scum/SCUM/Content/Paks/~mods".to_string();
+        account.ue4ss_path = "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods".to_string();
+
+        let (kind, remote, name) =
+            plan_library_download(&account, "/srv/scum/SCUM/Content/Paks/~mods/ServerPak.pak")
+                .unwrap();
+        assert_eq!(kind, DownloadKind::Pak);
+        assert_eq!(name, "ServerPak.pak");
+        assert_eq!(remote, "/srv/scum/SCUM/Content/Paks/~mods/ServerPak.pak");
+
+        let (kind, _, name) =
+            plan_library_download(&account, "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/SCUMTweaks")
+                .unwrap();
+        assert_eq!(kind, DownloadKind::Ue4ss);
+        assert_eq!(name, "SCUMTweaks");
+
+        assert!(plan_library_download(&account, "/srv/scum/SCUM/Content/Paks/~mods/notes.txt").is_err());
+        assert!(plan_library_download(&account, "/srv/scum/SCUM/Config/ServerSettings.ini").is_err());
     }
 
     fn build_test_pak(
