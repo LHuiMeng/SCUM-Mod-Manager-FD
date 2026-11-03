@@ -398,13 +398,18 @@ fn source_identity(source: Option<&ModEntry>, pak_path: &Path) -> String {
         .map(std::fs::Metadata::len)
         .or_else(|| source.map(|item| item.file_size))
         .unwrap_or_default();
-    let modified = actual
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos().to_string())
-        .or_else(|| source.map(|item| item.last_modified.clone()))
-        .unwrap_or_default();
     let sha256 = source.map(|item| item.sha256.as_str()).unwrap_or_default();
+    // 有内容哈希时不把 mtime 计入身份：同内容重导入只会抬 mtime，不应让融合缓存失效。
+    let modified = if sha256.trim().is_empty() {
+        actual
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos().to_string())
+            .or_else(|| source.map(|item| item.last_modified.clone()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let id = source.map(|item| item.id.as_str()).unwrap_or_default();
     format!("{id}|{size}|{modified}|{sha256}")
 }
@@ -515,5 +520,39 @@ mod tests {
             .unwrap();
 
         assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    #[test]
+    fn merge_fingerprint_stays_stable_when_only_mtime_changes() {
+        let alpha = conflicting_mod("alpha", 0);
+        let beta = conflicting_mod("beta", 1);
+        let metadata = metadata_for(&[alpha.clone(), beta.clone()]);
+        let analysis = pak_scan::analyze_conflicts(&metadata, &[alpha.clone(), beta.clone()]);
+        let first = create_plan(&[alpha.clone(), beta.clone()], &analysis, &metadata)
+            .unwrap()
+            .unwrap();
+
+        // 同内容重导入：last_modified 被抬高，内容哈希不变。
+        let mut alpha_reimported = alpha.clone();
+        alpha_reimported.last_modified = "2026-06-01T00:00:00Z".to_string();
+        let mut beta_reimported = beta.clone();
+        beta_reimported.last_modified = "2026-06-01T00:00:00Z".to_string();
+        let analysis = pak_scan::analyze_conflicts(
+            &metadata,
+            &[alpha_reimported.clone(), beta_reimported.clone()],
+        );
+        let second = create_plan(
+            &[alpha_reimported, beta_reimported],
+            &analysis,
+            &metadata,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            first.fingerprint(),
+            second.fingerprint(),
+            "同内容重导入只抬 mtime，不应让融合缓存失效"
+        );
     }
 }

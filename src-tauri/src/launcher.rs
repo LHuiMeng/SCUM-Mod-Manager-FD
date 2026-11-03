@@ -1,10 +1,12 @@
 use crate::models::GameStatus;
-use crate::mods::deploy::{deploy_local_mods, find_executable, reclaim_mods};
+use crate::mods::deploy::{
+    deploy_local_mods, find_executable, read_manifest, reclaim_mods, DeployedManifest,
+};
 use crate::state::AppState;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub struct ManagedProcess {
@@ -14,6 +16,7 @@ pub struct ManagedProcess {
 }
 
 pub fn launch(app: AppHandle, state: &AppState, mode: &str) -> Result<GameStatus> {
+    let started = Instant::now();
     if is_running(state) {
         bail!("游戏进程已经在运行");
     }
@@ -36,9 +39,12 @@ pub fn launch(app: AppHandle, state: &AppState, mode: &str) -> Result<GameStatus
     } else {
         "SCUM.exe"
     };
+    let previous_manifest = read_manifest(&state.paths);
     let executable = find_executable(std::path::Path::new(install), executable_name)
         .with_context(|| format!("在 {install} 中找不到 {executable_name}"))?;
+    let found_after = started.elapsed();
     let deployed_at = deploy_local_mods(&state.paths, &settings, &mods, is_server)?;
+    let deploy_after = started.elapsed();
     if let Some(time) = deployed_at {
         *state.last_deployed_at.lock().unwrap() = Some(time);
     }
@@ -76,6 +82,18 @@ pub fn launch(app: AppHandle, state: &AppState, mode: &str) -> Result<GameStatus
             return Err(error).context("无法创建游戏进程");
         }
     };
+    let spawn_after = started.elapsed();
+    let deployment_note = describe_deployment(&previous_manifest, &read_manifest(&state.paths));
+    state.log(
+        "info",
+        "launcher",
+        &format!(
+            "启动耗时：定位exe {}ms / 部署 {}ms（{deployment_note}）/ spawn {}ms",
+            found_after.as_millis(),
+            deploy_after.as_millis() - found_after.as_millis(),
+            spawn_after.as_millis() - deploy_after.as_millis(),
+        ),
+    );
     let pid = child.id();
     let token = {
         let mut next = state.next_launch_token.lock().unwrap();
@@ -93,6 +111,23 @@ pub fn launch(app: AppHandle, state: &AppState, mode: &str) -> Result<GameStatus
     let _ = app.emit("game-status-changed", &status);
     monitor_process(app, state, token, pid);
     Ok(status)
+}
+
+fn describe_deployment(
+    previous: &Option<DeployedManifest>,
+    current: &Option<DeployedManifest>,
+) -> String {
+    match (previous, current) {
+        (Some(previous), Some(current)) if previous.deployed_at == current.deployed_at => {
+            "复用既有部署".to_string()
+        }
+        (_, Some(current)) => format!(
+            "全量拷贝 {} 个文件（{:.1} MB）",
+            current.files.len(),
+            current.file_sizes.values().sum::<u64>() as f64 / 1_048_576.0
+        ),
+        _ => "无启用模组，未部署".to_string(),
+    }
 }
 
 pub fn stop(state: &AppState) -> Result<GameStatus> {

@@ -459,7 +459,11 @@ fn deployment_fingerprint(
         hash_deployment_field(&mut hasher, &item.file_name);
         hash_deployment_field(&mut hasher, &path_key(Path::new(&item.file_path)));
         hash_deployment_field(&mut hasher, &item.file_size.to_string());
-        hash_deployment_field(&mut hasher, &item.last_modified);
+        // 内容哈希稳定：同内容重导入只会抬 mtime，不应让部署指纹失效。
+        // 仅在条目没有 sha256（如 UE4SS 目录类）时退回 mtime。
+        if item.sha256.trim().is_empty() {
+            hash_deployment_field(&mut hasher, &item.last_modified);
+        }
         hash_deployment_field(&mut hasher, &item.sha256);
     }
     hex::encode(hasher.finalize())
@@ -807,8 +811,8 @@ pub fn sync_ue4ss_state(paths: &AppPaths, mods: &[ModEntry]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deploy_local_mods, read_manifest, reclaim_mods, rescue_mods_from_game, sync_ue4ss_state,
-        DeployedManifest,
+        deployment_fingerprint, deploy_local_mods, read_manifest, reclaim_mods,
+        rescue_mods_from_game, sync_ue4ss_state, DeployedManifest,
     };
     use crate::metadata::{save_metadata, MetadataFile};
     use crate::models::{AppSettings, ModEntry};
@@ -1848,6 +1852,90 @@ mod tests {
         assert!(managed.contains(&base64::engine::general_purpose::STANDARD.encode("EnabledMod")));
         assert!(managed.contains(&base64::engine::general_purpose::STANDARD.encode("DisabledMod")));
         assert!(!managed.contains("OldManaged"));
+    }
+
+    #[test]
+    fn deployment_fingerprint_ignores_mtime_when_content_hash_is_present() {
+        let mut alpha = mod_entry(std::path::Path::new("C:/mods/Alpha.pak"), true, "clientPak");
+        alpha.sha256 = "a".repeat(64);
+        alpha.last_modified = "2026-01-01T00:00:00Z".to_string();
+        let mut reimported = alpha.clone();
+        // 同内容重导入：mtime 被抬高，内容哈希不变。
+        reimported.last_modified = "2026-06-01T00:00:00Z".to_string();
+
+        assert_eq!(
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[alpha.clone()], None),
+            deployment_fingerprint(
+                std::path::Path::new("C:/game"),
+                false,
+                &[reimported],
+                None
+            ),
+            "同内容重导入不应让部署指纹失效"
+        );
+
+        let mut changed = alpha.clone();
+        changed.sha256 = "b".repeat(64);
+        assert_ne!(
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[alpha], None),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[changed], None),
+            "内容变化必须让部署指纹失效"
+        );
+    }
+
+    #[test]
+    fn deployment_fingerprint_falls_back_to_mtime_without_content_hash() {
+        let mut alpha = mod_entry(std::path::Path::new("C:/mods/DllMod"), true, "ue4ssMod");
+        alpha.sha256 = String::new();
+        alpha.last_modified = "2026-01-01T00:00:00Z".to_string();
+        let mut retouched = alpha.clone();
+        retouched.last_modified = "2026-06-01T00:00:00Z".to_string();
+
+        assert_ne!(
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[alpha], None),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[retouched], None),
+            "没有内容哈希的条目仍按 mtime 判定变化"
+        );
+    }
+
+    #[test]
+    fn deployment_fingerprint_still_changes_when_duplicate_canonical_flips() {
+        // 两个字节相同的 PAK，load_order 不同会折叠出不同 canonical（文件名不同）。
+        let mut alpha = mod_entry(std::path::Path::new("C:/mods/Alpha.pak"), true, "clientPak");
+        alpha.sha256 = "a".repeat(64);
+        alpha.load_order = 0;
+        let mut zeta = mod_entry(std::path::Path::new("C:/mods/Zeta.pak"), true, "clientPak");
+        zeta.sha256 = "a".repeat(64);
+        zeta.load_order = 1;
+
+        let canonical_a = super::super::duplicates::collapse_identical_mods(
+            vec![zeta.clone(), alpha.clone()],
+            &crate::metadata::MetadataFile::default(),
+        );
+        let mut swapped = zeta.clone();
+        swapped.load_order = 0;
+        let mut swapped_alpha = alpha.clone();
+        swapped_alpha.load_order = 1;
+        let canonical_b = super::super::duplicates::collapse_identical_mods(
+            vec![swapped, swapped_alpha],
+            &crate::metadata::MetadataFile::default(),
+        );
+
+        assert_ne!(
+            deployment_fingerprint(
+                std::path::Path::new("C:/game"),
+                false,
+                &canonical_a,
+                None
+            ),
+            deployment_fingerprint(
+                std::path::Path::new("C:/game"),
+                false,
+                &canonical_b,
+                None
+            ),
+            "canonical 不同（部署文件名不同）时指纹必须不同"
+        );
     }
 
     fn build_test_pak(

@@ -9,6 +9,7 @@ interface LaunchStripProps {
   enabledCount: number;
   totalBytes: number;
   running: boolean;
+  busy: boolean;
   keepDeployedModsOnExit: boolean;
   launchOptions: LaunchOptions;
   onLaunch: () => void;
@@ -21,6 +22,7 @@ export function LaunchStrip({
   enabledCount,
   totalBytes,
   running,
+  busy,
   keepDeployedModsOnExit,
   launchOptions,
   onLaunch,
@@ -138,9 +140,14 @@ export function LaunchStrip({
         variant={running ? "danger" : "primary"}
         className="launch-primary"
         icon={running ? "serverOff" : "play"}
+        disabled={busy && !running}
         onClick={running ? onKill : onLaunch}
       >
-        {running ? t("launch.stop") : t("launch.start")}
+        {running
+          ? t("launch.stop")
+          : busy
+            ? t("launch.deploying")
+            : t("launch.start")}
       </Button>
     </section>
   );

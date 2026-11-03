@@ -265,6 +265,7 @@ export function LibraryScreen({
               enabledCount={summary.enabled.length}
               totalBytes={summary.totalBytes}
               running={gameStatus.running}
+              busy={busy}
               keepDeployedModsOnExit={snapshot.settings.keepDeployedModsOnExit}
               launchOptions={snapshot.settings.launchOptions}
               onLaunch={onLaunch}
