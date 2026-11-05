@@ -86,7 +86,7 @@ export function RemoteBrowser({
 
   const breadcrumbs = remoteBreadcrumbs(browsePath);
   const selected = files.find((file) => file.path === selectedPath) ?? null;
-  const currentDir = browsePath.replace(/\/+$/, "");
+  const currentDir = browsePath.replace(/\/+$/, "") || "/";
 
   function entryName(path: string): string {
     return path.split("/").filter(Boolean).pop() ?? path;
@@ -104,7 +104,7 @@ export function RemoteBrowser({
 
   function openMove(path: string) {
     setMoveSource(path);
-    setMoveTarget(`${currentDir}/${entryName(path)}`);
+    setMoveTarget(normalizeRemotePath(`${currentDir}/${entryName(path)}`));
   }
 
   async function commitMove() {
@@ -278,6 +278,7 @@ export function RemoteBrowser({
             onChange={(event) => setMkdirName(event.target.value)}
             placeholder={t("server.browser.newFolderPlaceholder")}
             onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
               if (event.key === "Enter") void commitMkdir();
               if (event.key === "Escape") setMkdirOpen(false);
             }}

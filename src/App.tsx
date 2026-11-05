@@ -153,6 +153,10 @@ function LocalizedApp() {
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const [fileDragActive, setFileDragActive] = useState(false);
   const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
+  // 启动失败时必须让用户看到原因并能重试，而不是永远停在 loading。
+  const [bootError, setBootError] = useState<string | null>(null);
+  const [bootAttempt, setBootAttempt] = useState(0);
+  const [serverRestoreConfirm, setServerRestoreConfirm] = useState<string | null>(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
   const bootUpdateChecked = useRef(false);
   const importPathsRef = useRef<(paths: string[]) => Promise<void>>(async () => undefined);
@@ -413,6 +417,7 @@ function LocalizedApp() {
 
   useEffect(() => {
     let cancelled = false;
+    setBootError(null);
     Promise.all([api.getSnapshot(), api.getAppInfo()])
       .then(([next, info]) => {
         if (cancelled) return;
@@ -442,12 +447,14 @@ function LocalizedApp() {
         );
       })
       .catch((error) => {
+        if (cancelled) return;
+        setBootError(String(error));
         notify(t("toast.loadFailed.title"), String(error), "error");
       });
     return () => {
       cancelled = true;
     };
-  }, [loadLocale, notify]);
+  }, [bootAttempt, loadLocale, notify]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -1021,7 +1028,8 @@ function LocalizedApp() {
   }
 
   async function handleLaunch() {
-    if (!snapshot || snapshot.gameStatus.running) return;
+    // 连点会发出两次 launch_game：Rust 侧有启动互斥，前端也不该重复排队。
+    if (busy || !snapshot || snapshot.gameStatus.running) return;
     if (!snapshot.settings.scumInstallPath.trim()) {
       notify(
         t("toast.clientPathMissing.title"),
@@ -1385,7 +1393,7 @@ function LocalizedApp() {
       totalFiles: selected.length,
       completedBytes: 0,
       totalBytes: 0,
-      message: kind === "pak" ? "正在上传 PAK 模组…" : "正在上传 UE4SS 模组…",
+      message: kind === "pak" ? t("serverLibrary.uploadingPak") : t("serverLibrary.uploadingUe4ss"),
     });
     try {
       const result = await api.uploadServerMods(accountId, kind, selected);
@@ -1787,9 +1795,17 @@ function LocalizedApp() {
     }
   }
 
-  async function handleRestoreServerLibrary() {
+  function handleRestoreServerLibrary() {
     const accountId = serverLibraryView?.accountId;
     if (!accountId || busy) return;
+    // 恢复会移动服务器上的文件，必须二次确认。
+    setServerRestoreConfirm(accountId);
+  }
+
+  async function performRestoreServerLibrary() {
+    const accountId = serverRestoreConfirm;
+    if (!accountId) return;
+    setServerRestoreConfirm(null);
     setBusy(true);
     setServerError(null);
     try {
@@ -1806,7 +1822,21 @@ function LocalizedApp() {
   }
 
   async function handleReclaimPendingLinks() {
+    // 回收可能要等被占用的文件释放（单文件最长 30s）：订阅后端进度，先把「正在等」告诉用户。
+    let unlisten: (() => void) | null = null;
     try {
+      if (isTauri()) {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen<{ message?: string; waitedMs?: number }>(
+          "reclaim-progress",
+          (event) => {
+            const payload = event.payload;
+            if (payload?.message && (payload.waitedMs ?? 0) === 0) {
+              notify(t("toast.linksReclaimed.title"), payload.message);
+            }
+          },
+        );
+      }
       const removed = await api.reclaimPendingLinks();
       setPendingLinks([]);
       notify(
@@ -1816,6 +1846,8 @@ function LocalizedApp() {
       );
     } catch (error) {
       notify(t("toast.linksReclaimFailed.title"), String(error), "error");
+    } finally {
+      unlisten?.();
     }
   }
 
@@ -1861,6 +1893,20 @@ function LocalizedApp() {
   }
 
   if (!snapshot) {
+    if (bootError) {
+      return (
+        <div className="boot-screen">
+          <span className="boot-mark">SM</span>
+          <div>
+            <b>{t("toast.loadFailed.title")}</b>
+            <span>{bootError}</span>
+          </div>
+          <Button onClick={() => setBootAttempt((value) => value + 1)}>
+            {t("common.retry")}
+          </Button>
+        </div>
+      );
+    }
     return (
       <div className="boot-screen">
         <span className="boot-mark">SM</span>
@@ -2105,6 +2151,25 @@ function LocalizedApp() {
               </li>
             ))}
           </ul>
+        </Modal>
+      ) : null}
+      {serverRestoreConfirm ? (
+        <Modal
+          title={t("serverLibrary.restore")}
+          description={t("serverLibrary.confirmRestore")}
+          onClose={() => setServerRestoreConfirm(null)}
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setServerRestoreConfirm(null)}>
+                {t("common.cancel")}
+              </Button>
+              <Button variant="danger" onClick={() => void performRestoreServerLibrary()}>
+                {t("serverLibrary.restore")}
+              </Button>
+            </>
+          }
+        >
+          <p>{t("serverLibrary.managedHint")}</p>
         </Modal>
       ) : null}
       {crashReport ? (

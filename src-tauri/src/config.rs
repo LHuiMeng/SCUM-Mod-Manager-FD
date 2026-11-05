@@ -20,7 +20,7 @@ pub fn load_settings_with_cloud_defaults(
     default_cloud_urls: &[String],
 ) -> Result<AppSettings> {
     migrate_legacy_files(paths);
-    if !paths.config_file.exists() {
+    if !paths.config_file.exists() && !crate::paths::backup_path_of(&paths.config_file).exists() {
         let mut settings = AppSettings::default();
         normalize_settings(paths, &mut settings, None);
         apply_default_cloud_sources(&mut settings, default_cloud_urls);
@@ -28,9 +28,7 @@ pub fn load_settings_with_cloud_defaults(
         return Ok(settings);
     }
 
-    let raw = std::fs::read_to_string(&paths.config_file)
-        .with_context(|| format!("无法读取 {}", paths.config_file.display()))?;
-    let value: Value = serde_json::from_str(&raw).context("config.json 格式无效")?;
+    let value = read_config_value(paths)?;
     let mut settings: AppSettings =
         serde_json::from_value(value.clone()).context("config.json 字段无法解析")?;
     normalize_settings(paths, &mut settings, Some(&value));
@@ -39,11 +37,35 @@ pub fn load_settings_with_cloud_defaults(
     Ok(settings)
 }
 
+/// 读 config.json；主文件缺失或损坏时回退到上一次成功写入留下的 `.bak`。
+fn read_config_value(paths: &AppPaths) -> Result<Value> {
+    let backup = crate::paths::backup_path_of(&paths.config_file);
+    let value = match std::fs::read_to_string(&paths.config_file) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(value) => return Ok(value),
+            Err(error) => anyhow::Error::new(error).context("config.json 格式无效"),
+        },
+        Err(error) => anyhow::Error::new(error)
+            .context(format!("无法读取 {}", paths.config_file.display())),
+    };
+    // 主文件缺失（例如上次 rename 只完成了轮转）或损坏时，用 .bak 恢复。
+    let Ok(backup_raw) = std::fs::read_to_string(&backup) else {
+        return Err(value);
+    };
+    let parsed: Value = serde_json::from_str(&backup_raw)
+        .with_context(|| format!("{} 格式也无效", backup.display()))?;
+    eprintln!(
+        "config.json 读取失败，已回退到 {}：{value:#}",
+        backup.display()
+    );
+    Ok(parsed)
+}
+
 pub fn save_settings(paths: &AppPaths, settings: &AppSettings) -> Result<()> {
     let mut normalized = settings.clone();
     normalize_settings(paths, &mut normalized, None);
     let json = serde_json::to_string_pretty(&normalized)?;
-    std::fs::write(&paths.config_file, format!("{json}\n"))
+    crate::paths::write_state_file(&paths.config_file, format!("{json}\n").as_bytes())
         .with_context(|| format!("无法写入 {}", paths.config_file.display()))?;
     Ok(())
 }

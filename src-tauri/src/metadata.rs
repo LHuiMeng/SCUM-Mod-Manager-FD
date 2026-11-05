@@ -53,20 +53,39 @@ impl MetadataFile {
 }
 
 pub fn load_metadata(paths: &AppPaths) -> Result<MetadataFile> {
-    if !paths.metadata_file.exists() {
+    if !paths.metadata_file.exists() && !crate::paths::backup_path_of(&paths.metadata_file).exists()
+    {
         return Ok(MetadataFile::default());
     }
-    let text = std::fs::read_to_string(&paths.metadata_file)
-        .with_context(|| format!("无法读取 {}", paths.metadata_file.display()))?;
+    let primary_error = match read_metadata_at(&paths.metadata_file) {
+        Ok(metadata) => return Ok(metadata),
+        Err(error) => error,
+    };
+    let backup = crate::paths::backup_path_of(&paths.metadata_file);
+    match read_metadata_at(&backup) {
+        Ok(metadata) => {
+            eprintln!(
+                "mods_meta.json 解析失败，已回退到 {}：{primary_error:#}",
+                backup.display()
+            );
+            Ok(metadata)
+        }
+        Err(_) => Err(primary_error),
+    }
+}
+
+fn read_metadata_at(path: &Path) -> Result<MetadataFile> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("无法读取 {}", path.display()))?;
     if text.trim().is_empty() {
         return Ok(MetadataFile::default());
     }
-    serde_json::from_str(&text).context("mods_meta.json 格式无效")
+    serde_json::from_str(&text).with_context(|| format!("{} 格式无效", path.display()))
 }
 
 pub fn save_metadata_at(path: &Path, metadata: &MetadataFile) -> Result<()> {
     let json = serde_json::to_string_pretty(metadata)?;
-    std::fs::write(path, format!("{json}\n"))
+    crate::paths::write_state_file(path, format!("{json}\n").as_bytes())
         .with_context(|| format!("无法写入 {}", path.display()))?;
     Ok(())
 }

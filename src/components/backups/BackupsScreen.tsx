@@ -6,6 +6,7 @@ import { formatBytes, formatDate } from "../../lib/format";
 import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
 import { Icon } from "../ui/Icon";
+import { Modal } from "../ui/Modal";
 
 type BackupFilter = "all" | BackupEntry["kind"];
 
@@ -26,6 +27,11 @@ export function BackupsScreen({ onNotify, onRestored }: BackupsScreenProps) {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<BackupFilter>("all");
   const [workingId, setWorkingId] = useState<string | null>(null);
+  const [pending, setPending] = useState<{
+    action: "restore" | "remove";
+    entry: BackupEntry;
+  } | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -52,32 +58,50 @@ export function BackupsScreen({ onNotify, onRestored }: BackupsScreenProps) {
     [entries],
   );
 
-  async function restore(entry: BackupEntry) {
-    if (workingId) return;
+  async function restore(entry: BackupEntry): Promise<boolean> {
+    if (workingId) return false;
     setWorkingId(entry.id);
     try {
       const message = await api.restoreBackup(entry.id);
       onNotify(t("backups.restored.title"), message, "success");
       onRestored?.();
       await load();
+      return true;
     } catch (reason) {
       onNotify(t("backups.restoreFailed.title"), String(reason), "error");
+      return false;
     } finally {
       setWorkingId(null);
     }
   }
 
-  async function remove(entry: BackupEntry) {
-    if (workingId) return;
+  async function remove(entry: BackupEntry): Promise<boolean> {
+    if (workingId) return false;
     setWorkingId(entry.id);
     try {
       await api.deleteBackup(entry.id);
       onNotify(t("backups.removed.title"), entry.name, "success");
       await load();
+      return true;
     } catch (reason) {
       onNotify(t("backups.removeFailed.title"), String(reason), "error");
+      return false;
     } finally {
       setWorkingId(null);
+    }
+  }
+
+  async function confirmPending() {
+    if (!pending || confirmBusy) return;
+    setConfirmBusy(true);
+    try {
+      const ok =
+        pending.action === "restore"
+          ? await restore(pending.entry)
+          : await remove(pending.entry);
+      if (ok) setPending(null);
+    } finally {
+      setConfirmBusy(false);
     }
   }
 
@@ -158,11 +182,11 @@ export function BackupsScreen({ onNotify, onRestored }: BackupsScreenProps) {
               <div className="backup-actions">
                 <Button
                   size="sm"
-                  variant="primary"
+                  variant="outline"
                   icon="refresh"
                   disabled={Boolean(workingId) || !entry.restorable}
                   title={entry.restorable ? undefined : t("backups.viewOnly")}
-                  onClick={() => void restore(entry)}
+                  onClick={() => setPending({ action: "restore", entry })}
                 >
                   {!entry.restorable
                     ? t("backups.viewOnly")
@@ -175,7 +199,7 @@ export function BackupsScreen({ onNotify, onRestored }: BackupsScreenProps) {
                   variant="danger"
                   icon="trash"
                   disabled={Boolean(workingId)}
-                  onClick={() => void remove(entry)}
+                  onClick={() => setPending({ action: "remove", entry })}
                 >
                   {t("backups.remove")}
                 </Button>
@@ -184,6 +208,56 @@ export function BackupsScreen({ onNotify, onRestored }: BackupsScreenProps) {
           ))}
         </div>
       )}
+
+      {pending ? (
+        <Modal
+          title={t(
+            pending.action === "restore"
+              ? "backups.confirmRestore.title"
+              : "backups.confirmRemove.title",
+          )}
+          description={t(
+            pending.action === "restore"
+              ? "backups.confirmRestore.detail"
+              : "backups.confirmRemove.detail",
+            { name: pending.entry.name },
+          )}
+          onClose={() => {
+            if (!confirmBusy) setPending(null);
+          }}
+          footer={
+            <>
+              <Button
+                disabled={confirmBusy}
+                onClick={() => {
+                  if (!confirmBusy) setPending(null);
+                }}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                variant={pending.action === "remove" ? "danger" : "outline"}
+                disabled={confirmBusy}
+                onClick={() => void confirmPending()}
+              >
+                {confirmBusy
+                  ? t("common.working")
+                  : pending.action === "restore"
+                    ? t("backups.restore")
+                    : t("backups.remove")}
+              </Button>
+            </>
+          }
+        >
+          <div className="backup-confirm">
+            <code>{pending.entry.path}</code>
+            <span>
+              {formatBytes(pending.entry.size)} ·{" "}
+              {formatDate(pending.entry.createdAt, language)}
+            </span>
+          </div>
+        </Modal>
+      ) : null}
     </section>
   );
 }

@@ -63,8 +63,8 @@ export function UpdateSettings({
             <span>{progressLabel(phase, t)}</span>
             <b>{percent !== null ? `${percent}%` : t("update.verifyingShort")}</b>
           </div>
-          <i>
-            <span style={{ width: percent !== null ? `${percent}%` : "36%" }} />
+          <i className={percent === null ? "progress-indeterminate" : undefined}>
+            <span style={percent !== null ? { width: `${percent}%` } : undefined} />
           </i>
         </div>
       ) : null}

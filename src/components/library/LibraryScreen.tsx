@@ -400,10 +400,11 @@ export function LibraryScreen({
             if (serverMode && server) {
               const saved = await server.onEdit(editing.id, tags, notes);
               if (saved) setEditing(null);
-              return;
+              return saved;
             }
             await onEdit(editing.id, tags, notes);
             setEditing(null);
+            return true;
           }}
           onClose={() => setEditing(null)}
         />

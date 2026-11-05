@@ -431,8 +431,8 @@ export function mockSnapshot(): LibrarySnapshot {
     gameStatus,
     lastDeployedAt: null,
     lastScannedAt: new Date().toISOString(),
-    localModsPath: "W:/hermes/SCUM_Mod_Desk_v3/app-data/~mods",
-    clientModsPath: "X:/SteamLibrary/steamapps/common/SCUM/SCUM/Content/Paks/~mods",
+    localModsPath: "C:/SCUM Mod Desk/app-data/~mods",
+    clientModsPath: "D:/Steam/steamapps/common/SCUM/SCUM/Content/Paks/~mods",
   });
 }
 

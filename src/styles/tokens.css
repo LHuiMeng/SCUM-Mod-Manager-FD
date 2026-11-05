@@ -11,6 +11,11 @@
   --rail-active: #242a25;
   --rail-text: #d8d7cf;
   --rail-muted: #747b74;
+  --boot-bg: #0d0e0d;
+  --boot-ink: #f1eee8;
+  --boot-muted: #8e938d;
+  --boot-line: #343834;
+  --boot-mark-ink: #1d1210;
   --paper: #e9e5da;
   --paper-hi: #f5f1e7;
   --paper-lo: #d8d2c4;
@@ -60,6 +65,11 @@
   --rail-active: #202020;
   --rail-text: #f1eee8;
   --rail-muted: #777;
+  --boot-bg: #0d0e0d;
+  --boot-ink: #f1eee8;
+  --boot-muted: #8e938d;
+  --boot-line: #343834;
+  --boot-mark-ink: #1d1210;
   --paper: #151515;
   --paper-hi: #1c1c1c;
   --paper-lo: #232323;

@@ -135,7 +135,7 @@ export function RemoteModViewer({
 
   useEffect(() => {
     setDraftNote(selected ? notes[selected.path] ?? "" : "");
-  }, [notes, selected]);
+  }, [selected?.path]);
 
   const noteChanged = Boolean(selected && draftNote !== (notes[selected.path] ?? ""));
   const invalidRename =
@@ -499,6 +499,7 @@ export function RemoteModViewer({
               value={renameValue}
               onChange={(event) => setRenameValue(event.target.value)}
               onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.keyCode === 229) return;
                 if (event.key === "Enter") {
                   event.preventDefault();
                   void submitRename();

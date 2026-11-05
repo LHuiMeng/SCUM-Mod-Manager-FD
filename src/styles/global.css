@@ -3878,6 +3878,22 @@ body.is-row-dragging {
   transition: width 220ms ease;
 }
 
+.update-inline-progress > i.progress-indeterminate span,
+.update-progress-card > i.progress-indeterminate span {
+  width: 36%;
+  animation: progress-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(300%);
+  }
+}
+
 .update-available-meta {
   display: flex;
   flex-wrap: wrap;
@@ -4263,8 +4279,8 @@ body.is-row-dragging {
   align-items: center;
   justify-content: center;
   gap: 18px;
-  color: #f1eee8;
-  background: #0d0e0d;
+  color: var(--boot-ink);
+  background: var(--boot-bg);
 }
 
 .boot-mark {
@@ -4273,7 +4289,7 @@ body.is-row-dragging {
   display: grid;
   place-items: center;
   border-radius: 14px;
-  color: #1d1210;
+  color: var(--boot-mark-ink);
   background: var(--accent);
   font-family: "Archivo", sans-serif;
   font-size: var(--type-title-sm);
@@ -4290,7 +4306,7 @@ body.is-row-dragging {
 .boot-screen div span {
   display: block;
   margin-top: 5px;
-  color: #8e938d;
+  color: var(--boot-muted);
   font-size: var(--type-label);
 }
 
@@ -4299,7 +4315,7 @@ body.is-row-dragging {
   height: 1px;
   margin-left: 8px;
   overflow: hidden;
-  background: #343834;
+  background: var(--boot-line);
 }
 
 .boot-screen > i::after {
@@ -4869,6 +4885,24 @@ body.is-row-dragging {
   gap: 6px;
 }
 
+.backup-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.backup-confirm code {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+
+.backup-confirm span {
+  color: var(--muted);
+  font-size: var(--type-label);
+}
+
 .backups-error {
   margin-bottom: 12px;
   padding: 10px 12px;
@@ -4996,5 +5030,12 @@ body.is-row-dragging {
 @media (prefers-reduced-motion: reduce) {
   .server-upload-progress-track i {
     transition: none;
+  }
+
+  .update-inline-progress > i.progress-indeterminate span,
+  .update-progress-card > i.progress-indeterminate span {
+    width: 36%;
+    animation: none;
+    transform: none;
   }
 }

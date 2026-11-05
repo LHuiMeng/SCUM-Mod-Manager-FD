@@ -1,6 +1,6 @@
 use crate::metadata::MetadataFile;
 use crate::models::{ConflictGroup, ImportConflict, ImportResult, ModEntry};
-use crate::paths::{path_string, safe_disk_name, AppPaths};
+use crate::paths::{free_space, path_string, safe_disk_name, AppPaths};
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -774,7 +774,7 @@ pub fn install_ue4ss_zip(
 
     let staging = paths
         .ue4ss_mods
-        .join(format!(".staging-{}-{}", std::process::id(), folder_name));
+        .join(format!(".staging-{}-{}-{}", std::process::id(), uuid::Uuid::new_v4(), folder_name));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)?;
     let extracted = match extract_zip_all_with_wrapper(archive, &staging, wrapper.as_deref()) {
@@ -791,27 +791,22 @@ pub fn install_ue4ss_zip(
 
     let mut retired = None;
     if destination.exists() {
-        let trash =
-            paths
-                .ue4ss_mods
-                .join(format!(".retired-{}-{}", std::process::id(), folder_name));
-        let _ = std::fs::remove_dir_all(&trash);
-        std::fs::rename(&destination, &trash).with_context(|| {
+        // 与目录导入保持一致：旧版本搬进 backups/imports 可回收，而不是直接销毁。
+        let backup = import_backup_path(paths, &folder_name)?;
+        std::fs::rename(&destination, &backup).with_context(|| {
             format!("无法替换已存在的 UE4SS 模组目录 {}", destination.display())
         })?;
-        retired = Some(trash);
+        retired = Some(backup);
     }
     if let Err(error) = std::fs::rename(&staging, &destination) {
-        if let Some(trash) = retired {
-            let _ = std::fs::rename(&trash, &destination);
+        if let Some(backup) = retired {
+            let _ = std::fs::rename(&backup, &destination);
         }
         let _ = std::fs::remove_dir_all(&staging);
         return Err(error)
             .with_context(|| format!("无法写入 UE4SS 模组目录 {}", destination.display()));
     }
-    if let Some(trash) = retired {
-        let _ = std::fs::remove_dir_all(&trash);
-    }
+    // 旧版本保留在 backups/imports，交给备份页回收。
     Ok((1, 0))
 }
 
@@ -866,6 +861,29 @@ fn is_ue4ss_content_root(name: &str) -> bool {
     )
 }
 
+/// 单个 ZIP 的条目上限：防止条目爆炸把 staging 里塞满小文件。
+const MAX_ZIP_ENTRIES: usize = 50_000;
+/// 解压时至少给程序自身留出的磁盘余量。
+const ZIP_FREE_SPACE_RESERVE: u64 = 1 << 30;
+
+/// 本次解压允许写出的总字节数：最多用掉目标卷可用空间的 80%，并预留余量。
+fn zip_extract_budget(destination: &Path) -> u64 {
+    let available = free_space(destination).unwrap_or(0);
+    available
+        .saturating_sub(ZIP_FREE_SPACE_RESERVE)
+        .saturating_mul(4)
+        / 5
+}
+
+fn ensure_zip_entry_budget(entry_count: usize) -> Result<()> {
+    if entry_count > MAX_ZIP_ENTRIES {
+        anyhow::bail!(
+            "压缩包条目过多（{entry_count}），超过上限 {MAX_ZIP_ENTRIES}，已拒绝解压"
+        );
+    }
+    Ok(())
+}
+
 pub fn extract_zip_file(zip_path: &Path, destination: &Path) -> Result<usize> {
     let file = File::open(zip_path)?;
     let archive = ZipArchive::new(file)?;
@@ -883,6 +901,9 @@ where
     F: Fn(&str) -> bool,
 {
     std::fs::create_dir_all(destination)?;
+    ensure_zip_entry_budget(archive.len())?;
+    let budget = zip_extract_budget(destination);
+    let mut written = 0u64;
     let mut imported = 0;
     let mut skipped = 0;
     for index in 0..archive.len() {
@@ -912,6 +933,10 @@ where
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        written = written.saturating_add(entry.size());
+        if written > budget {
+            anyhow::bail!("压缩包解压后体积超过可用空间上限，已停止解压");
+        }
         let mut target = File::create(output)?;
         std::io::copy(&mut entry, &mut target)?;
         imported += 1;
@@ -929,6 +954,9 @@ fn extract_zip_all_with_wrapper(
     wrapper: Option<&str>,
 ) -> Result<usize> {
     std::fs::create_dir_all(destination)?;
+    ensure_zip_entry_budget(archive.len())?;
+    let budget = zip_extract_budget(destination);
+    let mut written = 0u64;
     let mut count = 0;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
@@ -956,6 +984,13 @@ fn extract_zip_all_with_wrapper(
         }
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        written = written.saturating_add(entry.size());
+        if written > budget {
+            anyhow::bail!(
+                "压缩包解压后体积超过可用空间上限，已停止解压：{}",
+                output.display()
+            );
         }
         let mut target = File::create(&output)?;
         std::io::copy(&mut entry, &mut target)?;
@@ -1034,11 +1069,12 @@ fn epoch_millis(time: SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_zip_file, import_paths, inspect_import_conflicts, install_ue4ss_zip,
-        refresh_conflicts, scan_local_mods, stable_id,
+        ensure_zip_entry_budget, extract_zip_file, import_paths, inspect_import_conflicts,
+        install_ue4ss_zip, refresh_conflicts, scan_local_mods, stable_id, zip_extract_budget,
+        MAX_ZIP_ENTRIES,
     };
     use crate::models::ModEntry;
-    use crate::paths::AppPaths;
+    use crate::paths::{free_space, AppPaths};
     use std::collections::HashSet;
     use std::fs::{self, File};
     use std::io::Write;
@@ -1703,5 +1739,22 @@ mod tests {
             .unwrap();
         assert_eq!(imports.len(), 1);
         assert_eq!(fs::read(imports[0].path()).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rejects_zips_with_too_many_entries() {
+        assert!(ensure_zip_entry_budget(MAX_ZIP_ENTRIES).is_ok());
+        let error = ensure_zip_entry_budget(MAX_ZIP_ENTRIES + 1).expect_err("超过条目上限必须拒绝");
+        assert!(error.to_string().contains("条目过多"));
+    }
+
+    #[test]
+    fn extract_budget_never_exceeds_available_space() {
+        let root = std::env::temp_dir().join(format!("scum-zip-budget-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let budget = zip_extract_budget(&root);
+        let available = free_space(&root).unwrap_or(0);
+        assert!(budget <= available, "预算不能超过可用空间");
+        let _ = fs::remove_dir_all(&root);
     }
 }

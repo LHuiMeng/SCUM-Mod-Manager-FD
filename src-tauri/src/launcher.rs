@@ -16,6 +16,9 @@ pub struct ManagedProcess {
 }
 
 pub fn launch(app: AppHandle, state: &AppState, mode: &str) -> Result<GameStatus> {
+    // 整个「检查 → 部署 → spawn → 登记」区间互斥：并发启动会双开游戏，
+    // 并让两份部署互相同步覆盖 deployment_manifest.json，导致第一个进程失去回收依据。
+    let _launch_guard = state.launch_lock.lock().unwrap();
     let started = Instant::now();
     if is_running(state) {
         bail!("游戏进程已经在运行");
@@ -233,7 +236,11 @@ fn game_process_running(name: &str) -> bool {
             let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
             text.contains(&name.to_ascii_lowercase())
         }
-        Err(_) => false,
+        Err(error) => {
+            // 查不到进程时保守返回 false，但必须留下痕迹，否则「游戏在跑」会被误判。
+            eprintln!("tasklist 查询失败，按未运行处理：{error}");
+            false
+        }
     }
 }
 

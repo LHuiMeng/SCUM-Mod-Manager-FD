@@ -235,6 +235,14 @@ async fn download_remote_into(
             }
         };
         let has_declared_hash = !remote.sha256.trim().is_empty();
+        // UE4SS 模组解包后是 Lua/DLL，属于可执行内容：没有 SHA-256 就不装。
+        if declared_ue4ss(&remote.mod_type) && !has_declared_hash {
+            errors.push(format!(
+                "{}: UE4SS 模组缺少 SHA-256，已拒绝安装",
+                download_endpoint_label(&url)
+            ));
+            continue;
+        }
         if !download_source_allowed(settings, &parsed, has_declared_hash) {
             errors.push(format!(
                 "{}: 跨源下载缺少 SHA-256，已跳过",
@@ -851,19 +859,13 @@ fn catalog_cache_file(paths: &AppPaths) -> PathBuf {
 /// 记住最后一次成功拉到的目录，供目录接口抖动时回退使用。
 fn save_catalog_cache(paths: &AppPaths, base: &str, catalog: &Value) {
     let file = catalog_cache_file(paths);
-    let Some(parent) = file.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
     let payload = serde_json::json!({
         "base": base,
         "savedAt": Utc::now().to_rfc3339(),
         "catalog": catalog,
     });
     if let Ok(bytes) = serde_json::to_vec(&payload) {
-        let _ = std::fs::write(&file, bytes);
+        let _ = crate::paths::write_atomic(&file, &bytes);
     }
 }
 

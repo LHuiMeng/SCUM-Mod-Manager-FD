@@ -2,7 +2,7 @@ use super::extract_zip_file;
 use crate::models::{AppSettings, ModEntry};
 use crate::mods::merge_cache;
 use crate::mods::pak_scan;
-use crate::paths::{is_within, path_string, safe_file_component, AppPaths};
+use crate::paths::{is_within, is_within_resolved, path_string, safe_file_component, AppPaths};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::Utc;
@@ -45,7 +45,20 @@ pub struct DeployedBackup {
 }
 
 pub fn read_manifest(paths: &AppPaths) -> Option<DeployedManifest> {
-    let text = std::fs::read_to_string(&paths.deployment_manifest).ok()?;
+    if let Some(manifest) = read_manifest_at(&paths.deployment_manifest) {
+        return Some(manifest);
+    }
+    let backup = crate::paths::backup_path_of(&paths.deployment_manifest);
+    let manifest = read_manifest_at(&backup)?;
+    eprintln!(
+        "deployment_manifest.json 解析失败，已回退到 {}",
+        backup.display()
+    );
+    Some(manifest)
+}
+
+fn read_manifest_at(path: &Path) -> Option<DeployedManifest> {
+    let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -137,6 +150,16 @@ pub fn reclaim_mods_with_wait(
     for file in manifest.files.iter().rev() {
         let file = PathBuf::from(file);
         if !roots.iter().any(|root| is_within(&file, root)) {
+            continue;
+        }
+        // 文件可能是指向根外的 junction / 符号链接：解析真实路径后再确认一次，
+        // 避免 remove_file 作用到链接目标。
+        if file.exists() && !roots.iter().any(|root| is_within_resolved(&file, root)) {
+            failures.push(format!(
+                "跳过越界的部署文件（疑似符号链接）：{}",
+                file.display()
+            ));
+            remaining_files.push(path_string(&file));
             continue;
         }
         if file.exists() {
@@ -926,7 +949,7 @@ fn place_file_record(
 
 fn write_manifest(paths: &AppPaths, manifest: &DeployedManifest) -> Result<()> {
     let json = serde_json::to_string_pretty(manifest)?;
-    std::fs::write(&paths.deployment_manifest, format!("{json}\n"))
+    crate::paths::write_state_file(&paths.deployment_manifest, format!("{json}\n").as_bytes())
         .with_context(|| format!("无法写入 {}", paths.deployment_manifest.display()))
 }
 

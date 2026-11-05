@@ -102,8 +102,8 @@ export function UpdateDialog({
             </span>
             <b>{percent !== null ? `${percent}%` : t("update.dialog.autoVerify")}</b>
           </div>
-          <i>
-            <span style={{ width: percent !== null ? `${percent}%` : "42%" }} />
+          <i className={percent === null ? "progress-indeterminate" : undefined}>
+            <span style={percent !== null ? { width: `${percent}%` } : undefined} />
           </i>
           <small>
             {phase === "installing"

@@ -65,7 +65,7 @@ export function ServerAccountForm({
     setUe4ssPath(editing?.ue4ssPath ?? "");
     setSecretInput("");
     setAddressNote(null);
-  }, [editing]);
+  }, [editing?.id]);
 
   /**
    * 地址框里直接粘贴连接链接或 `主机:端口` 就自动拆分到各字段，不再额外占一个按钮控件。
@@ -169,6 +169,7 @@ export function ServerAccountForm({
             }}
             onBlur={() => applyAddressInput(host)}
             onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
               if (event.key !== "Enter") return;
               event.preventDefault();
               applyAddressInput(host);

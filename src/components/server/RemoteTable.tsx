@@ -279,6 +279,7 @@ export function RemoteTable({
                       }}
                       onKeyDown={(event) => {
                         event.stopPropagation();
+                        if (event.nativeEvent.isComposing || event.keyCode === 229) return;
                         if (event.key === "Enter") void commitRename();
                         if (event.key === "Escape") setRenamePath(null);
                       }}

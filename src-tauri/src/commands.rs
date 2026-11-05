@@ -790,8 +790,34 @@ pub fn get_pending_links(state: State<'_, AppState>) -> Vec<PendingLink> {
 }
 
 #[tauri::command]
-pub fn reclaim_pending_links(state: State<'_, AppState>) -> Result<usize, String> {
-    state.reclaim_pending_links().map_err(error_text)
+pub async fn reclaim_pending_links(app: AppHandle) -> Result<usize, String> {
+    // 回收要等被占用的文件释放（单文件最长 30s），不能放在 UI 线程上同步跑。
+    let progress_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        state
+            .reclaim_pending_links_notified(|wait| {
+                let file_name = std::path::Path::new(&wait.path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| wait.path.clone());
+                let _ = progress_app.emit(
+                    "reclaim-progress",
+                    serde_json::json!({
+                        "phase": if wait.waited_ms == 0 { "waiting" } else { "still-waiting" },
+                        "file": file_name,
+                        "waitedMs": wait.waited_ms,
+                        "message": format!(
+                            "正在回收 {file_name}，文件被占用，已等待 {} 秒",
+                            wait.waited_ms / 1000
+                        ),
+                    }),
+                );
+            })
+            .map_err(error_text)
+    })
+    .await
+    .map_err(error_text)?
 }
 
 #[tauri::command]

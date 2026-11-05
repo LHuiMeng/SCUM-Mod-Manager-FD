@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
 
@@ -208,6 +210,85 @@ pub fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// 原子写计数器，保证同一进程内并发写的临时文件名互不相同。
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state".to_string());
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{name}.tmp-{}-{seq}", std::process::id()))
+}
+
+/// 原子写：先写同目录临时文件并 `sync_all`，再 `rename` 提交。
+///
+/// Windows 上 `std::fs::rename` 走 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`，可以直接
+/// 覆盖已存在的目标，所以断电/崩溃只会留下一个临时文件，不会产生被截断的状态文件。
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建目录 {}", parent.display()))?;
+    }
+    let temp = temp_path_for(path);
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&temp)
+            .with_context(|| format!("无法创建临时文件 {}", temp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("无法写入临时文件 {}", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("无法同步临时文件 {}", temp.display()))?;
+        drop(file);
+        std::fs::rename(&temp, path)
+            .with_context(|| format!("无法提交 {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// 状态文件的上一版副本路径（`config.json` → `config.json.bak`）。
+pub fn backup_path_of(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state".to_string());
+    path.with_file_name(format!("{name}.bak"))
+}
+
+/// 写状态文件：原子写 + 把上一版轮转成 `.bak`，供解析失败时回退。
+pub fn write_state_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建目录 {}", parent.display()))?;
+    }
+    let temp = temp_path_for(path);
+    let commit = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&temp)
+            .with_context(|| format!("无法创建临时文件 {}", temp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("无法写入临时文件 {}", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("无法同步临时文件 {}", temp.display()))?;
+        drop(file);
+        // 用上一版覆盖 `.bak`，再提交新版；两步 rename 之间失败时 `.bak` 仍可恢复。
+        if path.exists() {
+            let _ = std::fs::rename(path, backup_path_of(path));
+        }
+        std::fs::rename(&temp, path)
+            .with_context(|| format!("无法提交 {}", path.display()))?;
+        Ok(())
+    })();
+    if commit.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    commit
+}
+
 /// 下载暂存目录的保留时长。超过这个时间的残留（进程崩溃、断电）在启动时清掉。
 const STALE_DOWNLOAD_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -274,6 +355,18 @@ pub fn is_within(path: &Path, root: &Path) -> bool {
     normalized_path == normalized_root || normalized_path.starts_with(&(normalized_root + "\\"))
 }
 
+/// 解析重解析点（junction / 符号链接）后再判断包含关系。
+///
+/// `is_within` 是纯词法判断：`{root}/~mods/evil` 若是指向根外的 junction，
+/// 词法检查仍然通过。删除、复制、回收这类会作用到链接目标的操作必须用这个版本。
+pub fn is_within_resolved(path: &Path, root: &Path) -> bool {
+    let (Ok(resolved_path), Ok(resolved_root)) = (path.canonicalize(), root.canonicalize()) else {
+        return false;
+    };
+    let path_key = normalize_for_compare(&resolved_path);
+    let root_key = normalize_for_compare(&resolved_root);
+    path_key == root_key || path_key.starts_with(&(root_key + "\\"))
+}
 fn normalize_for_compare(path: &Path) -> String {
     std::path::absolute(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -286,8 +379,8 @@ fn normalize_for_compare(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        free_space, is_within, prune_stale_downloads, resolve_data_root, safe_disk_name,
-        safe_file_component,
+        backup_path_of, free_space, is_within, prune_stale_downloads, resolve_data_root,
+        safe_disk_name, safe_file_component, write_atomic, write_state_file,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -396,5 +489,39 @@ mod tests {
     fn free_space_reads_the_volume_of_a_real_directory() {
         let available = free_space(&std::env::temp_dir()).expect("Windows 上应能读到卷可用空间");
         assert!(available > 0, "可用空间应为正数");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file_behind() {
+        let root = std::env::temp_dir().join(format!("scum-atomic-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("config.json");
+
+        write_atomic(&target, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+        write_atomic(&target, b"second").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+
+        let leftovers = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "临时文件必须被清理");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn state_write_rotates_the_previous_version_into_a_backup() {
+        let root = std::env::temp_dir().join(format!("scum-state-write-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("mods_meta.json");
+
+        write_state_file(&target, b"v1").unwrap();
+        write_state_file(&target, b"v2").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"v2");
+        assert_eq!(fs::read(backup_path_of(&target)).unwrap(), b"v1");
+        let _ = fs::remove_dir_all(&root);
     }
 }

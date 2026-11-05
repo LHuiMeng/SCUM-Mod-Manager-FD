@@ -572,7 +572,8 @@ fn download_library_pak(
         std::fs::rename(&destination, &backup)
             .with_context(|| format!("无法备份已存在的模组文件 {destination:?}"))?;
     }
-    let partial = destination.with_file_name(format!(".{name}.part"));
+    // 并发下载同名 PAK 时，固定的 .part 名会让两路交错写同一个文件。
+    let partial = destination.with_file_name(format!(".{name}.{}.part", Uuid::new_v4()));
     let download = (|| -> Result<()> {
         let mut remote_file = sftp
             .open(Path::new(remote))
@@ -611,12 +612,14 @@ fn download_library_ue4ss_dir(
     let destination = paths.ue4ss_mods.join(name);
     std::fs::create_dir_all(&paths.ue4ss_mods).with_context(|| "无法创建本地 UE4SS 模组目录")?;
     let process_id = std::process::id();
+    // 进程 ID 只能区分跨进程，同一进程内的两个并发导入会撞上同一个暂存目录。
+    let run_id = Uuid::new_v4();
     let staging = paths
         .ue4ss_mods
-        .join(format!(".staging-{process_id}-{name}"));
+        .join(format!(".staging-{process_id}-{run_id}-{name}"));
     let retired = paths
         .ue4ss_mods
-        .join(format!(".retired-{process_id}-{name}"));
+        .join(format!(".retired-{process_id}-{run_id}-{name}"));
     if destination.exists() {
         let _ = std::fs::remove_dir_all(&retired);
         if destination.exists() {
@@ -1496,9 +1499,14 @@ pub fn apply_remote_layout(
                 }
             }
             // UE4SS 模组删除：整棵目录挪进同一批次备份目录，避免直接删掉。
+            // 后端不信任前端载荷：`remote_path_within` 只做字符串前缀比较，
+            // `/root/Mods/x/../../../etc/passwd` 能靠前缀绕过；先做路径清洗再判断包含，
+            // 并复用与其它远端写操作一致的根目录白名单。
             if !account.ue4ss_path.trim().is_empty() {
                 for path in deleted {
-                    if !remote_path_within(&account.ue4ss_path, path) {
+                    if !is_deletable_remote_child(&account.ue4ss_path, path)
+                        || ensure_remote_operation_allowed(account, path).is_err()
+                    {
                         continue;
                     }
                     let Ok(stat) = sftp.lstat(Path::new(path)) else {
@@ -2294,28 +2302,57 @@ fn upload_local_file_with_progress(
     on_bytes: &mut dyn FnMut(u64),
 ) -> Result<()> {
     let mut source = File::open(local).with_context(|| format!("无法读取 {}", local.display()))?;
-    let mut target = sftp
-        .create(Path::new(remote))
-        .with_context(|| format!("无法创建远端文件 {remote}"))?;
-    let mut buffer = vec![0u8; 256 * 1024];
-    let mut reported = 0u64;
-    let mut uploaded = 0u64;
-    loop {
-        let read = source.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    // 先传到一个唯一的临时名再 rename：`create` 会直接截断目标，
+    // 上传中断就会在服务器上留下半截 PAK，而且原来的版本也没了。
+    let partial = format!("{remote}.upload-{}.part", Uuid::new_v4());
+    let result = (|| -> Result<()> {
+        let mut target = sftp
+            .create(Path::new(&partial))
+            .with_context(|| format!("无法创建远端临时文件 {partial}"))?;
+        let mut buffer = vec![0u8; 256 * 1024];
+        let mut reported = 0u64;
+        let mut uploaded = 0u64;
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            target.write_all(&buffer[..read])?;
+            uploaded += read as u64;
+            if uploaded - reported >= 512 * 1024 {
+                on_bytes(uploaded - reported);
+                reported = uploaded;
+            }
         }
-        target.write_all(&buffer[..read])?;
-        uploaded += read as u64;
-        if uploaded - reported >= 512 * 1024 {
+        if uploaded > reported {
             on_bytes(uploaded - reported);
-            reported = uploaded;
         }
+        drop(target);
+        // SFTP 的 rename 不会覆盖已存在目标：先把旧版本挪到临时名，
+        // 新文件提交成功后再删；提交失败就把旧版本挪回去。
+        let mut replaced: Option<String> = None;
+        if sftp.lstat(Path::new(remote)).is_ok() {
+            let stash = format!("{remote}.replaced-{}.part", Uuid::new_v4());
+            sftp.rename(Path::new(remote), Path::new(&stash), None)
+                .with_context(|| format!("无法移开已存在的远端文件 {remote}"))?;
+            replaced = Some(stash);
+        }
+        if let Err(error) = sftp.rename(Path::new(&partial), Path::new(remote), None) {
+            if let Some(stash) = &replaced {
+                let _ = sftp.rename(Path::new(stash), Path::new(remote), None);
+            }
+            return Err(anyhow::Error::new(error))
+                .with_context(|| format!("无法提交远端文件 {remote}"));
+        }
+        if let Some(stash) = replaced {
+            let _ = sftp.unlink(Path::new(&stash));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = sftp.unlink(Path::new(&partial));
     }
-    if uploaded > reported {
-        on_bytes(uploaded - reported);
-    }
-    Ok(())
+    result
 }
 
 fn ensure_remote_dir(sftp: &Sftp, path: &str) -> Result<()> {
@@ -2478,11 +2515,8 @@ fn load_known_hosts(paths: &AppPaths) -> Result<KnownHostsFile> {
 }
 
 fn save_known_hosts(paths: &AppPaths, known_hosts: &KnownHostsFile) -> Result<()> {
-    if let Some(parent) = paths.sftp_known_hosts.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(known_hosts)?;
-    std::fs::write(&paths.sftp_known_hosts, format!("{json}\n"))
+    crate::paths::write_state_file(&paths.sftp_known_hosts, format!("{json}\n").as_bytes())
         .with_context(|| format!("无法写入 {}", paths.sftp_known_hosts.display()))?;
     Ok(())
 }
@@ -2749,11 +2783,8 @@ fn load_remote_notes(paths: &AppPaths) -> Result<RemoteNotesFile> {
 }
 
 fn save_remote_notes(paths: &AppPaths, notes: &RemoteNotesFile) -> Result<()> {
-    if let Some(parent) = paths.sftp_remote_notes.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(notes)?;
-    std::fs::write(&paths.sftp_remote_notes, format!("{json}\n"))
+    crate::paths::write_state_file(&paths.sftp_remote_notes, format!("{json}\n").as_bytes())
         .with_context(|| format!("无法写入 {}", paths.sftp_remote_notes.display()))
 }
 
@@ -3302,6 +3333,16 @@ fn validate_remote_name(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+/// `deleted` 里的路径是否可以安全地从 ue4ss 根搬走。
+///
+/// 必须同时满足：本身是干净路径（不含 `.`/`..`）、位于根之下、且不等于根本身——
+/// `remote_path_within` 只做字符串前缀比较，`/root/x/../../etc` 和 `/root` 都能通过。
+fn is_deletable_remote_child(root: &str, path: &str) -> bool {
+    is_clean_remote_path(path)
+        && normalize_remote_path(path) != normalize_remote_path(root)
+        && remote_path_within(root, path)
+}
+
 fn remote_parent(path: &str) -> Option<String> {
     let parent = Path::new(path).parent()?.to_string_lossy();
     let parent = normalize_remote_path(&parent);
@@ -3613,7 +3654,8 @@ mod tests {
         conflict_entries_cache_name, download_file, ensure_remote_operation_allowed,
         load_remote_notes, move_remote_notes, numbered_remote_pak_file_name, pak_path_candidates,
         plan_library_download, plan_move, plan_remote_pak_renames, read_conflict_entries_cache,
-        remote_deployment_prefix_width, remote_join, remove_remote_notes_under, root_from_pak_path,
+        is_deletable_remote_child, remote_deployment_prefix_width, remote_join,
+        remove_remote_notes_under, root_from_pak_path,
         root_from_ue4ss_path, safe_pak_relative_path, save_remote_notes, ue4ss_path_candidates,
         validate_managed_manifest_paths, validate_remote_name, write_conflict_entries_cache,
         DownloadKind, RemoteNotesFile,
@@ -4102,5 +4144,25 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         pak
+    }
+
+    #[test]
+    fn rejects_parent_traversal_in_deleted_entries() {
+        let root = "/srv/ue4ss/Mods";
+        for path in [
+            "/srv/ue4ss/Mods/Evil/../../../../etc/password",
+            "/srv/ue4ss/Mods/../Mods/Evil",
+            "/srv/ue4ss/Mods/./Evil",
+            "/srv/ue4ss/Mods",
+        ] {
+            assert!(
+                !is_deletable_remote_child(root, path),
+                "不该接受含父目录穿越、或等于根目录的路径：{path}"
+            );
+        }
+        assert!(
+            is_deletable_remote_child(root, "/srv/ue4ss/Mods/Evil"),
+            "根目录下的正常模组路径应当被接受"
+        );
     }
 }

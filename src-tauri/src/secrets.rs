@@ -108,11 +108,8 @@ fn secret_candidates(paths: &AppPaths) -> Vec<PathBuf> {
 }
 
 pub fn write_secret(path: &Path, plaintext: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let encrypted = protect(plaintext.as_bytes())?;
-    std::fs::write(path, encrypted)
+    crate::paths::write_atomic(path, &encrypted)
         .with_context(|| format!("无法写入密钥文件 {}", path.display()))?;
     Ok(())
 }

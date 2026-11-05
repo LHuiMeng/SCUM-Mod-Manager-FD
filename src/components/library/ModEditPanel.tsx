@@ -7,7 +7,7 @@ import { Modal } from "../ui/Modal";
 
 interface ModEditPanelProps {
   mod: ModEntry;
-  onSave: (tags: string[], notes: string) => void;
+  onSave: (tags: string[], notes: string) => Promise<boolean>;
   onClose: () => void;
 }
 
@@ -16,6 +16,7 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
   const [tags, setTags] = useState(mod.tags);
   const [tagDraft, setTagDraft] = useState("");
   const [notes, setNotes] = useState(mod.notes);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     setTags(mod.tags);
@@ -29,6 +30,17 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
     setTagDraft("");
   }
 
+  async function save() {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const ok = await onSave(tags, notes.trim());
+      if (ok) onClose();
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <Modal
       title={t("edit.title")}
@@ -36,15 +48,11 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
       onClose={onClose}
       footer={
         <>
-          <Button onClick={onClose}>{t("common.cancel")}</Button>
-          <Button
-            variant="primary"
-            onClick={() => {
-              onSave(tags, notes.trim());
-              onClose();
-            }}
-          >
-            {t("common.save")}
+          <Button onClick={onClose} disabled={saving}>
+            {t("common.cancel")}
+          </Button>
+          <Button variant="primary" onClick={() => void save()} disabled={saving}>
+            {saving ? t("modEdit.saving") : t("common.save")}
           </Button>
         </>
       }
@@ -71,6 +79,7 @@ export function ModEditPanel({ mod, onSave, onClose }: ModEditPanelProps) {
           placeholder={t("edit.tagPlaceholder")}
           onChange={(event) => setTagDraft(event.target.value)}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
             if (event.key === "Enter") {
               event.preventDefault();
               addTag();

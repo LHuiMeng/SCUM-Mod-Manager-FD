@@ -13,7 +13,7 @@ use crate::mods::deploy::{
 };
 use crate::mods::links::{find_pending_links, reclaim_pending_links, PendingLink};
 use crate::mods::{refresh_conflicts, scan_local_mods_with_diagnostics};
-use crate::paths::{is_within, path_string, safe_disk_name, AppPaths};
+use crate::paths::{is_within, is_within_resolved, path_string, safe_disk_name, AppPaths};
 use crate::secrets::{load_runtime_secrets, RuntimeSecrets};
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -42,6 +42,10 @@ pub struct AppState {
     pub pending_links: Mutex<Vec<PendingLink>>,
     /// 最近一次异常退出的取证结果，供前端弹窗展示。
     pub last_crash: Mutex<Option<crate::crash::CrashReport>>,
+    /// 部署回收互斥：监控线程与 kill_game/window_close 可能同时回收同一份清单。
+    pub reclaim_lock: Mutex<()>,
+    /// 启动互斥：并发的 launch_game 会双开游戏并把部署清单写成两次。
+    pub launch_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -71,7 +75,9 @@ impl AppState {
         // 发现上次残留的链接就先不自动回收，等用户在界面上确认；
         // 没有残留时才走正常的启动清理。
         if !settings.keep_deployed_mods_on_exit && pending_before.is_empty() {
-            let _ = reclaim_mods(&paths);
+            if let Err(error) = reclaim_mods(&paths) {
+                eprintln!("启动时回收上次部署失败：{error:#}");
+            }
         }
         let pending_links = if settings.keep_deployed_mods_on_exit {
             Vec::new()
@@ -86,9 +92,12 @@ impl AppState {
         let scan =
             scan_local_mods_with_diagnostics(&paths, &mut metadata, &deployed).unwrap_or_default();
         let mut mods = scan.mods;
+        // 只用于补显示名，失败时保持原有名称（返回 0）。
         let _ = cloud::apply_catalog_names(&paths, &mut metadata, &mut mods);
         let conflicts = refresh_conflicts(&mut metadata, &mut mods);
-        let _ = metadata::save_metadata(&paths, &metadata);
+        if let Err(error) = metadata::save_metadata(&paths, &metadata) {
+            eprintln!("启动时保存模组元数据失败：{error:#}");
+        }
         let deployed_at = read_manifest(&paths).map(|manifest| manifest.deployed_at);
         let state = Self {
             paths,
@@ -106,6 +115,8 @@ impl AppState {
             secrets,
             pending_links: Mutex::new(pending_links),
             last_crash: Mutex::new(None),
+            reclaim_lock: Mutex::new(()),
+            launch_lock: Mutex::new(()),
         };
         state.log("info", "app", "Rust 后端已初始化，本地模组扫描完成");
         log_pak_diagnostics(&state, &scan.diagnostics);
@@ -229,19 +240,23 @@ impl AppState {
         if self.process_running() {
             anyhow::bail!("游戏运行期间不能更改模组启用状态");
         }
-        let mut mods_snapshot = {
-            let mut mods = self.mods.write().unwrap();
-            let item = mods
+        // 在克隆上改，落盘成功后才写回线上列表：落盘失败时不能留下「界面已改、磁盘没改」的分叉。
+        let mut mods_snapshot = self.mods.read().unwrap().clone();
+        {
+            let item = mods_snapshot
                 .iter_mut()
                 .find(|item| item.id == id)
                 .context("找不到指定模组")?;
             item.enabled = enabled;
-            mods.clone()
-        };
+        }
         let mut metadata = self.metadata.lock().unwrap();
+        let previous_enabled = metadata.entry_mut(id).enabled;
         metadata.entry_mut(id).enabled = enabled;
         let conflicts = refresh_conflicts(&mut metadata, &mut mods_snapshot);
-        metadata::save_metadata(&self.paths, &metadata)?;
+        if let Err(error) = metadata::save_metadata(&self.paths, &metadata) {
+            metadata.entry_mut(id).enabled = previous_enabled;
+            return Err(error);
+        }
         drop(metadata);
         *self.mods.write().unwrap() = mods_snapshot.clone();
         *self.conflicts.write().unwrap() = conflicts;
@@ -252,32 +267,34 @@ impl AppState {
     }
 
     pub fn reorder_mods(&self, ids: &[String]) -> Result<LibrarySnapshot> {
-        let mut ordered = {
-            let mut mods = self.mods.write().unwrap();
-            let mut by_id: HashMap<String, ModEntry> =
-                mods.drain(..).map(|item| (item.id.clone(), item)).collect();
-            let mut ordered = Vec::new();
-            for id in ids {
-                if let Some(item) = by_id.remove(id) {
-                    ordered.push(item);
-                }
+        // 在克隆上排序，落盘成功后才替换线上列表：落盘失败时不能把内存里的模组清空。
+        let current = self.mods.read().unwrap().clone();
+        let mut by_id: HashMap<String, ModEntry> =
+            current.into_iter().map(|item| (item.id.clone(), item)).collect();
+        let mut ordered = Vec::new();
+        for id in ids {
+            if let Some(item) = by_id.remove(id) {
+                ordered.push(item);
             }
-            let mut remaining: Vec<ModEntry> = by_id.into_values().collect();
-            remaining.sort_by_key(|item| item.load_order);
-            ordered.extend(remaining);
-            for (index, item) in ordered.iter_mut().enumerate() {
-                item.load_order = index;
-            }
-            ordered
-        };
+        }
+        let mut remaining: Vec<ModEntry> = by_id.into_values().collect();
+        remaining.sort_by_key(|item| item.load_order);
+        ordered.extend(remaining);
+        for (index, item) in ordered.iter_mut().enumerate() {
+            item.load_order = index;
+        }
         let order = ordered
             .iter()
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         let mut metadata = self.metadata.lock().unwrap();
         let conflicts = refresh_conflicts(&mut metadata, &mut ordered);
+        let previous_order = metadata.order.clone();
         metadata.order = order;
-        metadata::save_metadata(&self.paths, &metadata)?;
+        if let Err(error) = metadata::save_metadata(&self.paths, &metadata) {
+            metadata.order = previous_order;
+            return Err(error);
+        }
         drop(metadata);
         *self.mods.write().unwrap() = ordered;
         *self.conflicts.write().unwrap() = conflicts;
@@ -333,19 +350,30 @@ impl AppState {
         tags: Vec<String>,
         notes: String,
     ) -> Result<LibrarySnapshot> {
-        let mut mods = self.mods.write().unwrap();
-        let item = mods
-            .iter_mut()
-            .find(|item| item.id == id)
-            .context("找不到指定模组")?;
-        item.tags = tags.clone();
-        item.notes = notes.clone();
-        drop(mods);
+        // 同样先改克隆、落盘成功后再写回，失败时线上列表保持原样。
+        let mut mods_snapshot = self.mods.read().unwrap().clone();
+        {
+            let item = mods_snapshot
+                .iter_mut()
+                .find(|item| item.id == id)
+                .context("找不到指定模组")?;
+            item.tags = tags.clone();
+            item.notes = notes.clone();
+        }
         let mut metadata = self.metadata.lock().unwrap();
         let entry = metadata.entry_mut(id);
+        let previous_tags = entry.tags.clone();
+        let previous_notes = entry.notes.clone();
         entry.tags = tags;
         entry.notes = notes;
-        metadata::save_metadata(&self.paths, &metadata)?;
+        if let Err(error) = metadata::save_metadata(&self.paths, &metadata) {
+            let entry = metadata.entry_mut(id);
+            entry.tags = previous_tags;
+            entry.notes = previous_notes;
+            return Err(error);
+        }
+        drop(metadata);
+        *self.mods.write().unwrap() = mods_snapshot;
         Ok(self.snapshot())
     }
 
@@ -465,9 +493,12 @@ impl AppState {
     }
 
     pub fn save_settings(&self, settings: AppSettings) -> Result<AppSettings> {
+        // 持锁写盘：避免与 set_theme / set_language / set_cloud_settings 的并发写
+        // 互相截断 config.json，产生无法解析的坏文件。
+        let mut current = self.settings.lock().unwrap();
         config::save_settings(&self.paths, &settings)?;
         let saved = config::load_settings(&self.paths)?;
-        *self.settings.lock().unwrap() = saved.clone();
+        *current = saved.clone();
         Ok(saved)
     }
 
@@ -605,24 +636,28 @@ impl AppState {
         let _ = std::fs::write(self.paths.logs_dir.join("runtime.jsonl"), "");
     }
 
+    /// 统一的「游戏是否在运行」判定。
+    ///
+    /// 必须走 `launcher::is_running`：它额外检查 SCUM.exe/SCUMServer.exe 是否仍在运行，
+    /// 覆盖「被启动的只是引导进程、它退出后游戏主进程还在跑」的情况。只看子进程句柄会让
+    /// 运行期的写操作（改启用状态、删除模组、回收部署）在游戏真正运行时被放行。
     pub fn process_running(&self) -> bool {
-        let mut guard = self.process.lock().unwrap();
-        match guard.as_mut() {
-            Some(process) => matches!(process.child.try_wait(), Ok(None)),
-            None => false,
-        }
+        crate::launcher::is_running(self)
     }
 
     pub fn pending_links(&self) -> Vec<PendingLink> {
         self.pending_links.lock().unwrap().clone()
     }
 
-    /// 用户确认后回收残留链接；返回实际断开的数量。
-    pub fn reclaim_pending_links(&self) -> Result<usize> {
+    /// 用户确认后回收残留链接，并把「文件被占用、正在等待」的进度交给调用方。
+    pub fn reclaim_pending_links_notified(
+        &self,
+        notify: impl FnMut(&ReclaimWait),
+    ) -> Result<usize> {
         let settings = self.settings.lock().unwrap().clone();
         let installs = vec![settings.scum_install_path, settings.server_install_path];
         // 链接模式下部署目录里还有硬链接与清单，先按清单回收，再断链接。
-        if let Err(error) = reclaim_mods(&self.paths) {
+        if let Err(error) = reclaim_mods_with_wait(&self.paths, notify) {
             self.log(
                 "warn",
                 "deploy",
@@ -654,6 +689,9 @@ impl AppState {
         &self,
         notify: impl FnMut(&ReclaimWait),
     ) -> Result<Option<usize>> {
+        // 监控线程与 stop_with_notice 可能同时走到这里：互斥可以避免两边删同一批文件、
+        // 各自写出不同的剩余清单，甚至交错写坏 deployment_manifest.json。
+        let _reclaim_guard = self.reclaim_lock.lock().unwrap();
         let settings = self.settings.lock().unwrap().clone();
         // 两种模式默认都在退出后回收：复制模式删文件，链接模式只断链接（毫秒级，不搬数据）。
         if settings.keep_deployed_mods_on_exit {
@@ -676,7 +714,9 @@ impl AppState {
         if self.process.lock().unwrap().is_some() {
             let _ = crate::launcher::stop_with_notice(self, notify);
         } else {
-            let _ = self.reclaim_deployments_after_exit_notified(notify);
+            if let Err(error) = self.reclaim_deployments_after_exit_notified(notify) {
+                self.log("warn", "deploy", &format!("退出回收部署文件失败：{error:#}"));
+            }
         }
     }
 }
@@ -707,6 +747,8 @@ fn suggested_pak_dir(install: &str) -> String {
 
 fn is_direct_child(path: &Path, root: &Path) -> bool {
     is_within(path, root)
+        // 目标可能是指向根外的 junction/符号链接，解析后再确认一次。
+        && (!path.exists() || is_within_resolved(path, root))
         && path.parent().is_some_and(|parent| is_within(parent, root))
         && path
             .parent()
@@ -869,6 +911,40 @@ mod tests {
         assert!(!manifest.exists());
     }
 
+    /// 落盘失败时不能把内存里的模组列表清空（旧实现会 drain 掉 self.mods 后提前返回）。
+    #[test]
+    fn reorder_failure_keeps_the_in_memory_mod_list() {
+        let temp = TempRoot::new("reorder-rollback");
+        let paths = temp.paths();
+        fs::write(paths.local_mods.join("Alpha.pak"), b"alpha").unwrap();
+        fs::write(paths.local_mods.join("Beta.pak"), b"beta").unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        let initial = state.scan(false).unwrap();
+        let ids = initial
+            .mods
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+
+        // 把元数据文件及其 .bak 都换成非空目录，让 save_metadata 一定失败。
+        for target in [
+            paths.metadata_file.clone(),
+            crate::paths::backup_path_of(&paths.metadata_file),
+        ] {
+            let _ = fs::remove_file(&target);
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("blocker"), b"x").unwrap();
+        }
+
+        let reordered = vec![ids[1].clone(), ids[0].clone()];
+        assert!(state.reorder_mods(&reordered).is_err());
+        assert_eq!(
+            state.snapshot().mods.len(),
+            2,
+            "落盘失败后内存里的模组不能被清空"
+        );
+    }
     #[test]
     fn persists_mod_order_tags_notes_and_enabled_state() {
         let temp = TempRoot::new("state-persistence");
