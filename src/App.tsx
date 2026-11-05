@@ -61,6 +61,7 @@ import {
   normalizeServerLibraryState,
   readStoredServerLibraryState,
   serverLibraryDisabledPaths,
+  serverLibraryReleasedPaths,
   storeServerLibraryState,
   type ServerLibraryState,
 } from "./lib/serverLibrary";
@@ -226,6 +227,10 @@ function LocalizedApp() {
           t("serverLibrary.mergedDescription", {
             sources: sources.join("、"),
           }),
+        disabledTag: t("serverLibrary.disabledTag"),
+        disabledDescription: t("serverLibrary.disabledDescription"),
+        deletedTag: t("serverLibrary.deletedTag"),
+        deletedDescription: t("serverLibrary.deletedDescription"),
       },
     });
     return {
@@ -1816,6 +1821,7 @@ function LocalizedApp() {
         view.accountId,
         view.state.order,
         serverLibraryDisabledPaths(view.state),
+        sftpScan ? serverLibraryReleasedPaths(view.state, sftpScan) : [],
         view.state.deleted,
         view.state.winners,
       );

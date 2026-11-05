@@ -140,6 +140,7 @@ export const api = {
     accountId: string,
     order: string[],
     disabled: string[],
+    released: string[],
     deleted: string[],
     winners: Record<string, string>,
   ) =>
@@ -147,6 +148,7 @@ export const api = {
       accountId,
       order,
       disabled,
+      released,
       deleted,
       winners,
     }),

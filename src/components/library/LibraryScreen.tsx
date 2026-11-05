@@ -279,6 +279,13 @@ export function LibraryScreen({
                   </small>
                 </div>
               ) : null}
+              {(server.manifest?.backups ?? []).some(
+                (item) => item.reason === "disabled" || item.reason === "deleted",
+              ) ? (
+                <p className="server-library-provenance">
+                  {t("serverLibrary.backupHint")}
+                </p>
+              ) : null}
               {server.prepare?.hasConflicts ? (
                 <p className="server-library-provenance">
                   {t("serverLibrary.pendingUploadPrompt", {

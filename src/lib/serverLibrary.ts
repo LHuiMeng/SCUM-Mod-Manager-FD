@@ -19,12 +19,25 @@ interface ServerLibraryLabels {
   mergedName: string;
   mergedTag: string;
   mergedDescription: (sources: string[]) => string;
+  disabledTag: string;
+  disabledDescription: string;
+  deletedTag: string;
+  deletedDescription: string;
 }
 
 const STORAGE_PREFIX = "scum-server-library-v1:";
 
 function serverPaths(scan: SftpConnectionResult): string[] {
-  return [...scan.pakMods, ...scan.ue4ssMods].map((file) => file.path);
+  const paths = new Set([...scan.pakMods, ...scan.ue4ssMods].map((file) => file.path));
+  // 被移进备份批次的条目仍算「可用路径」：否则 normalize 会把禁用/删除状态删掉，
+  // 下一次 apply 先 restore 再按 disabled 列表处理时，用户关掉的模组会被静默重新启用。
+  // merged / previous-merged / signature 不并进来——它们是融合产物，不是独立模组。
+  for (const backup of scan.managedManifest?.backups ?? []) {
+    if (backup.reason === "disabled" || backup.reason === "deleted") {
+      paths.add(backup.originalPath);
+    }
+  }
+  return [...paths];
 }
 
 function displayServerPakName(fileName: string): string {
@@ -108,6 +121,17 @@ export function serverLibraryDisabledPaths(state: ServerLibraryState): string[] 
     .map(([path]) => path);
 }
 
+/** 上一轮被禁用、但用户这次打开了开关的路径：必须显式告诉后端，否则它会继续继承禁用。 */
+export function serverLibraryReleasedPaths(
+  state: ServerLibraryState,
+  scan: SftpConnectionResult,
+): string[] {
+  return (scan.managedManifest?.backups ?? [])
+    .filter((item) => item.reason === "disabled")
+    .map((item) => item.originalPath)
+    .filter((path) => state.enabled[path] === true);
+}
+
 export function buildServerLibrarySnapshot({
   base,
   scan,
@@ -176,6 +200,51 @@ export function buildServerLibrarySnapshot({
       duplicateCount: 0,
       duplicateAliases: [],
     };
+  });
+  // 备份批次里的禁用/已删除条目：上传后它们不在扫描列表里，但仍要让用户看见并可以拨回开关。
+  const backedUpPaths = new Set<string>();
+  for (const backup of manifest?.backups ?? []) {
+    if (backup.reason !== "disabled" && backup.reason !== "deleted") continue;
+    backedUpPaths.add(backup.originalPath);
+    if (mods.some((mod) => mod.id === backup.originalPath)) continue;
+    const isPak = backup.name.toLowerCase().endsWith(".pak");
+    mods.push({
+      id: backup.originalPath,
+      name: displayServerPakName(backup.name),
+      author: "",
+      fileName: backup.name,
+      filePath: backup.originalPath,
+      fileSize: 0,
+      lastModified: manifest?.createdAt ?? now,
+      enabled: false,
+      type: isPak ? "clientPak" : "ue4ssMod",
+      loadOrder: orderIndex.get(backup.originalPath) ?? mods.length,
+      tags: [backup.reason === "deleted" ? labels.deletedTag : labels.disabledTag],
+      notes: notes?.[backup.originalPath] ?? "",
+      sha256: "",
+      originSource: "cloud",
+      deployed: false,
+      description:
+        backup.reason === "deleted" ? labels.deletedDescription : labels.disabledDescription,
+      conflictCount: 0,
+      fileCount: 0,
+      overriddenFileCount: 0,
+      overridingFileCount: 0,
+      fullyOverridden: false,
+      updateVersion: null,
+      coverUrl: null,
+      duplicateCount: 0,
+      duplicateAliases: [],
+    });
+  }
+  // 备份中的条目排在启用中的模组之后，不要混进正常列表里。
+  mods.sort((left, right) => {
+    const leftBacked = backedUpPaths.has(left.id) ? 1 : 0;
+    const rightBacked = backedUpPaths.has(right.id) ? 1 : 0;
+    return leftBacked - rightBacked || left.loadOrder - right.loadOrder;
+  });
+  mods.forEach((mod, index) => {
+    mod.loadOrder = index;
   });
   const modsById = new Map(mods.map((mod) => [mod.id, mod]));
   const conflicts: ConflictGroup[] = [];

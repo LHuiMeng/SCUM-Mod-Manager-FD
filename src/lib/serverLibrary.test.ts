@@ -8,6 +8,7 @@ import {
   buildServerLibrarySnapshot,
   normalizeServerLibraryState,
   serverLibraryDisabledPaths,
+  serverLibraryReleasedPaths,
 } from "./serverLibrary";
 
 const scan: SftpConnectionResult = {
@@ -121,6 +122,10 @@ describe("server library model", () => {
         mergedName: "Merged",
         mergedTag: "Merged",
         mergedDescription: (sources) => sources.join(", "),
+        disabledTag: "Disabled",
+        disabledDescription: "Disabled backup",
+        deletedTag: "Deleted",
+        deletedDescription: "Deleted backup",
       },
     });
     expect(result.snapshot.mods.map((mod) => mod.name)).toEqual([
@@ -157,6 +162,10 @@ describe("server library model", () => {
         mergedName: "Merged",
         mergedTag: "Merged",
         mergedDescription: (sources) => sources.join(", "),
+        disabledTag: "Disabled",
+        disabledDescription: "Disabled backup",
+        deletedTag: "Deleted",
+        deletedDescription: "Deleted backup",
       },
     });
     expect(result.conflicts).toEqual([]);
@@ -198,6 +207,10 @@ describe("server library model", () => {
         mergedName: "Merged mod",
         mergedTag: "Merged",
         mergedDescription: (sources) => `Sources: ${sources.join(", ")}`,
+        disabledTag: "Disabled",
+        disabledDescription: "Disabled backup",
+        deletedTag: "Deleted",
+        deletedDescription: "Deleted backup",
       },
     });
     expect(result.snapshot.mods[0].name).toBe("Merged mod");
@@ -227,6 +240,10 @@ describe("server library model", () => {
         mergedName: "Merged",
         mergedTag: "Merged",
         mergedDescription: (sources) => sources.join(", "),
+        disabledTag: "Disabled",
+        disabledDescription: "Disabled backup",
+        deletedTag: "Deleted",
+        deletedDescription: "Deleted backup",
       },
     });
     expect(result.state.deleted).toEqual(["/srv/mods/Beta.pak"]);
@@ -287,6 +304,10 @@ describe("server library model", () => {
         mergedName: "Merged",
         mergedTag: "Merged",
         mergedDescription: (sources) => sources.join(", "),
+        disabledTag: "Disabled",
+        disabledDescription: "Disabled backup",
+        deletedTag: "Deleted",
+        deletedDescription: "Deleted backup",
       },
     });
 
@@ -294,5 +315,135 @@ describe("server library model", () => {
       "Alpha.pak",
       "Beta.pak",
     ]);
+  });
+
+  it("keeps disabled mods in state when the server moved them into the backup batch", () => {
+    const scanWithBackup: SftpConnectionResult = {
+      ...scan,
+      pakMods: [scan.pakMods[1]],
+      managedManifest: {
+        version: 1,
+        createdAt: "2026-01-01T00:00:00Z",
+        mergedPath: null,
+        mergedName: null,
+        sources: [],
+        backups: [
+          {
+            name: "Alpha.pak",
+            originalPath: "/srv/mods/Alpha.pak",
+            backupPath: "/srv/mods/_SCUM_Mod_Desk_Backups/1/Alpha.pak.bak",
+            reason: "disabled",
+          },
+        ],
+        renames: [],
+        createdPaths: [],
+        winners: {},
+        provenancePaths: [],
+      },
+    };
+
+    const state = normalizeServerLibraryState(
+      {
+        order: ["/srv/mods/Alpha.pak", "/srv/mods/Beta.pak"],
+        enabled: { "/srv/mods/Alpha.pak": false },
+        winners: {},
+        deleted: [],
+      },
+      scanWithBackup,
+    );
+
+    expect(state.enabled["/srv/mods/Alpha.pak"]).toBe(false);
+    expect(serverLibraryDisabledPaths(state)).toEqual(["/srv/mods/Alpha.pak"]);
+    expect(state.order).toEqual(["/srv/mods/Alpha.pak", "/srv/mods/Beta.pak"]);
+    expect(serverLibraryReleasedPaths(state, scanWithBackup)).toEqual([]);
+  });
+
+  it("reports released paths when a disabled mod is switched back on", () => {
+    const scanWithBackup: SftpConnectionResult = {
+      ...scan,
+      pakMods: [scan.pakMods[1]],
+      managedManifest: {
+        version: 1,
+        createdAt: "2026-01-01T00:00:00Z",
+        mergedPath: null,
+        mergedName: null,
+        sources: [],
+        backups: [
+          {
+            name: "Alpha.pak",
+            originalPath: "/srv/mods/Alpha.pak",
+            backupPath: "/srv/mods/_SCUM_Mod_Desk_Backups/1/Alpha.pak.bak",
+            reason: "disabled",
+          },
+        ],
+        renames: [],
+        createdPaths: [],
+        winners: {},
+        provenancePaths: [],
+      },
+    };
+    const state = normalizeServerLibraryState(
+      {
+        order: ["/srv/mods/Alpha.pak", "/srv/mods/Beta.pak"],
+        enabled: { "/srv/mods/Alpha.pak": true },
+        winners: {},
+        deleted: [],
+      },
+      scanWithBackup,
+    );
+    expect(serverLibraryReleasedPaths(state, scanWithBackup)).toEqual([
+      "/srv/mods/Alpha.pak",
+    ]);
+  });
+
+  it("renders backup-only mods as disabled rows after upload", () => {
+    const manifest = {
+      version: 1,
+      createdAt: "2026-01-01T00:00:00Z",
+      mergedPath: null,
+      mergedName: null,
+      sources: [],
+      backups: [
+        {
+          name: "Alpha.pak",
+          originalPath: "/srv/mods/Alpha.pak",
+          backupPath: "/srv/mods/_SCUM_Mod_Desk_Backups/1/Alpha.pak.bak",
+          reason: "disabled",
+        },
+      ],
+      renames: [],
+      createdPaths: [],
+      winners: {},
+      provenancePaths: [],
+    };
+    const scanWithBackup: SftpConnectionResult = {
+      ...scan,
+      pakMods: [scan.pakMods[1]],
+      managedManifest: manifest,
+    };
+    const state = normalizeServerLibraryState(
+      { order: [], enabled: {}, winners: {}, deleted: [] },
+      scanWithBackup,
+    );
+    const result = buildServerLibrarySnapshot({
+      base,
+      scan: scanWithBackup,
+      report: null,
+      state,
+      manifest,
+      labels: {
+        mergedName: "Merged",
+        mergedTag: "Merged",
+        mergedDescription: (sources) => sources.join(", "),
+        disabledTag: "Disabled",
+        disabledDescription: "Disabled backup",
+        deletedTag: "Deleted",
+        deletedDescription: "Deleted backup",
+      },
+    });
+    const alpha = result.snapshot.mods.find((mod) => mod.id === "/srv/mods/Alpha.pak");
+    expect(alpha?.enabled).toBe(false);
+    expect(alpha?.tags).toEqual(["Disabled"]);
+    expect(result.snapshot.mods.map((mod) => mod.name)).toEqual(["Beta.pak", "Alpha.pak"]);
   });
 });

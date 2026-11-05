@@ -885,6 +885,7 @@ pub async fn apply_sftp_mod_layout(
     account_id: String,
     order: Vec<String>,
     disabled: Vec<String>,
+    released: Vec<String>,
     deleted: Vec<String>,
     winners: BTreeMap<String, String>,
 ) -> Result<SftpApplyResult, String> {
@@ -909,6 +910,7 @@ pub async fn apply_sftp_mod_layout(
             &account_id,
             &order,
             &disabled,
+            &released,
             &deleted,
             &winners,
             progress,

@@ -1155,12 +1155,41 @@ fn prepare_remote_layout_inner(
     })
 }
 
+/// 最终禁用集合 = 本次请求的 disabled ∪ 上一轮 manifest 里的 disabled − 显式 released。
+/// 单独抽出来是为了能脱离 SFTP 单测：这段语义错了会让用户关掉的模组静默复活，
+/// 或者让「拨回开关」永远不生效。
+fn inherit_disabled_paths(
+    requested: &[String],
+    released: &[String],
+    existing: Option<&SftpManagedManifest>,
+) -> HashSet<String> {
+    let released = released.iter().cloned().collect::<HashSet<_>>();
+    requested
+        .iter()
+        .cloned()
+        .chain(
+            existing
+                .map(|manifest| {
+                    manifest
+                        .backups
+                        .iter()
+                        .filter(|item| item.reason == "disabled")
+                        .map(|item| item.original_path.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        )
+        .filter(|path| !released.contains(path))
+        .collect()
+}
+
 pub fn apply_remote_layout(
     paths: &AppPaths,
     settings: &AppSettings,
     account_id: &str,
     order: &[String],
     disabled: &[String],
+    released: &[String],
     deleted: &[String],
     winners: &BTreeMap<String, String>,
     progress: SftpConflictProgressCallback,
@@ -1182,12 +1211,14 @@ pub fn apply_remote_layout(
         None,
         "正在检查服务器现有托管状态",
     );
+    let mut previous_manifest = None;
     if let Some(existing) = with_sftp(paths, account, |sftp| {
         read_managed_manifest(sftp, &account.mods_path, &account.ue4ss_path)
     })? {
         with_sftp(paths, account, |sftp| {
             restore_managed_manifest(sftp, &account.mods_path, &existing)
         })?;
+        previous_manifest = Some(existing);
     }
 
     let cache_dir = paths
@@ -1209,7 +1240,8 @@ pub fn apply_remote_layout(
         .enumerate()
         .map(|(index, path)| (path.clone(), index))
         .collect::<BTreeMap<_, _>>();
-    let disabled = disabled.iter().cloned().collect::<HashSet<_>>();
+    // 上一轮被禁用的模组继续禁用；只有前端显式 released 的才真正放开。
+    let disabled = inherit_disabled_paths(disabled, released, previous_manifest.as_ref());
     let mut sorted_paks = pak_files;
     sorted_paks.sort_by(|left, right| {
         order_index
@@ -3652,6 +3684,7 @@ mod tests {
     use super::{
         active_account, build_remote_merged_pak, build_remote_ue4ss_mods_txt,
         conflict_entries_cache_name, download_file, ensure_remote_operation_allowed,
+        inherit_disabled_paths,
         load_remote_notes, move_remote_notes, numbered_remote_pak_file_name, pak_path_candidates,
         plan_library_download, plan_move, plan_remote_pak_renames, read_conflict_entries_cache,
         is_deletable_remote_child, remote_deployment_prefix_width, remote_join,
@@ -4164,5 +4197,30 @@ mod tests {
             is_deletable_remote_child(root, "/srv/ue4ss/Mods/Evil"),
             "根目录下的正常模组路径应当被接受"
         );
+    }
+
+    #[test]
+    fn inherits_disabled_paths_unless_explicitly_released() {
+        let manifest = SftpManagedManifest {
+            backups: vec![SftpManagedBackup {
+                name: "Alpha.pak".into(),
+                original_path: "/srv/mods/Alpha.pak".into(),
+                backup_path: "/srv/mods/_SCUM_Mod_Desk_Backups/1/Alpha.pak.bak".into(),
+                reason: "disabled".into(),
+            }],
+            ..SftpManagedManifest::default()
+        };
+        let requested = vec!["/srv/mods/Beta.pak".to_string()];
+
+        let inherited = inherit_disabled_paths(&requested, &[], Some(&manifest));
+        assert!(inherited.contains("/srv/mods/Alpha.pak"));
+        assert!(inherited.contains("/srv/mods/Beta.pak"));
+        assert_eq!(inherited.len(), 2);
+
+        let released = vec!["/srv/mods/Alpha.pak".to_string()];
+        let reopened = inherit_disabled_paths(&requested, &released, Some(&manifest));
+        assert!(!reopened.contains("/srv/mods/Alpha.pak"));
+        assert!(reopened.contains("/srv/mods/Beta.pak"));
+        assert_eq!(reopened.len(), 1);
     }
 }
