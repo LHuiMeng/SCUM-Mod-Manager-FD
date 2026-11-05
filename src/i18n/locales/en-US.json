@@ -475,7 +475,7 @@
   "settings.startup.keepDeployed": "Keep deployment files after exiting",
   "settings.startup.keepDeployedDetail": "Retain PAK / UE4SS files; unchanged deployments are reused on the next launch",
   "settings.startup.useDeployLinks": "Deploy mods as links",
-  "settings.startup.useDeployLinksDetail": "Point the game ~mods folder at the launcher deployment folder: no copy on launch and no cleanup on exit. Turning it off restores a real folder and copies again",
+  "settings.startup.useDeployLinksDetail": "Point ~mods and ue4ss\\Mods at the launcher folder: nothing is copied and exiting only detaches the links. Turning it off restores real folders and copies again",
   "settings.startup.autoMergeConflicts": "Automatically merge conflicts",
   "settings.startup.autoMergeConflictsDetail": "Reuse the merge cache at launch; turn this off to merge manually from the Conflicts tab",
   "settings.startup.port": "Server port",

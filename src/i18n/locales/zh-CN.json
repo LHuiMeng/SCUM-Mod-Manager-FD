@@ -465,7 +465,7 @@
   "settings.startup.keepDeployed": "退出游戏后保留部署文件",
   "settings.startup.keepDeployedDetail": "保留 PAK / UE4SS 文件；未变化时下次启动直接复用",
   "settings.startup.useDeployLinks": "用链接部署模组",
-  "settings.startup.useDeployLinksDetail": "游戏 ~mods 指向启动器部署目录：部署不复制、退出不删；切回关闭会恢复真实目录并按原方式复制",
+  "settings.startup.useDeployLinksDetail": "游戏 ~mods 与 ue4ss\\Mods 指向启动器目录：部署不复制，退出只断开链接、库文件不动；关闭后恢复真实目录并按原方式复制",
   "settings.startup.autoMergeConflicts": "自动融合冲突",
   "settings.startup.autoMergeConflictsDetail": "启动时复用融合缓存；关闭后需在「冲突模组」标签手动融合",
   "settings.startup.port": "服务端端口",

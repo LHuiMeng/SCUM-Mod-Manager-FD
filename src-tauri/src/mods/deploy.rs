@@ -32,6 +32,9 @@ pub struct DeployedManifest {
     /// 本次部署是否通过 junction + 硬链接完成（false = 直接复制进游戏目录）。
     #[serde(default)]
     pub use_links: bool,
+    /// 链接模式下由本管理器建立的 junction（回收时只删链接，不动库和目标目录）。
+    #[serde(default)]
+    pub links: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +92,7 @@ pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
     let mut removed = 0;
     let mut failures = Vec::new();
     let mut remaining_files = Vec::new();
+    let mut remaining_links = Vec::new();
     for file in manifest.files.iter().rev() {
         let file = PathBuf::from(file);
         if !roots.iter().any(|root| is_within(&file, root)) {
@@ -185,6 +189,20 @@ pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
         }
     }
 
+    for link in manifest.links.iter() {
+        let link = PathBuf::from(link);
+        if !crate::mods::links::is_junction(&link) {
+            continue;
+        }
+        match crate::mods::links::remove_junction(&link) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                failures.push(format!("无法断开链接 {}：{error}", link.display()));
+                remaining_links.push(path_string(&link));
+            }
+        }
+    }
+
     if failures.is_empty() {
         let _ = std::fs::remove_file(&paths.deployment_manifest);
         return Ok(removed);
@@ -201,6 +219,7 @@ pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
         mode: manifest.mode,
         file_sizes: manifest.file_sizes,
         use_links: manifest.use_links,
+        links: remaining_links,
     };
     write_manifest(paths, &remaining)?;
     bail!(
@@ -284,19 +303,11 @@ pub fn deploy_local_mods(
     // 游戏直接读链接后的文件，退出也不用回收。复制模式保持原行为。
     let use_links = settings.use_deploy_links;
     let deploy_root = if use_links {
-        let root = paths
+        paths
             .root
             .join("deployed")
-            .join(if is_server { "server" } else { "client" });
-        prepare_link_layout(paths, &pak_dir, &root)?;
-        root
+            .join(if is_server { "server" } else { "client" })
     } else {
-        if crate::mods::links::is_junction(&pak_dir) {
-            // 从链接模式切回来：先把 junction 换回真实目录，再按复制模式部署。
-            crate::mods::links::remove_junction(&pak_dir)?;
-        }
-        std::fs::create_dir_all(&pak_dir)
-            .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
         pak_dir.clone()
     };
 
@@ -350,11 +361,26 @@ pub fn deploy_local_mods(
     if enabled.is_empty() {
         return Ok(None);
     }
+    if use_links {
+        prepare_link_layout(paths, &pak_dir, &deploy_root)?;
+    } else {
+        if crate::mods::links::is_junction(&pak_dir) {
+            // 从链接模式切回来：先把 junction 换回真实目录，再按复制模式部署。
+            crate::mods::links::remove_junction(&pak_dir)?;
+        }
+        std::fs::create_dir_all(&pak_dir)
+            .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
+    }
 
     let mut manifest = DeployedManifest {
         deployed_at: Utc::now().to_rfc3339(),
         roots: vec![path_string(install), path_string(&deploy_root)],
         use_links,
+        links: if use_links {
+            vec![path_string(&pak_dir)]
+        } else {
+            Vec::new()
+        },
         fingerprint: deployment_fingerprint,
         mode: if is_server { "server" } else { "client" }.to_string(),
         ..DeployedManifest::default()
@@ -421,9 +447,14 @@ pub fn deploy_local_mods(
             if let Some(binaries) = find_binaries_dir(install) {
                 ensure_runtime_framework(paths)?;
                 sync_ue4ss_mods_txt(paths, &canonical_mods)?;
-                deploy_framework(paths, &binaries, &backup_root, &mut manifest)?;
-                for item in ue4ss_enabled {
-                    deploy_ue4ss_mod(item, &binaries, &backup_root, &mut manifest)?;
+                deploy_framework(paths, &binaries, &backup_root, &mut manifest, !use_links)?;
+                if use_links {
+                    let ue4ss_mods_link = binaries.join("ue4ss").join("Mods");
+                    ensure_ue4ss_link(&mut manifest, &ue4ss_mods_link, &paths.ue4ss_mods)?;
+                } else {
+                    for item in ue4ss_enabled {
+                        deploy_ue4ss_mod(item, &binaries, &backup_root, &mut manifest)?;
+                    }
                 }
             }
         }
@@ -513,6 +544,10 @@ fn reusable_deployment(
     if manifest.fingerprint != fingerprint
         || manifest.mode != expected_mode
         || manifest.use_links != use_links
+        || manifest
+            .links
+            .iter()
+            .any(|link| !crate::mods::links::is_junction(Path::new(link)))
         || !manifest
             .roots
             .iter()
@@ -598,6 +633,7 @@ fn deploy_framework(
     binaries: &Path,
     backup_root: &Path,
     manifest: &mut DeployedManifest,
+    seed_mods: bool,
 ) -> Result<()> {
     let dll = paths.ue4ss_runtime.join("dwmapi.dll");
     if dll.is_file() {
@@ -621,7 +657,13 @@ fn deploy_framework(
             copy_file_record(entry.path(), &target, backup_root, manifest)?;
         }
     }
-    for file_name in ["mods.json", "mods.txt"] {
+    // 链接模式下 Mods 是指向库的 junction，不能往里写框架自带的空 mods.txt，
+    // 否则会把库里的启用清单盖掉。
+    for file_name in if seed_mods {
+        vec!["mods.json", "mods.txt"]
+    } else {
+        Vec::new()
+    } {
         let source = source_root.join("Mods").join(file_name);
         if source.is_file() {
             copy_file_record(
@@ -710,6 +752,59 @@ fn prepare_link_layout(paths: &AppPaths, pak_dir: &Path, deployed_root: &Path) -
             deployed_root.display()
         )
     })?;
+    Ok(())
+}
+
+/// 把游戏 `Binaries\Win64\ue4ss\Mods` 指向库目录，UE4SS 直接读库里的模组，
+/// 启用/停用交给库里的 `mods.txt`，不再复制目录。
+fn ensure_ue4ss_link(
+    manifest: &mut DeployedManifest,
+    link: &Path,
+    library: &Path,
+) -> Result<()> {
+    if crate::mods::links::is_junction(link) {
+        crate::mods::links::ensure_junction(link, library).with_context(|| {
+            format!("无法把 {} 指向 {}", link.display(), library.display())
+        })?;
+    } else if link.exists() {
+        if !link.is_dir() {
+            bail!("UE4SS 模组目录不是文件夹：{}", link.display());
+        }
+        // 框架自带的空 mods.json / mods.txt 可以直接清掉重建；出现模组目录就拒绝接管。
+        let entries = std::fs::read_dir(link)?.filter_map(Result::ok).collect::<Vec<_>>();
+        let foreign = entries
+            .iter()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                name != "mods.json" && name != "mods.txt"
+            })
+            .count();
+        if foreign > 0 {
+            bail!(
+                "{} 里还有 {} 项已复制的模组内容，请先切回复制模式让管理器回收，或手动清空后再启用链接部署",
+                link.display(),
+                foreign
+            );
+        }
+        for entry in entries {
+            let _ = std::fs::remove_file(entry.path());
+        }
+        std::fs::remove_dir(link)?;
+        crate::mods::links::ensure_junction(link, library).with_context(|| {
+            format!("无法把 {} 指向 {}", link.display(), library.display())
+        })?;
+    } else {
+        crate::mods::links::ensure_junction(link, library).with_context(|| {
+            format!("无法把 {} 指向 {}", link.display(), library.display())
+        })?;
+    }
+    if !manifest
+        .links
+        .iter()
+        .any(|item| same_path(Path::new(item), link))
+    {
+        manifest.links.push(path_string(link));
+    }
     Ok(())
 }
 
@@ -1076,6 +1171,82 @@ mod tests {
         assert!(!crate::mods::links::is_junction(&pak_dir));
         assert_eq!(fs::read(pak_dir.join("000_TestWeapon.pak")).unwrap(), b"pak-content");
         assert!(source.is_file());
+    }
+
+    #[test]
+    fn tears_down_links_on_reclaim_and_keeps_the_library() {
+        let temp = TempRoot::new("deploy-links-teardown");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let source = paths.local_mods.join("TestWeapon.pak");
+        fs::write(&source, b"pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+        assert!(crate::mods::links::is_junction(&pak_dir));
+
+        let removed = reclaim_mods(&paths).unwrap();
+
+        assert!(removed >= 1, "回收应至少断开一个链接");
+        assert!(!pak_dir.exists(), "退出后 ~mods 链接必须断开");
+        assert!(source.is_file(), "库文件必须保留");
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn links_ue4ss_mods_and_detaches_on_reclaim() {
+        let temp = TempRoot::new("deploy-links-ue4ss");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let module = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(module.join("Scripts")).unwrap();
+        fs::write(module.join("Scripts").join("main.lua"), b"print('x')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&module, true, "ue4ssMod")];
+
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+
+        let link = binaries.join("ue4ss").join("Mods");
+        assert!(
+            crate::mods::links::is_junction(&link),
+            "UE4SS Mods 应该是 junction"
+        );
+        assert_eq!(
+            crate::mods::links::junction_target(&link).unwrap(),
+            paths.ue4ss_mods
+        );
+        assert!(link.join("BetterAI").join("Scripts").join("main.lua").is_file());
+
+        reclaim_mods(&paths).unwrap();
+
+        assert!(!crate::mods::links::is_junction(&link), "回收要断开 UE4SS 链接");
+        assert!(
+            module.join("Scripts").join("main.lua").is_file(),
+            "库里的模组目录不能被删"
+        );
     }
 
     #[test]
