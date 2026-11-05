@@ -447,11 +447,19 @@ pub fn deploy_local_mods(
             if let Some(binaries) = find_binaries_dir(install) {
                 ensure_runtime_framework(paths)?;
                 sync_ue4ss_mods_txt(paths, &canonical_mods)?;
-                deploy_framework(paths, &binaries, &backup_root, &mut manifest, !use_links)?;
                 if use_links {
-                    let ue4ss_mods_link = binaries.join("ue4ss").join("Mods");
-                    ensure_ue4ss_link(&mut manifest, &ue4ss_mods_link, &paths.ue4ss_mods)?;
+                    // 只有 dwmapi.dll 必须落在 exe 同目录（Windows 的 DLL 搜索规则），
+                    // 其余整棵 ue4ss 目录（UE4SS.dll / settings / Mods）用 junction 指到启动器。
+                    deploy_loader_dll(paths, &binaries, &backup_root, &mut manifest)?;
+                    let link = binaries.join("ue4ss");
+                    link_ue4ss_framework(
+                        &mut manifest,
+                        &link,
+                        &paths.ue4ss_runtime.join("ue4ss"),
+                        &backup_root,
+                    )?;
                 } else {
+                    deploy_framework(paths, &binaries, &backup_root, &mut manifest)?;
                     for item in ue4ss_enabled {
                         deploy_ue4ss_mod(item, &binaries, &backup_root, &mut manifest)?;
                     }
@@ -633,7 +641,6 @@ fn deploy_framework(
     binaries: &Path,
     backup_root: &Path,
     manifest: &mut DeployedManifest,
-    seed_mods: bool,
 ) -> Result<()> {
     let dll = paths.ue4ss_runtime.join("dwmapi.dll");
     if dll.is_file() {
@@ -657,13 +664,7 @@ fn deploy_framework(
             copy_file_record(entry.path(), &target, backup_root, manifest)?;
         }
     }
-    // 链接模式下 Mods 是指向库的 junction，不能往里写框架自带的空 mods.txt，
-    // 否则会把库里的启用清单盖掉。
-    for file_name in if seed_mods {
-        vec!["mods.json", "mods.txt"]
-    } else {
-        Vec::new()
-    } {
+    for file_name in ["mods.json", "mods.txt"] {
         let source = source_root.join("Mods").join(file_name);
         if source.is_file() {
             copy_file_record(
@@ -755,12 +756,27 @@ fn prepare_link_layout(paths: &AppPaths, pak_dir: &Path, deployed_root: &Path) -
     Ok(())
 }
 
-/// 把游戏 `Binaries\Win64\ue4ss\Mods` 指向库目录，UE4SS 直接读库里的模组，
-/// 启用/停用交给库里的 `mods.txt`，不再复制目录。
-fn ensure_ue4ss_link(
+/// 只复制加载器 `dwmapi.dll`：Windows 只从 exe 同目录加载代理 DLL，这一个躲不开。
+fn deploy_loader_dll(
+    paths: &AppPaths,
+    binaries: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+) -> Result<()> {
+    let dll = paths.ue4ss_runtime.join("dwmapi.dll");
+    if dll.is_file() {
+        copy_file_record(&dll, &binaries.join("dwmapi.dll"), backup_root, manifest)?;
+    }
+    Ok(())
+}
+
+/// 把游戏 `Binaries\Win64\ue4ss` 整棵目录指向启动器框架目录：
+/// `UE4SS.dll`、`UE4SS-settings.ini`、`Mods` 全部零复制，启用/停用由库里的 `mods.txt` 决定。
+fn link_ue4ss_framework(
     manifest: &mut DeployedManifest,
     link: &Path,
     library: &Path,
+    backup_root: &Path,
 ) -> Result<()> {
     if crate::mods::links::is_junction(link) {
         crate::mods::links::ensure_junction(link, library).with_context(|| {
@@ -768,28 +784,30 @@ fn ensure_ue4ss_link(
         })?;
     } else if link.exists() {
         if !link.is_dir() {
-            bail!("UE4SS 模组目录不是文件夹：{}", link.display());
+            bail!("UE4SS 运行时目录不是文件夹：{}", link.display());
         }
-        // 框架自带的空 mods.json / mods.txt 可以直接清掉重建；出现模组目录就拒绝接管。
-        let entries = std::fs::read_dir(link)?.filter_map(Result::ok).collect::<Vec<_>>();
-        let foreign = entries
-            .iter()
-            .filter(|entry| {
-                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                name != "mods.json" && name != "mods.txt"
-            })
-            .count();
-        if foreign > 0 {
-            bail!(
-                "{} 里还有 {} 项已复制的模组内容，请先切回复制模式让管理器回收，或手动清空后再启用链接部署",
-                link.display(),
-                foreign
-            );
+        // 旧版本的逐文件部署会在游戏目录留下一份框架副本；先把其中可能存在的 Mods 链接摘掉，
+        // 再把整棵目录挪进备份（不跨卷时 rename，跨卷时退回复制），最后建 junction。
+        let mods = link.join("Mods");
+        if crate::mods::links::is_junction(&mods) {
+            crate::mods::links::remove_junction(&mods)?;
         }
-        for entry in entries {
-            let _ = std::fs::remove_file(entry.path());
+        std::fs::create_dir_all(backup_root)?;
+        let retired = backup_root.join(format!(
+            "ue4ss-{}.bak",
+            Utc::now().format("%Y%m%d%H%M%S")
+        ));
+        if std::fs::rename(link, &retired).is_err() {
+            super::copy_tree(link, &retired).with_context(|| {
+                format!(
+                    "无法把旧的 UE4SS 目录 {} 备份到 {}",
+                    link.display(),
+                    retired.display()
+                )
+            })?;
+            std::fs::remove_dir_all(link)
+                .with_context(|| format!("无法移除旧 UE4SS 目录 {}", link.display()))?;
         }
-        std::fs::remove_dir(link)?;
         crate::mods::links::ensure_junction(link, library).with_context(|| {
             format!("无法把 {} 指向 {}", link.display(), library.display())
         })?;
@@ -1229,20 +1247,29 @@ mod tests {
 
         deploy_local_mods(&paths, &settings, &mods, false).unwrap();
 
-        let link = binaries.join("ue4ss").join("Mods");
+        let framework = paths.ue4ss_runtime.join("ue4ss");
+        let link = binaries.join("ue4ss");
         assert!(
             crate::mods::links::is_junction(&link),
-            "UE4SS Mods 应该是 junction"
+            "整棵 ue4ss 目录都应该是 junction"
         );
         assert_eq!(
             crate::mods::links::junction_target(&link).unwrap(),
-            paths.ue4ss_mods
+            framework
         );
-        assert!(link.join("BetterAI").join("Scripts").join("main.lua").is_file());
+        assert!(link.join("UE4SS.dll").is_file(), "框架 DLL 必须走链接，不是复制");
+        assert!(link.join("UE4SS-settings.ini").is_file());
+        assert!(
+            binaries.join("dwmapi.dll").is_file(),
+            "只有加载器 DLL 需要落在 exe 同目录"
+        );
+        assert!(link.join("Mods").join("BetterAI").join("Scripts").join("main.lua").is_file());
 
         reclaim_mods(&paths).unwrap();
 
         assert!(!crate::mods::links::is_junction(&link), "回收要断开 UE4SS 链接");
+        assert!(!link.exists());
+        assert!(!binaries.join("dwmapi.dll").exists(), "加载器副本也要回收");
         assert!(
             module.join("Scripts").join("main.lua").is_file(),
             "库里的模组目录不能被删"
