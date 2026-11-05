@@ -38,6 +38,7 @@ interface AppShellProps {
   updateAvailable: boolean;
   updateVersion: string | null;
   maximized: boolean;
+  statusSlot?: ReactNode;
   children: ReactNode;
   onSectionChange: (section: NavSection) => void;
   onToggleTheme: () => void;
@@ -72,6 +73,7 @@ export function AppShell({
   updateAvailable,
   updateVersion,
   maximized,
+  statusSlot,
   children,
   onSectionChange,
   onToggleTheme,
@@ -116,6 +118,7 @@ export function AppShell({
             onMaximize={onMaximize}
             onClose={onClose}
           />
+          {statusSlot}
           <div className="app-content">{children}</div>
         </main>
       </div>

@@ -8,7 +8,7 @@ use crate::models::{
     DetectPathsResult, DownloadResult, GameStatus, ImportConflict, ImportResult,
     InstallUpdateResult, LibrarySnapshot, LocaleBundle, RemoteFile, RemoteMod, RuntimeLog,
     SftpAccountInput, SftpApplyResult, SftpConflictReport, SftpConnectionResult,
-    SftpOperationResult, SftpPrepareResult, UploadResult,
+    SftpOperationProgress, SftpOperationResult, SftpPrepareResult, UploadResult,
 };
 use crate::mods::links::PendingLink;
 use crate::paths::path_string;
@@ -50,6 +50,120 @@ fn begin_download(id: &str) -> Result<DownloadGuard, String> {
 
 fn error_text(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// 把 sftp 模块的两种进度回调包装成「旧事件 + 新统一事件」双发。
+/// 旧事件保留：ServerScreen 现有进度条仍在用，删了会回归。
+#[derive(Clone)]
+struct OperationReporter {
+    app: AppHandle,
+    kind: &'static str,
+}
+
+impl OperationReporter {
+    fn new(app: AppHandle, kind: &'static str) -> Self {
+        Self { app, kind }
+    }
+
+    fn emit(
+        &self,
+        phase: &str,
+        message: &str,
+        completed: u64,
+        total: u64,
+        unit: &str,
+        current: Option<String>,
+        finished: bool,
+    ) {
+        let _ = self.app.emit(
+            "sftp-operation-progress",
+            SftpOperationProgress {
+                kind: self.kind.to_string(),
+                phase: phase.to_string(),
+                message: message.to_string(),
+                completed,
+                total,
+                unit: unit.to_string(),
+                current_item: current,
+                finished,
+            },
+        );
+    }
+
+    fn finish(&self, phase: &str, message: &str) {
+        self.emit(phase, message, 0, 0, "none", None, true);
+    }
+
+    fn conflict(&self) -> sftp::SftpConflictProgressCallback {
+        let app = self.app.clone();
+        let kind = self.kind.to_string();
+        Arc::new(move |payload: crate::models::SftpConflictProgress| {
+            let _ = app.emit("sftp-conflict-progress", payload.clone());
+            let by_bytes = payload.total_bytes > 0;
+            let (completed, total, unit) = if by_bytes {
+                (payload.completed_bytes, payload.total_bytes, "bytes")
+            } else {
+                (
+                    payload.completed_files as u64,
+                    payload.total_files as u64,
+                    "files",
+                )
+            };
+            let _ = app.emit(
+                "sftp-operation-progress",
+                SftpOperationProgress {
+                    kind: kind.clone(),
+                    phase: payload.phase.clone(),
+                    message: payload.message.clone(),
+                    completed,
+                    total,
+                    unit: unit.to_string(),
+                    current_item: payload.current_file.clone(),
+                    finished: payload.phase == "completed" || payload.phase == "error",
+                },
+            );
+        })
+    }
+
+    fn upload(&self) -> sftp::SftpUploadProgressCallback {
+        let app = self.app.clone();
+        let kind = self.kind.to_string();
+        Arc::new(move |payload: crate::models::SftpUploadProgress| {
+            let _ = app.emit("sftp-upload-progress", payload.clone());
+            let finished = payload.total_files > 0 && payload.completed_files >= payload.total_files;
+            let _ = app.emit(
+                "sftp-operation-progress",
+                SftpOperationProgress {
+                    kind: kind.clone(),
+                    phase: if finished { "done" } else { "uploading" }.to_string(),
+                    message: payload.message.clone(),
+                    completed: payload.completed_bytes,
+                    total: payload.total_bytes,
+                    unit: "bytes".to_string(),
+                    current_item: Some(payload.file.clone()).filter(|value| !value.is_empty()),
+                    finished,
+                },
+            );
+        })
+    }
+}
+
+fn finish_operation<T>(
+    reporter: &OperationReporter,
+    result: Result<T, anyhow::Error>,
+    message: impl Fn(&T) -> String,
+) -> Result<T, String> {
+    match result {
+        Ok(value) => {
+            reporter.finish("done", &message(&value));
+            Ok(value)
+        }
+        Err(error) => {
+            let text = format!("{error:#}");
+            reporter.finish("error", &text);
+            Err(text)
+        }
+    }
 }
 
 #[tauri::command]
@@ -529,11 +643,19 @@ pub async fn upload_server_mods(
     kind: String,
     paths: Vec<String>,
 ) -> Result<UploadResult, String> {
-    let progress_app = app.clone();
-    let progress: sftp::SftpUploadProgressCallback = std::sync::Arc::new(move |payload| {
-        let _ = progress_app.emit("sftp-upload-progress", payload);
-    });
-    tauri::async_runtime::spawn_blocking(move || {
+    let reporter = OperationReporter::new(app.clone(), "upload");
+    reporter.emit(
+        "starting",
+        "正在上传文件到服务器",
+        0,
+        0,
+        "none",
+        None,
+        false,
+    );
+    let progress = reporter.upload();
+    let worker = reporter.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
         let result = sftp::upload_files(
@@ -548,8 +670,8 @@ pub async fn upload_server_mods(
         Ok::<_, anyhow::Error>(result)
     })
     .await
-    .map_err(error_text)?
-    .map_err(error_text)
+    .map_err(error_text)?;
+    finish_operation(&worker, result, |uploaded| uploaded.message.clone())
 }
 
 #[tauri::command]
@@ -632,7 +754,18 @@ pub async fn download_sftp_mod_to_library(
     account_id: String,
     path: String,
 ) -> Result<LibrarySnapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let reporter = OperationReporter::new(app.clone(), "download");
+    reporter.emit(
+        "starting",
+        &format!("正在把 {} 下载到本地模组库", path),
+        0,
+        0,
+        "none",
+        Some(path.clone()),
+        false,
+    );
+    let worker = reporter.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
         let result = sftp::download_mod_to_library(&state.paths, &settings, &account_id, &path)?;
@@ -641,8 +774,13 @@ pub async fn download_sftp_mod_to_library(
         Ok::<_, anyhow::Error>(snapshot)
     })
     .await
-    .map_err(error_text)?
-    .map_err(error_text)
+    .map_err(|error| {
+        let message = error_text(error);
+        worker.finish("error", &message);
+        message
+    })?;
+    let worker = reporter.clone();
+    finish_operation(&worker, result, |_| "已下载到本地模组库".to_string())
 }
 
 #[tauri::command]
@@ -682,11 +820,11 @@ pub async fn analyze_sftp_conflicts(
     app: AppHandle,
     account_id: String,
 ) -> Result<SftpConflictReport, String> {
-    let progress_app = app.clone();
-    let progress: sftp::SftpConflictProgressCallback = Arc::new(move |payload| {
-        let _ = progress_app.emit("sftp-conflict-progress", payload);
-    });
-    tauri::async_runtime::spawn_blocking(move || {
+    let reporter = OperationReporter::new(app.clone(), "analyze");
+    reporter.emit("starting", "正在读取服务器模组清单", 0, 0, "none", None, false);
+    let progress = reporter.conflict();
+    let worker = reporter.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
         let result =
@@ -695,8 +833,8 @@ pub async fn analyze_sftp_conflicts(
         Ok::<_, anyhow::Error>(result)
     })
     .await
-    .map_err(error_text)?
-    .map_err(error_text)
+    .map_err(error_text)?;
+    finish_operation(&worker, result, |report| report.message.clone())
 }
 
 #[tauri::command]
@@ -708,11 +846,19 @@ pub async fn prepare_sftp_mod_layout(
     deleted: Vec<String>,
     winners: BTreeMap<String, String>,
 ) -> Result<SftpPrepareResult, String> {
-    let progress_app = app.clone();
-    let progress: sftp::SftpConflictProgressCallback = Arc::new(move |payload| {
-        let _ = progress_app.emit("sftp-conflict-progress", payload);
-    });
-    tauri::async_runtime::spawn_blocking(move || {
+    let reporter = OperationReporter::new(app.clone(), "prepare");
+    reporter.emit(
+        "starting",
+        "正在连接服务器并读取模组清单",
+        0,
+        0,
+        "none",
+        None,
+        false,
+    );
+    let progress = reporter.conflict();
+    let worker = reporter.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
         let result = sftp::prepare_remote_layout(
@@ -729,8 +875,8 @@ pub async fn prepare_sftp_mod_layout(
         Ok::<_, anyhow::Error>(result)
     })
     .await
-    .map_err(error_text)?
-    .map_err(error_text)
+    .map_err(error_text)?;
+    finish_operation(&worker, result, |plan| plan.message.clone())
 }
 
 #[tauri::command]
@@ -742,11 +888,19 @@ pub async fn apply_sftp_mod_layout(
     deleted: Vec<String>,
     winners: BTreeMap<String, String>,
 ) -> Result<SftpApplyResult, String> {
-    let progress_app = app.clone();
-    let progress: sftp::SftpConflictProgressCallback = Arc::new(move |payload| {
-        let _ = progress_app.emit("sftp-conflict-progress", payload);
-    });
-    tauri::async_runtime::spawn_blocking(move || {
+    let reporter = OperationReporter::new(app.clone(), "apply");
+    reporter.emit(
+        "starting",
+        "正在应用服务器模组布局",
+        0,
+        0,
+        "none",
+        None,
+        false,
+    );
+    let progress = reporter.conflict();
+    let worker = reporter.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
         let result = sftp::apply_remote_layout(
@@ -763,8 +917,8 @@ pub async fn apply_sftp_mod_layout(
         Ok::<_, anyhow::Error>(result)
     })
     .await
-    .map_err(error_text)?
-    .map_err(error_text)
+    .map_err(error_text)?;
+    finish_operation(&worker, result, |applied| applied.message.clone())
 }
 
 #[tauri::command]

@@ -5039,3 +5039,182 @@ body.is-row-dragging {
     transform: none;
   }
 }
+
+/* ── 常驻操作条：服务器长操作的「现在在干什么」 ───────────────────────── */
+.operation-dock {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 26px 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper-hi);
+  color: var(--ink);
+  font-size: var(--type-label);
+}
+.operation-dock-spinner {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border-radius: 50%;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--accent);
+  animation: operation-spin 900ms linear infinite;
+}
+.operation-dock-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.operation-dock-copy b {
+  font-size: var(--type-label);
+  font-weight: 600;
+}
+.operation-dock-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: var(--type-meta);
+}
+.operation-dock-track {
+  flex: 1 1 auto;
+  min-width: 80px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+.operation-dock-track i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 180ms linear;
+}
+.operation-dock-meta {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--type-meta);
+  color: var(--muted);
+}
+.operation-dock-history {
+  position: relative;
+  flex: none;
+}
+.operation-dock-history summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: var(--type-meta);
+}
+.operation-dock-history ul {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  width: 320px;
+  margin: 0;
+  padding: 8px;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper-hi);
+  box-shadow: var(--shadow);
+}
+.operation-dock-history li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 2px;
+  font-size: var(--type-meta);
+}
+.operation-dock-history li[data-finished="false"] {
+  color: var(--accent-strong);
+}
+.operation-dock-history li small {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+@keyframes operation-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .operation-dock-spinner {
+    animation: none;
+  }
+  .operation-dock-track i {
+    transition: none;
+  }
+}
+
+/* ── 服务器库内的内联进度与上传前清单 ─────────────────────────────────── */
+.server-library-progress {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+.server-library-progress-copy {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: var(--type-meta);
+  color: var(--muted);
+}
+.server-library-progress-copy b {
+  color: var(--ink);
+  font-size: var(--type-meta);
+  font-weight: 600;
+}
+.server-library-progress-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+}
+.server-library-progress-track i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 180ms linear;
+}
+.server-library-progress small {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+.server-plan {
+  display: grid;
+  gap: 12px;
+  max-height: 46vh;
+  overflow: auto;
+}
+.server-plan section {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 8px 10px;
+  background: var(--soft-fill);
+}
+.server-plan ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: var(--type-meta);
+}
+.server-plan li {
+  overflow-wrap: anywhere;
+}
+.server-plan-note {
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: var(--type-meta);
+  line-height: 1.6;
+}
+@media (prefers-reduced-motion: reduce) {
+  .server-library-progress-track i {
+    transition: none;
+  }
+}

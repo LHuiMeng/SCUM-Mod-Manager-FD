@@ -28,6 +28,7 @@ import type {
   SftpConflictReport,
   SftpConnectionResult,
   SftpManagedManifest,
+  SftpOperationProgress,
   SftpPrepareResult,
   SftpUploadKind,
   SftpUploadProgress,
@@ -49,6 +50,11 @@ import {
 } from "./i18n";
 import { resolveFileDrop } from "./lib/fileDrop";
 import { cloudDownloadIsActive } from "./lib/cloudDownload";
+
+import {
+  applyOperationEvent,
+  emptyOperations,
+} from "./lib/operations";
 import { CLOUD_AUTO_ATTEMPTS, runCloudCatalogAttempts } from "./lib/cloudCatalog";
 import {
   buildServerLibrarySnapshot,
@@ -59,11 +65,13 @@ import {
   type ServerLibraryState,
 } from "./lib/serverLibrary";
 import { AppShell } from "./components/shell/AppShell";
+import { OperationDock } from "./components/shell/OperationDock";
 import {
   LibraryScreen,
   type ServerLibraryView,
 } from "./components/library/LibraryScreen";
 import { ImportConflictDialog } from "./components/library/ImportConflictDialog";
+import { ServerUploadPlanDialog } from "./components/library/ServerUploadPlanDialog";
 import { CloudScreen } from "./components/cloud/CloudScreen";
 import { ServerScreen } from "./components/server/ServerScreen";
 import { BackupsScreen } from "./components/backups/BackupsScreen";
@@ -157,6 +165,7 @@ function LocalizedApp() {
   const [bootError, setBootError] = useState<string | null>(null);
   const [bootAttempt, setBootAttempt] = useState(0);
   const [serverRestoreConfirm, setServerRestoreConfirm] = useState<string | null>(null);
+  const [serverPlanOpen, setServerPlanOpen] = useState(false);
   const [windowMaximized, setWindowMaximized] = useState(false);
   const bootUpdateChecked = useRef(false);
   const importPathsRef = useRef<(paths: string[]) => Promise<void>>(async () => undefined);
@@ -569,6 +578,40 @@ function LocalizedApp() {
       disposed = true;
       unlisten?.();
     };
+  }, []);
+
+  // 统一操作流：所有服务器长操作（分析/融合/上传/下载/恢复）都走这一条。
+  const [operations, setOperations] = useState(emptyOperations);
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<SftpOperationProgress>("sftp-operation-progress", (event) => {
+          setOperations((state) => applyOperationEvent(state, event.payload, Date.now()));
+        }),
+      )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // 浏览器预览：mock 用 window 事件模拟后端推送（Tauri 的 listen 在浏览器里不存在）。
+  useEffect(() => {
+    if (isTauri()) return;
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<SftpOperationProgress>).detail;
+      if (detail) setOperations((state) => applyOperationEvent(state, detail, Date.now()));
+    };
+    window.addEventListener("mock:sftp-operation-progress", handler);
+    return () => window.removeEventListener("mock:sftp-operation-progress", handler);
   }, []);
 
   useEffect(() => {
@@ -1939,6 +1982,9 @@ function LocalizedApp() {
         updateAvailable={updatePhase === "available"}
         updateVersion={updateInfo?.version ?? null}
         maximized={windowMaximized}
+        statusSlot={
+          <OperationDock current={operations.current} history={operations.history} />
+        }
         onSectionChange={(next) => {
           setSection(next);
           if (next !== "library") setSearch("");
@@ -1971,6 +2017,7 @@ function LocalizedApp() {
                       analyzing: remoteConflictLoading && !serverUploading,
                       uploading: serverUploading,
                       busy,
+                      operation: operations.current,
                       onRefresh: () => void handleServerLibraryRefresh(),
                       onPrepare: () => {
                         const view = serverLibraryViewRef.current;
@@ -1985,7 +2032,7 @@ function LocalizedApp() {
                       onEdit: handleServerLibraryEdit,
                       onDelete: handleServerLibraryDelete,
                       onUndoDeleted: handleServerLibraryUndoDeleted,
-                      onApply: () => void handleApplyServerLibrary(),
+                      onApply: () => setServerPlanOpen(true),
                       onRestore: () => void handleRestoreServerLibrary(),
                     } satisfies ServerLibraryView)
                   : null
@@ -2152,6 +2199,19 @@ function LocalizedApp() {
             ))}
           </ul>
         </Modal>
+      ) : null}
+      {serverPlanOpen && serverPrepare && serverLibraryView ? (
+        <ServerUploadPlanDialog
+          prepare={serverPrepare}
+          state={serverLibraryView.state}
+          mods={serverLibraryView.snapshot.mods}
+          busy={serverUploading}
+          onClose={() => setServerPlanOpen(false)}
+          onConfirm={() => {
+            setServerPlanOpen(false);
+            void handleApplyServerLibrary();
+          }}
+        />
       ) : null}
       {serverRestoreConfirm ? (
         <Modal

@@ -520,6 +520,24 @@ pub struct SftpUploadProgress {
     pub message: String,
 }
 
+/// 面向 UI 的统一「正在做什么」事件。所有长操作都会发一条，前端只订阅这一条流。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpOperationProgress {
+    /// analyze | prepare | apply | upload | download | restore
+    pub kind: String,
+    /// starting | downloading | parsing | uploading | applying | done | error
+    pub phase: String,
+    pub message: String,
+    pub completed: u64,
+    pub total: u64,
+    /// files | bytes | none
+    pub unit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_item: Option<String>,
+    pub finished: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportResult {

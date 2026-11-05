@@ -13,9 +13,40 @@ import type {
   RemoteFile,
   RemoteMod,
   RuntimeLog,
+  SftpOperationProgress,
 } from "../types";
 
 const now = Date.now();
+
+/** 浏览器预览用：把「后端推送」模拟成 window 事件，App 里的 mock 桥接会订阅它。 */
+export function emitMockOperation(progress: SftpOperationProgress) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("mock:sftp-operation-progress", { detail: progress }));
+}
+
+function simulateMockOperation(kind: string, message: string, totalBytes = 1_400_000_000) {
+  if (typeof window === "undefined") return;
+  const steps: Array<{ delay: number; ratio: number; label: string; finished: boolean }> = [
+    { delay: 0, ratio: 0.01, label: "正在连接服务器", finished: false },
+    { delay: 300, ratio: 0.45, label: "正在下载服务器模组", finished: false },
+    { delay: 700, ratio: 0.85, label: "正在解析 PAK 资源", finished: false },
+    { delay: 1100, ratio: 1, label: message, finished: true },
+  ];
+  for (const step of steps) {
+    window.setTimeout(() => {
+      emitMockOperation({
+        kind,
+        phase: step.finished ? "done" : "downloading",
+        message: step.label,
+        completed: Math.round(totalBytes * step.ratio),
+        total: totalBytes,
+        unit: "bytes",
+        currentItem: step.finished ? null : "Alpha.pak",
+        finished: step.finished,
+      });
+    }, step.delay);
+  }
+}
 
 function mockCover(kind: "weapons" | "vehicles" | "storage" | "weather") {
   const themes = {
@@ -816,6 +847,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       return structuredClone(remoteNotes) as T;
     }
     case "analyze_sftp_conflicts": {
+      simulateMockOperation("analyze", "冲突分析完成");
       const pakMods = remoteFiles.filter(
         (file) => !file.isDirectory && file.name.endsWith(".pak"),
       );
@@ -842,6 +874,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       } as T;
     }
     case "prepare_sftp_mod_layout": {
+      simulateMockOperation("prepare", "融合方案已生成");
       const pakMods = remoteFiles.filter(
         (file) => !file.isDirectory && file.name.endsWith(".pak"),
       );
@@ -865,6 +898,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       } as T;
     }
     case "apply_sftp_mod_layout": {
+      simulateMockOperation("apply", "服务器布局已更新");
       const pakMods = remoteFiles.filter(
         (file) => !file.isDirectory && file.name.endsWith(".pak"),
       );

@@ -218,6 +218,17 @@ export interface SftpUploadProgress {
   message: string;
 }
 
+export interface SftpOperationProgress {
+  kind: string;
+  phase: string;
+  message: string;
+  completed: number;
+  total: number;
+  unit: string;
+  currentItem?: string | null;
+  finished: boolean;
+}
+
 export interface SftpManagedSource {
   name: string;
   path: string;

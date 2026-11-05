@@ -9,6 +9,8 @@ import type {
   SftpPrepareResult,
 } from "../../types";
 import type { ServerLibraryState } from "../../lib/serverLibrary";
+import type { OperationEntry } from "../../lib/operations";
+import { operationKindKey, operationPercent } from "../../lib/operations";
 import { useI18n } from "../../i18n";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
@@ -29,6 +31,7 @@ export interface ServerLibraryView {
   analyzing: boolean;
   uploading: boolean;
   busy: boolean;
+  operation: OperationEntry | null;
   onRefresh: () => void;
   onPrepare: () => void;
   onToggle: (id: string, enabled: boolean) => void;
@@ -255,6 +258,27 @@ export function LibraryScreen({
                         ? t("serverLibrary.managedHint")
                         : t("serverLibrary.applyHint")}
               </p>
+              {server.operation ? (
+                <div className="server-library-progress" aria-live="polite">
+                  <div className="server-library-progress-copy">
+                    <b>{t(operationKindKey(server.operation.kind))}</b>
+                    <span>
+                      {server.operation.message}
+                      {server.operation.currentItem
+                        ? ` · ${server.operation.currentItem}`
+                        : ""}
+                    </span>
+                  </div>
+                  <div className="server-library-progress-track" aria-hidden="true">
+                    <i style={{ width: `${operationPercent(server.operation) ?? 0}%` }} />
+                  </div>
+                  <small>
+                    {operationPercent(server.operation) === null
+                      ? t("operation.dock.working")
+                      : `${operationPercent(server.operation)}%`}
+                  </small>
+                </div>
+              ) : null}
               {server.prepare?.hasConflicts ? (
                 <p className="server-library-provenance">
                   {t("serverLibrary.pendingUploadPrompt", {
