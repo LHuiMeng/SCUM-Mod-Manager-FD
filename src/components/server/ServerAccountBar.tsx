@@ -29,46 +29,46 @@ export function ServerAccountBar({
 
   return (
     <div className="server-account-bar">
-      <div className="server-account-bar-main">
+      <div className="server-account-bar-head">
         <span className={`sftp-connection-state ${connected ? "" : "is-offline"}`}>
           <i />
           {t(connected ? "server.accountBar.statusOn" : "server.accountBar.statusOff")}
         </span>
-        <div className="server-account-bar-controls">
-          <select
-            aria-label={t("server.selectAccount")}
-            value={active.id}
-            onChange={(event) => onSwitchAccount(event.target.value)}
-          >
-            {accounts.map((account) => (
-              <option key={account.id} value={account.id}>
-                {account.name}
-              </option>
-            ))}
-          </select>
+        <div className="server-account-bar-actions">
           <Button size="sm" icon="plus" onClick={onNewAccount}>
             {t("server.new")}
           </Button>
+          <Button size="sm" icon="settings" onClick={onManage}>
+            {t("server.manageAccount")}
+          </Button>
         </div>
-        <code className="server-account-bar-host">
-          {active.username}@{active.host}:{active.port}
-        </code>
-        <dl className="server-account-bar-roots">
-          <div>
-            <dt>PAK</dt>
-            <dd>{scan?.detectedModsPath || active.modsPath || t("server.scanNotLocated")}</dd>
-          </div>
-          <div>
-            <dt>UE4SS</dt>
-            <dd>{scan?.detectedUe4ssPath || active.ue4ssPath || t("server.scanNotLocated")}</dd>
-          </div>
-        </dl>
       </div>
-      <div className="server-account-bar-actions">
-        <Button size="sm" icon="settings" onClick={onManage}>
-          {t("server.manageAccount")}
-        </Button>
+      <div className="server-account-bar-controls">
+        <select
+          aria-label={t("server.selectAccount")}
+          value={active.id}
+          onChange={(event) => onSwitchAccount(event.target.value)}
+        >
+          {accounts.map((account) => (
+            <option key={account.id} value={account.id}>
+              {account.name}
+            </option>
+          ))}
+        </select>
       </div>
+      <code className="server-account-bar-host">
+        {active.username}@{active.host}:{active.port}
+      </code>
+      <dl className="server-account-bar-roots">
+        <div>
+          <dt>PAK</dt>
+          <dd>{scan?.detectedModsPath || active.modsPath || t("server.scanNotLocated")}</dd>
+        </div>
+        <div>
+          <dt>UE4SS</dt>
+          <dd>{scan?.detectedUe4ssPath || active.ue4ssPath || t("server.scanNotLocated")}</dd>
+        </div>
+      </dl>
     </div>
   );
 }

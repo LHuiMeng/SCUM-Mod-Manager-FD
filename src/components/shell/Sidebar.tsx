@@ -2,10 +2,11 @@ import type { NavSection } from "../../types";
 import { useI18n } from "../../i18n";
 import { Icon, type IconName } from "../ui/Icon";
 
-const items: Array<{ id: NavSection; labelKey: "nav.library" | "nav.cloud" | "nav.server" | "nav.logs"; icon: IconName }> = [
+const items: Array<{ id: NavSection; labelKey: "nav.library" | "nav.cloud" | "nav.server" | "nav.backups" | "nav.logs"; icon: IconName }> = [
   { id: "library", labelKey: "nav.library", icon: "box" },
   { id: "cloud", labelKey: "nav.cloud", icon: "cloud" },
   { id: "server", labelKey: "nav.server", icon: "server" },
+  { id: "backups", labelKey: "nav.backups", icon: "refresh" },
   { id: "logs", labelKey: "nav.logs", icon: "log" },
 ];
 

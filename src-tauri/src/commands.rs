@@ -1,13 +1,16 @@
 use crate::app_update;
+use crate::backups;
 use crate::cloud;
+use crate::crash;
 use crate::launcher;
 use crate::models::{
     AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, ConflictMergeResult,
     DetectPathsResult, DownloadResult, GameStatus, ImportConflict, ImportResult,
     InstallUpdateResult, LibrarySnapshot, LocaleBundle, RemoteFile, RemoteMod, RuntimeLog,
     SftpAccountInput, SftpApplyResult, SftpConflictReport, SftpConnectionResult,
-    SftpOperationResult, UploadResult,
+    SftpOperationResult, SftpPrepareResult, UploadResult,
 };
+use crate::mods::links::PendingLink;
 use crate::paths::path_string;
 use crate::sftp;
 use crate::state::AppState;
@@ -686,11 +689,46 @@ pub async fn analyze_sftp_conflicts(
 }
 
 #[tauri::command]
+pub async fn prepare_sftp_mod_layout(
+    app: AppHandle,
+    account_id: String,
+    order: Vec<String>,
+    disabled: Vec<String>,
+    deleted: Vec<String>,
+    winners: BTreeMap<String, String>,
+) -> Result<SftpPrepareResult, String> {
+    let progress_app = app.clone();
+    let progress: sftp::SftpConflictProgressCallback = Arc::new(move |payload| {
+        let _ = progress_app.emit("sftp-conflict-progress", payload);
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        let result = sftp::prepare_remote_layout(
+            &state.paths,
+            &settings,
+            &account_id,
+            &order,
+            &disabled,
+            &deleted,
+            &winners,
+            progress,
+        )?;
+        state.log("info", "sftp", &result.message);
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
 pub async fn apply_sftp_mod_layout(
     app: AppHandle,
     account_id: String,
     order: Vec<String>,
     disabled: Vec<String>,
+    deleted: Vec<String>,
     winners: BTreeMap<String, String>,
 ) -> Result<SftpApplyResult, String> {
     let progress_app = app.clone();
@@ -706,6 +744,7 @@ pub async fn apply_sftp_mod_layout(
             &account_id,
             &order,
             &disabled,
+            &deleted,
             &winners,
             progress,
         )?;
@@ -735,6 +774,69 @@ pub async fn restore_sftp_mod_layout(
 }
 
 #[tauri::command]
+pub fn get_pending_links(state: State<'_, AppState>) -> Vec<PendingLink> {
+    state.pending_links()
+}
+
+#[tauri::command]
+pub fn reclaim_pending_links(state: State<'_, AppState>) -> Result<usize, String> {
+    state.reclaim_pending_links().map_err(error_text)
+}
+
+#[tauri::command]
+pub fn dismiss_pending_links(state: State<'_, AppState>) {
+    state.dismiss_pending_links();
+}
+
+#[tauri::command]
+pub async fn list_backups(app: AppHandle) -> Result<Vec<backups::BackupEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        backups::list_backups(&state.paths)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn restore_backup(app: AppHandle, id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let message =
+            backups::restore_backup(&state.paths, &id, crate::launcher::is_running(&state))?;
+        state.log("info", "backup", &message);
+        Ok::<_, anyhow::Error>(message)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn delete_backup(app: AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        backups::remove_backup(&state.paths, &id)?;
+        state.log("info", "backup", "已删除一个本地备份");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub fn get_last_crash(state: State<'_, AppState>) -> Option<crash::CrashReport> {
+    state.last_crash()
+}
+
+#[tauri::command]
+pub fn dismiss_crash(state: State<'_, AppState>) {
+    let _ = state.take_last_crash();
+}
+
+#[tauri::command]
 pub fn window_minimize(window: WebviewWindow) -> Result<(), String> {
     window.minimize().map_err(error_text)
 }
@@ -749,8 +851,30 @@ pub fn window_toggle_maximize(window: WebviewWindow) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn window_close(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
-    app.state::<AppState>().shutdown_cleanup();
+pub async fn window_close(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    let emit_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AppState>().shutdown_cleanup_notified(|wait| {
+            let file_name = std::path::Path::new(&wait.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| wait.path.clone());
+            let _ = emit_app.emit(
+                "reclaim-progress",
+                serde_json::json!({
+                    "phase": if wait.waited_ms == 0 { "waiting" } else { "still-waiting" },
+                    "file": file_name,
+                    "waitedMs": wait.waited_ms,
+                    "message": format!(
+                        "正在回收 {file_name}，文件被占用，已等待 {} 秒",
+                        wait.waited_ms / 1000
+                    ),
+                }),
+            );
+        });
+    })
+    .await
+    .map_err(error_text)?;
     window.close().map_err(error_text)
 }
 

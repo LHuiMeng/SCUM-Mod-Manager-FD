@@ -2,10 +2,11 @@ import type { GameStatus, NavSection, ThemeMode } from "../../types";
 import { useI18n } from "../../i18n";
 import { Icon } from "../ui/Icon";
 
-const titleKeys: Record<NavSection, "page.library" | "page.cloud" | "page.server" | "page.logs" | "page.settings"> = {
+const titleKeys: Record<NavSection, "page.library" | "page.cloud" | "page.server" | "page.backups" | "page.logs" | "page.settings"> = {
   library: "page.library",
   cloud: "page.cloud",
   server: "page.server",
+  backups: "page.backups",
   logs: "page.logs",
   settings: "page.settings",
 };

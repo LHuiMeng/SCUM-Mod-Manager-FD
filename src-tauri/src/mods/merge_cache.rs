@@ -541,13 +541,9 @@ mod tests {
             &metadata,
             &[alpha_reimported.clone(), beta_reimported.clone()],
         );
-        let second = create_plan(
-            &[alpha_reimported, beta_reimported],
-            &analysis,
-            &metadata,
-        )
-        .unwrap()
-        .unwrap();
+        let second = create_plan(&[alpha_reimported, beta_reimported], &analysis, &metadata)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             first.fingerprint(),

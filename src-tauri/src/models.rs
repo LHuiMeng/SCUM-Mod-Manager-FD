@@ -474,6 +474,24 @@ pub struct SftpManagedManifest {
     pub renames: Vec<SftpManagedRename>,
     pub created_paths: Vec<String>,
     pub winners: std::collections::BTreeMap<String, String>,
+    /// 融合溯源文件在服务器上的路径（合并包 → 原模组）。恢复布局时不删除。
+    #[serde(default)]
+    pub provenance_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpPrepareResult {
+    pub required: bool,
+    pub has_conflicts: bool,
+    pub analyzed_mods: usize,
+    pub merged_sources: Vec<SftpManagedSource>,
+    pub backup_count: usize,
+    pub delete_count: usize,
+    pub rename_count: usize,
+    pub merged_bytes: u64,
+    pub provenance_path: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,6 +9,7 @@ import { Tag } from "../ui/Tag";
 interface ModInspectorProps {
   mod: ModEntry | null;
   serverMode?: boolean;
+  readOnly?: boolean;
   onEdit: () => void;
   onDelete: () => void;
   onOpenFolder: () => void;
@@ -18,6 +19,7 @@ interface ModInspectorProps {
 export function ModInspector({
   mod,
   serverMode = false,
+  readOnly = false,
   onEdit,
   onDelete,
   onOpenFolder,
@@ -98,7 +100,7 @@ export function ModInspector({
             <Tag>{t("common.uncategorized")}</Tag>
           )}
         </div>
-        {!serverMode ? (
+        {!readOnly ? (
           <Button className="detail-action" trailingIcon="edit" onClick={onEdit}>
             {t("inspector.edit")}
           </Button>
@@ -222,7 +224,7 @@ export function ModInspector({
             </>
           )}
         </div>
-        {!serverMode ? (
+        {!readOnly ? (
           <Button
             className="inspector-delete-button"
             size="sm"

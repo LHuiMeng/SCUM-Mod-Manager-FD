@@ -79,7 +79,48 @@ fn strip_deployed_pak_prefix(file_name: &str) -> Option<&str> {
     extension.eq_ignore_ascii_case("pak").then_some(original)
 }
 
+/// 回收时遇到的占用等待信息。前端用它提示“正在回收，请稍候”。
+#[derive(Debug, Clone)]
+pub struct ReclaimWait {
+    pub path: String,
+    pub waited_ms: u64,
+}
+
+/// 文件被游戏/杀软占用时的最长等待时间。dwmapi.dll 常在进程刚退出时还被短暂持有。
+const RECLAIM_WAIT_MS: u64 = 30_000;
+const RECLAIM_POLL_MS: u64 = 500;
+
+fn is_retryable_lock(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
+fn remove_file_waiting(file: &Path, on_wait: &mut impl FnMut(&ReclaimWait)) -> std::io::Result<()> {
+    let mut waited = 0u64;
+    loop {
+        match std::fs::remove_file(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_lock(&error) && waited < RECLAIM_WAIT_MS => {
+                on_wait(&ReclaimWait {
+                    path: path_string(file),
+                    waited_ms: waited,
+                });
+                std::thread::sleep(std::time::Duration::from_millis(RECLAIM_POLL_MS));
+                waited += RECLAIM_POLL_MS;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
+    reclaim_mods_with_wait(paths, |_| {})
+}
+
+/// 回收部署文件；文件被占用时最多等待 [`RECLAIM_WAIT_MS`]，期间通过 `on_wait` 上报。
+pub fn reclaim_mods_with_wait(
+    paths: &AppPaths,
+    mut on_wait: impl FnMut(&ReclaimWait),
+) -> Result<usize> {
     let Some(manifest) = read_manifest(paths) else {
         return Ok(0);
     };
@@ -99,7 +140,7 @@ pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
             continue;
         }
         if file.exists() {
-            match std::fs::remove_file(&file) {
+            match remove_file_waiting(&file, &mut on_wait) {
                 Ok(()) => removed += 1,
                 Err(error) => {
                     failures.push(format!("无法删除 {}：{error}", file.display()));
@@ -779,9 +820,8 @@ fn link_ue4ss_framework(
     backup_root: &Path,
 ) -> Result<()> {
     if crate::mods::links::is_junction(link) {
-        crate::mods::links::ensure_junction(link, library).with_context(|| {
-            format!("无法把 {} 指向 {}", link.display(), library.display())
-        })?;
+        crate::mods::links::ensure_junction(link, library)
+            .with_context(|| format!("无法把 {} 指向 {}", link.display(), library.display()))?;
     } else if link.exists() {
         if !link.is_dir() {
             bail!("UE4SS 运行时目录不是文件夹：{}", link.display());
@@ -793,10 +833,7 @@ fn link_ue4ss_framework(
             crate::mods::links::remove_junction(&mods)?;
         }
         std::fs::create_dir_all(backup_root)?;
-        let retired = backup_root.join(format!(
-            "ue4ss-{}.bak",
-            Utc::now().format("%Y%m%d%H%M%S")
-        ));
+        let retired = backup_root.join(format!("ue4ss-{}.bak", Utc::now().format("%Y%m%d%H%M%S")));
         if std::fs::rename(link, &retired).is_err() {
             super::copy_tree(link, &retired).with_context(|| {
                 format!(
@@ -808,13 +845,11 @@ fn link_ue4ss_framework(
             std::fs::remove_dir_all(link)
                 .with_context(|| format!("无法移除旧 UE4SS 目录 {}", link.display()))?;
         }
-        crate::mods::links::ensure_junction(link, library).with_context(|| {
-            format!("无法把 {} 指向 {}", link.display(), library.display())
-        })?;
+        crate::mods::links::ensure_junction(link, library)
+            .with_context(|| format!("无法把 {} 指向 {}", link.display(), library.display()))?;
     } else {
-        crate::mods::links::ensure_junction(link, library).with_context(|| {
-            format!("无法把 {} 指向 {}", link.display(), library.display())
-        })?;
+        crate::mods::links::ensure_junction(link, library)
+            .with_context(|| format!("无法把 {} 指向 {}", link.display(), library.display()))?;
     }
     if !manifest
         .links
@@ -876,9 +911,8 @@ fn place_file_record(
         manifest.files.push(path_string(target));
     }
     if use_links {
-        crate::mods::links::link_or_copy(source, target).with_context(|| {
-            format!("无法链接 {} 到 {}", source.display(), target.display())
-        })?;
+        crate::mods::links::link_or_copy(source, target)
+            .with_context(|| format!("无法链接 {} 到 {}", source.display(), target.display()))?;
     } else {
         std::fs::copy(source, target)
             .with_context(|| format!("无法复制 {} 到 {}", source.display(), target.display()))?;
@@ -1023,7 +1057,7 @@ pub fn sync_ue4ss_state(paths: &AppPaths, mods: &[ModEntry]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deployment_fingerprint, deploy_local_mods, read_manifest, reclaim_mods,
+        deploy_local_mods, deployment_fingerprint, read_manifest, reclaim_mods,
         rescue_mods_from_game, sync_ue4ss_state, DeployedManifest,
     };
     use crate::metadata::{save_metadata, MetadataFile};
@@ -1187,7 +1221,10 @@ mod tests {
         };
         deploy_local_mods(&paths, &copy_settings, &mods, false).unwrap();
         assert!(!crate::mods::links::is_junction(&pak_dir));
-        assert_eq!(fs::read(pak_dir.join("000_TestWeapon.pak")).unwrap(), b"pak-content");
+        assert_eq!(
+            fs::read(pak_dir.join("000_TestWeapon.pak")).unwrap(),
+            b"pak-content"
+        );
         assert!(source.is_file());
     }
 
@@ -1257,17 +1294,28 @@ mod tests {
             crate::mods::links::junction_target(&link).unwrap(),
             framework
         );
-        assert!(link.join("UE4SS.dll").is_file(), "框架 DLL 必须走链接，不是复制");
+        assert!(
+            link.join("UE4SS.dll").is_file(),
+            "框架 DLL 必须走链接，不是复制"
+        );
         assert!(link.join("UE4SS-settings.ini").is_file());
         assert!(
             binaries.join("dwmapi.dll").is_file(),
             "只有加载器 DLL 需要落在 exe 同目录"
         );
-        assert!(link.join("Mods").join("BetterAI").join("Scripts").join("main.lua").is_file());
+        assert!(link
+            .join("Mods")
+            .join("BetterAI")
+            .join("Scripts")
+            .join("main.lua")
+            .is_file());
 
         reclaim_mods(&paths).unwrap();
 
-        assert!(!crate::mods::links::is_junction(&link), "回收要断开 UE4SS 链接");
+        assert!(
+            !crate::mods::links::is_junction(&link),
+            "回收要断开 UE4SS 链接"
+        );
         assert!(!link.exists());
         assert!(!binaries.join("dwmapi.dll").exists(), "加载器副本也要回收");
         assert!(
@@ -1303,7 +1351,10 @@ mod tests {
             error.to_string().contains("非本管理器部署"),
             "应为明确的接管拒绝：{error}"
         );
-        assert!(pak_dir.join("HandInstalled.pak").is_file(), "用户文件必须保留");
+        assert!(
+            pak_dir.join("HandInstalled.pak").is_file(),
+            "用户文件必须保留"
+        );
         assert!(!crate::mods::links::is_junction(&pak_dir));
     }
 
@@ -2243,13 +2294,13 @@ mod tests {
         reimported.last_modified = "2026-06-01T00:00:00Z".to_string();
 
         assert_eq!(
-            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[alpha.clone()], None),
             deployment_fingerprint(
                 std::path::Path::new("C:/game"),
                 false,
-                &[reimported],
+                &[alpha.clone()],
                 None
             ),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[reimported], None),
             "同内容重导入不应让部署指纹失效"
         );
 
@@ -2301,18 +2352,8 @@ mod tests {
         );
 
         assert_ne!(
-            deployment_fingerprint(
-                std::path::Path::new("C:/game"),
-                false,
-                &canonical_a,
-                None
-            ),
-            deployment_fingerprint(
-                std::path::Path::new("C:/game"),
-                false,
-                &canonical_b,
-                None
-            ),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &canonical_a, None),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &canonical_b, None),
             "canonical 不同（部署文件名不同）时指纹必须不同"
         );
     }

@@ -33,9 +33,16 @@ pub fn is_junction(path: &Path) -> bool {
     }
 }
 
+/// 路径是不是重解析点（junction / 符号链接），目标不存在时也返回 true。
+pub fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 /// 读 junction 指向的目标；不是 junction 时返回 None。
 pub fn junction_target(path: &Path) -> Option<PathBuf> {
-    if !is_junction(path) {
+    if !is_link(path) {
         return None;
     }
     std::fs::read_link(path)
@@ -81,10 +88,7 @@ pub fn ensure_junction(link: &Path, target: &Path) -> io::Result<EnsureOutcome> 
     if link.exists() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!(
-                "{} 已存在且是真实目录，无法替换为链接",
-                link.display()
-            ),
+            format!("{} 已存在且是真实目录，无法替换为链接", link.display()),
         ));
     }
     create_junction(link, target)?;
@@ -97,6 +101,102 @@ pub fn remove_junction(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     std::fs::remove_dir(path)
+}
+
+/// 启动时检测到的、由本管理器建立但尚未回收的目录链接。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingLink {
+    pub path: String,
+    pub target: String,
+    /// pak / ue4ss / ue4ss-mods
+    pub kind: String,
+}
+
+fn link_candidates(install: &str) -> Vec<(PathBuf, &'static str)> {
+    let root = PathBuf::from(install.trim());
+    vec![
+        (
+            root.join("SCUM").join("Content").join("Paks").join("~mods"),
+            "pak",
+        ),
+        (root.join("Content").join("Paks").join("~mods"), "pak"),
+        (
+            root.join("SCUM")
+                .join("Binaries")
+                .join("Win64")
+                .join("ue4ss"),
+            "ue4ss",
+        ),
+        (root.join("Binaries").join("Win64").join("ue4ss"), "ue4ss"),
+        (
+            root.join("SCUM")
+                .join("Binaries")
+                .join("Win64")
+                .join("ue4ss")
+                .join("Mods"),
+            "ue4ss-mods",
+        ),
+        (
+            root.join("Binaries")
+                .join("Win64")
+                .join("ue4ss")
+                .join("Mods"),
+            "ue4ss-mods",
+        ),
+    ]
+}
+
+/// 找出指向启动器数据目录、但可能因异常关机没被回收的 junction。
+///
+/// 只认目标落在 `{app-data}` 内的链接：用户自己建的、指向别处的链接一律不碰，
+/// 也不提示，避免误删。
+pub fn find_pending_links(paths: &crate::paths::AppPaths, installs: &[String]) -> Vec<PendingLink> {
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for install in installs {
+        if install.trim().is_empty() {
+            continue;
+        }
+        for (candidate, kind) in link_candidates(install) {
+            let key = candidate.to_string_lossy().to_ascii_lowercase();
+            if !seen.insert(key) {
+                continue;
+            }
+            let Some(target) = junction_target(&candidate) else {
+                continue;
+            };
+            if !crate::paths::is_within(&target, &paths.root) {
+                continue;
+            }
+            found.push(PendingLink {
+                path: crate::paths::path_string(&candidate),
+                target: crate::paths::path_string(&target),
+                kind: kind.to_string(),
+            });
+        }
+    }
+    found
+}
+
+/// 回收上面找到的链接；只删 junction 本身，不动目标目录里的任何文件。
+pub fn reclaim_pending_links(
+    paths: &crate::paths::AppPaths,
+    installs: &[String],
+) -> io::Result<usize> {
+    let mut links = find_pending_links(paths, installs);
+    // 先删深层链接：父目录链接被删掉后，子路径自然不存在，避免重复删除报错。
+    links.sort_by_key(|link| std::cmp::Reverse(link.path.len()));
+    let mut removed = 0;
+    for link in links {
+        let path = PathBuf::from(&link.path);
+        if !is_link(&path) {
+            continue;
+        }
+        remove_junction(&path)?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// 同卷用硬链接（0 拷贝、无需权限），跨卷自动退回复制。
@@ -233,10 +333,8 @@ mod tests {
 
     impl TempRoot {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "scum-mod-links-{label}-{}",
-                uuid::Uuid::new_v4()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("scum-mod-links-{label}-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -284,9 +382,18 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         let link = temp.path().join("link");
 
-        assert_eq!(ensure_junction(&link, &first).unwrap(), EnsureOutcome::Created);
-        assert_eq!(ensure_junction(&link, &first).unwrap(), EnsureOutcome::Unchanged);
-        assert_eq!(ensure_junction(&link, &second).unwrap(), EnsureOutcome::Replaced);
+        assert_eq!(
+            ensure_junction(&link, &first).unwrap(),
+            EnsureOutcome::Created
+        );
+        assert_eq!(
+            ensure_junction(&link, &first).unwrap(),
+            EnsureOutcome::Unchanged
+        );
+        assert_eq!(
+            ensure_junction(&link, &second).unwrap(),
+            EnsureOutcome::Replaced
+        );
         assert!(same_path(&junction_target(&link).unwrap(), &second));
     }
 

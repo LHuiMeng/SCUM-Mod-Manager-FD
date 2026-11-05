@@ -6,6 +6,7 @@ import type {
   ModEntry,
   NavSection,
   SftpManagedManifest,
+  SftpPrepareResult,
 } from "../../types";
 import type { ServerLibraryState } from "../../lib/serverLibrary";
 import { useI18n } from "../../i18n";
@@ -23,11 +24,17 @@ export interface ServerLibraryView {
   snapshot: LibrarySnapshot;
   state: ServerLibraryState;
   manifest: SftpManagedManifest | null;
+  prepare: SftpPrepareResult | null;
+  preparing: boolean;
   busy: boolean;
   onRefresh: () => void;
+  onPrepare: () => void;
   onToggle: (id: string, enabled: boolean) => void;
   onReorder: (ids: string[]) => void;
   onSaveConflictWinners: (winners: Record<string, string>) => Promise<boolean>;
+  onEdit: (id: string, tags: string[], notes: string) => Promise<boolean>;
+  onDelete: (id: string) => Promise<boolean>;
+  onUndoDeleted: () => void;
   onApply: () => void;
   onRestore: () => void;
 }
@@ -149,7 +156,7 @@ export function LibraryScreen({
   return (
     <div className="library-layout">
       <section className="library-main">
-        <div className="page-heading">
+        <div className="page-heading library-heading">
           <div>
             <h1>{t(serverMode ? "serverLibrary.title" : "library.title")}</h1>
             <p>{t(serverMode ? "serverLibrary.subtitle" : "library.subtitle")}</p>
@@ -191,22 +198,29 @@ export function LibraryScreen({
               )}
             />
             {serverMode && server ? (
-              <Button
-                icon="refresh"
-                onClick={server.onRefresh}
-                disabled={server.busy}
-              >
-                {t("serverLibrary.refresh")}
-              </Button>
+              <span className="heading-actions">
+                {!server.manifest && !server.prepare && !server.preparing ? (
+                  <Button icon="upload" onClick={server.onPrepare} disabled={server.busy}>
+                    {t("serverLibrary.prepareUpload")}
+                  </Button>
+                ) : null}
+                <Button
+                  icon="refresh"
+                  onClick={server.onRefresh}
+                  disabled={server.busy}
+                >
+                  {t("serverLibrary.refresh")}
+                </Button>
+              </span>
             ) : (
-              <>
+              <span className="heading-actions">
                 <Button icon="folder" onClick={onScan}>
                   {t("library.scan")}
                 </Button>
                 <Button icon="plus" onClick={onImport}>
                   {t("library.import")}
                 </Button>
-              </>
+              </span>
             )}
           </div>
         </div>
@@ -221,18 +235,42 @@ export function LibraryScreen({
               </span>
               <b>{serverStatusTitle}</b>
               <p>
-                {server.manifest?.sources.length
-                  ? t("serverLibrary.mergedSources", {
-                      sources: server.manifest.sources
-                        .map((source) => source.name)
-                        .join("、"),
-                    })
-                  : server.manifest
-                    ? t("serverLibrary.managedHint")
-                    : t("serverLibrary.applyHint")}
+                {server.preparing
+                  ? t("serverLibrary.preparingHint")
+                  : server.prepare
+                    ? server.prepare.message
+                    : server.manifest?.sources.length
+                      ? t("serverLibrary.mergedSources", {
+                          sources: server.manifest.sources
+                            .map((source) => source.name)
+                            .join("、"),
+                        })
+                      : server.manifest
+                        ? t("serverLibrary.managedHint")
+                        : t("serverLibrary.applyHint")}
               </p>
+              {server.prepare?.hasConflicts ? (
+                <p className="server-library-provenance">
+                  {t("serverLibrary.pendingUploadPrompt", {
+                    sources: server.prepare.mergedSources
+                      .map((source) => source.name)
+                      .join("、"),
+                  })}
+                </p>
+              ) : null}
             </div>
             <div className="server-library-strip-actions">
+              {server.state.deleted.length > 0 ? (
+                <Button
+                  icon="refresh"
+                  onClick={server.onUndoDeleted}
+                  disabled={server.busy}
+                >
+                  {t("serverLibrary.undoDelete", {
+                    count: server.state.deleted.length,
+                  })}
+                </Button>
+              ) : null}
               {server.manifest ? (
                 <Button
                   icon="refresh"
@@ -241,22 +279,26 @@ export function LibraryScreen({
                 >
                   {t("serverLibrary.restore")}
                 </Button>
-              ) : null}
-              <Button
-                variant="primary"
-                icon="upload"
-                onClick={server.onApply}
-                disabled={server.busy || mods.length === 0 || Boolean(server.manifest)}
-                title={
-                  server.manifest
-                    ? t("serverLibrary.restoreBeforeApply")
-                    : undefined
-                }
-              >
-                {server.busy
-                  ? t("serverLibrary.applying")
-                  : t("serverLibrary.apply")}
-              </Button>
+              ) : server.preparing ? (
+                <span className="server-library-plan-state">
+                  {t("serverLibrary.preparing")}
+                </span>
+              ) : server.prepare?.required ? (
+                <Button
+                  variant="primary"
+                  icon="upload"
+                  onClick={server.onApply}
+                  disabled={server.busy || mods.length === 0}
+                >
+                  {server.busy
+                    ? t("serverLibrary.uploading")
+                    : t("serverLibrary.upload")}
+                </Button>
+              ) : (
+                <span className="server-library-plan-state">
+                  {t("serverLibrary.noPendingUpload")}
+                </span>
+              )}
             </div>
           </section>
         ) : (
@@ -328,6 +370,7 @@ export function LibraryScreen({
         key={`${serverMode ? "server" : "local"}-${visibleSelected?.id ?? "empty"}`}
         mod={visibleSelected}
         serverMode={serverMode}
+        readOnly={Boolean(serverMode && server?.manifest)}
         onEdit={() => visibleSelected && setEditing(visibleSelected)}
         onDelete={() => visibleSelected && setDeleting(visibleSelected)}
         onOpenFolder={() => visibleSelected && onOpenFolder(visibleSelected.id)}
@@ -344,15 +387,23 @@ export function LibraryScreen({
         />
       ) : null}
 
-      {!serverMode && editing ? (
+      {editing ? (
         <ModEditPanel
           mod={editing}
-          onSave={(tags, notes) => onEdit(editing.id, tags, notes)}
+          onSave={async (tags, notes) => {
+            if (serverMode && server) {
+              const saved = await server.onEdit(editing.id, tags, notes);
+              if (saved) setEditing(null);
+              return;
+            }
+            await onEdit(editing.id, tags, notes);
+            setEditing(null);
+          }}
           onClose={() => setEditing(null)}
         />
       ) : null}
 
-      {!serverMode && deleting ? (
+      {deleting ? (
         <Modal
           title={t("inspector.deleteTitle")}
           description={t(
@@ -394,7 +445,10 @@ export function LibraryScreen({
                       await new Promise((resolve) =>
                         window.setTimeout(resolve, removeDelay),
                       );
-                      const deleted = await onDelete(deleting.id);
+                      const deleted =
+                        serverMode && server
+                          ? await server.onDelete(deleting.id)
+                          : await onDelete(deleting.id);
                       if (deleted) setDeleting(null);
                     } finally {
                       setDeleteBusy(false);
@@ -409,9 +463,11 @@ export function LibraryScreen({
           }
         >
           <p className="delete-confirm-note">
-            {gameStatus.running
-              ? t("inspector.deleteRunning")
-              : t("inspector.deleteBackupNote")}
+            {serverMode
+              ? t("serverLibrary.deletePendingNote")
+              : gameStatus.running
+                ? t("inspector.deleteRunning")
+                : t("inspector.deleteBackupNote")}
           </p>
         </Modal>
       ) : null}

@@ -211,6 +211,7 @@ async function connect(url, appUrl) {
       模组库: "模组库",
       云端: "云端目录",
       服务器: "远程服务器",
+      备份找回: "备份找回",
       日志: "运行日志",
       设置: "设置",
     }[label];
@@ -357,16 +358,31 @@ async function connect(url, appUrl) {
     })()`);
     if (!setup) throw new Error("拖拽回归需要至少三个模组");
 
-    await evaluate(`window.dispatchEvent(new PointerEvent("pointermove", {
-      bubbles: true,
-      cancelable: true,
-      pointerId: 41,
-      pointerType: "mouse",
-      isPrimary: true,
-      buttons: 1,
-      clientX: window.__dragPoint.x,
-      clientY: window.__dragPoint.targetY,
-    }))`);
+    await evaluate(`(() => {
+      window.dispatchEvent(new PointerEvent("pointermove", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 41,
+        pointerType: "mouse",
+        isPrimary: true,
+        buttons: 1,
+        clientX: window.__dragPoint.x,
+        clientY: window.__dragPoint.targetY,
+      }));
+      // 在页面内逐帧采样，避免 CDP 往返时延把 320ms 过渡整个跳过。
+      window.__dragSamples = [];
+      const capture = () => {
+        const row = document.querySelector(".mod-row.is-drag-shift-up, .mod-row.is-drag-shift-down");
+        if (!row) return;
+        window.__dragSamples.push(getComputedStyle(row).transform);
+      };
+      requestAnimationFrame(() => {
+        capture();
+        requestAnimationFrame(capture);
+        setTimeout(capture, 80);
+        setTimeout(capture, 340);
+      });
+    })()`);
     await waitFor("document.querySelector('.mod-row.is-dragging') !== null");
     await waitFor("document.querySelector('.mod-drop-indicator') !== null");
     const preview = await evaluate(`(() => {
@@ -401,15 +417,12 @@ async function connect(url, appUrl) {
     if (!preview.footText.includes("释放到第 03 位") || preview.live !== "polite") {
       throw new Error(`拖拽状态反馈异常：${JSON.stringify(preview)}`);
     }
-    const transitionSamples = [];
-    for (const delay of [0, 90, 320]) {
-      if (delay > 0) await wait(delay);
-      transitionSamples.push(
-        await evaluate(`getComputedStyle(
-          document.querySelector(".mod-row.is-drag-shift-up, .mod-row.is-drag-shift-down")
-        ).transform`),
-      );
-    }
+    await wait(420);
+    const transitionSamples = await evaluate("window.__dragSamples ?? []");
+    const settledTransform = await evaluate(`getComputedStyle(
+      document.querySelector(".mod-row.is-drag-shift-up, .mod-row.is-drag-shift-down")
+    ).transform`);
+    transitionSamples.push(settledTransform);
     if (new Set(transitionSamples).size < 2) {
       throw new Error(`让位过程没有连续过渡：${JSON.stringify(transitionSamples)}`);
     }
@@ -966,6 +979,7 @@ async function connect(url, appUrl) {
     );
     await clickText("服务器模组", ".library-source-switch button");
     await waitFor("document.querySelector('h1')?.innerText === '服务器模组库'");
+    screenshots.push(await screenshot("1440-light-server-library"));
     await waitFor("document.querySelectorAll('.mod-row').length >= 4");
 
     const initialOrder = await evaluate(
@@ -1012,7 +1026,19 @@ async function connect(url, appUrl) {
     await waitFor("document.querySelector('.conflict-panel') === null");
     await waitFor("document.body.innerText.includes('覆盖选择已保存')");
 
-    await clickText("备份并应用合并");
+    // 改动排序/冲突选择后，后台会先下载分析并融合，完成后才出现上传按钮。
+    await waitFor(
+      "[...document.querySelectorAll('button')].some(button => button.innerText.includes('上传到服务器'))",
+      15000,
+    );
+    const pendingPrompt = await evaluate(
+      "document.querySelector('.server-library-provenance')?.innerText ?? ''",
+    );
+    if (!pendingPrompt.includes("未上传")) {
+      throw new Error(`融合完成后没有提示待上传：${pendingPrompt}`);
+    }
+    screenshots.push(await screenshot("1440-light-server-library-ready"));
+    await clickText("上传到服务器");
     await waitFor("document.body.innerText.includes('服务器布局已应用')", 10000);
     await waitFor(
       "document.body.innerText.includes('服务器已应用托管布局') && document.body.innerText.includes('SCUM Mod Desk 合并模组')",
@@ -1027,18 +1053,11 @@ async function connect(url, appUrl) {
     ) {
       throw new Error(`服务器模组库未显示合并来源：${managedCopy}`);
     }
-    await waitFor(`(() => {
-      const button = [...document.querySelectorAll("button")]
-        .find(item => item.innerText.includes("备份并应用合并"));
-      return Boolean(button?.disabled);
-    })()`, 10000);
-    const applyDisabled = await evaluate(`(() => {
-      const button = [...document.querySelectorAll("button")]
-        .find(item => item.innerText.includes("备份并应用合并"));
-      return Boolean(button?.disabled);
-    })()`);
-    if (!applyDisabled) {
-      throw new Error("已有托管布局时仍可重复应用，可能覆盖原始排序");
+    const restoreAvailable = await evaluate(
+      "[...document.querySelectorAll('button')].some(button => button.innerText.includes('恢复服务器原状'))",
+    );
+    if (!restoreAvailable) {
+      throw new Error("应用后没有出现恢复服务器原状的入口");
     }
     screenshots.push(await screenshot("1440-light-server-library-merged"));
     await send("Emulation.setDeviceMetricsOverride", {
@@ -1136,7 +1155,7 @@ async function connect(url, appUrl) {
       initialOrder,
       reordered,
       managedCopy,
-      applyDisabled,
+      restoreAvailable,
       localFirstId,
     };
   });
@@ -1175,7 +1194,17 @@ async function connect(url, appUrl) {
     if (!selectedRow) {
       throw new Error("文件树中没有可选择文件");
     }
-    await waitFor("document.querySelector('.remote-file-selection') !== null");
+    try {
+      await waitFor("document.querySelector('.remote-file-selection') !== null", 3000);
+    } catch {
+      // 偶发：文件树在 mock 刷新时重渲染，第一次点击落在旧节点上。再点一次。
+      await evaluate(`(() => {
+        const row = [...document.querySelectorAll(".remote-file-row")]
+          .find(item => !item.classList.contains("is-browsable"));
+        row?.click();
+      })()`);
+      await waitFor("document.querySelector('.remote-file-selection') !== null", 5000);
+    }
     const selectedFile = await evaluate(`(() => ({
       text: document.querySelector(".remote-file-selection")?.innerText ?? "",
       download: Boolean(document.querySelector(".remote-file-selection button")),
@@ -1262,6 +1291,24 @@ async function connect(url, appUrl) {
 
     screenshots.push(await screenshot("1440-light-server-file-ops"));
     return { initial, rowActions, rowBefore };
+  });
+
+  await test("备份找回入口、类型筛选与空态", async () => {
+    await navigate("备份找回");
+    await waitFor("document.querySelector('h1')?.innerText === '备份找回'");
+    const filters = await evaluate(
+      "[...document.querySelectorAll('.backups-filters button')].map(button => button.innerText)",
+    );
+    for (const label of ["全部", "删除的模组", "导入覆盖", "下载覆盖", "部署覆盖"]) {
+      if (!filters.includes(label)) {
+        throw new Error(`备份筛选缺少「${label}」：${JSON.stringify(filters)}`);
+      }
+    }
+    await waitFor("document.body.innerText.includes('没有可找回的备份')");
+    await clickText("刷新", ".page-header button");
+    await waitFor("document.body.innerText.includes('没有可找回的备份')");
+    screenshots.push(await screenshot("1440-light-backups"));
+    return { filters };
   });
 
   await test("日志刷新、筛选与清空", async () => {
@@ -1434,6 +1481,7 @@ async function connect(url, appUrl) {
       ["模组库", "library"],
       ["云端", "cloud"],
       ["服务器", "server"],
+      ["备份找回", "backups"],
       ["日志", "logs"],
       ["设置", "settings"],
     ]) {
@@ -1450,6 +1498,9 @@ async function connect(url, appUrl) {
       report[page] = info;
       if (page === "library") {
         screenshots.push(await screenshot("1100-light-conflicts"));
+      }
+      if (page === "backups") {
+        screenshots.push(await screenshot("1100-light-backups"));
       }
     }
     screenshots.push(await screenshot("1100-light-settings"));

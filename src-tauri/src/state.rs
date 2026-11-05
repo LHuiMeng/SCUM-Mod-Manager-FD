@@ -8,8 +8,10 @@ use crate::models::{
     ModEntry, RuntimeLog, SftpAccount, SftpAccountInput,
 };
 use crate::mods::deploy::{
-    deployed_file_names, read_manifest, reclaim_mods, rescue_mods_from_game, sync_ue4ss_state,
+    deployed_file_names, read_manifest, reclaim_mods, reclaim_mods_with_wait,
+    rescue_mods_from_game, sync_ue4ss_state, ReclaimWait,
 };
+use crate::mods::links::{find_pending_links, reclaim_pending_links, PendingLink};
 use crate::mods::{refresh_conflicts, scan_local_mods_with_diagnostics};
 use crate::paths::{is_within, path_string, safe_disk_name, AppPaths};
 use crate::secrets::{load_runtime_secrets, RuntimeSecrets};
@@ -36,6 +38,10 @@ pub struct AppState {
     pub logs: Mutex<VecDeque<RuntimeLog>>,
     log_sequence: Mutex<u64>,
     pub secrets: RuntimeSecrets,
+    /// 启动时发现的、可能因异常关机没被回收的目录链接。
+    pub pending_links: Mutex<Vec<PendingLink>>,
+    /// 最近一次异常退出的取证结果，供前端弹窗展示。
+    pub last_crash: Mutex<Option<crate::crash::CrashReport>>,
 }
 
 impl AppState {
@@ -52,9 +58,26 @@ impl AppState {
                 config::apply_default_cloud_sources(&mut settings, &secrets.cloud_base_urls);
                 settings
             });
-        if !settings.keep_deployed_mods_on_exit {
+        let installs = vec![
+            settings.scum_install_path.clone(),
+            settings.server_install_path.clone(),
+        ];
+        // 「退出后保留部署文件」是明确的用户选择，链接本来就该在，不再打扰。
+        let pending_before = if settings.keep_deployed_mods_on_exit {
+            Vec::new()
+        } else {
+            find_pending_links(&paths, &installs)
+        };
+        // 发现上次残留的链接就先不自动回收，等用户在界面上确认；
+        // 没有残留时才走正常的启动清理。
+        if !settings.keep_deployed_mods_on_exit && pending_before.is_empty() {
             let _ = reclaim_mods(&paths);
         }
+        let pending_links = if settings.keep_deployed_mods_on_exit {
+            Vec::new()
+        } else {
+            find_pending_links(&paths, &installs)
+        };
         let mut metadata = metadata::load_metadata(&paths).unwrap_or_else(|error| {
             eprintln!("读取模组元数据失败，使用默认值：{error:#}");
             MetadataFile::default()
@@ -81,9 +104,23 @@ impl AppState {
             logs: Mutex::new(VecDeque::new()),
             log_sequence: Mutex::new(0),
             secrets,
+            pending_links: Mutex::new(pending_links),
+            last_crash: Mutex::new(None),
         };
         state.log("info", "app", "Rust 后端已初始化，本地模组扫描完成");
         log_pak_diagnostics(&state, &scan.diagnostics);
+        let pending = state.pending_links.lock().unwrap().clone();
+        if let Some(links) = pending.first() {
+            let first = format!("{} → {}", links.path, links.target);
+            state.log(
+                "warn",
+                "deploy",
+                &format!(
+                    "发现 {} 个上次未回收的目录链接（{first}），等待用户确认回收",
+                    pending.len()
+                ),
+            );
+        }
         Ok(state)
     }
 
@@ -129,7 +166,6 @@ impl AppState {
                 }
             }
         }
-
         let mut metadata = self.metadata.lock().unwrap();
         let deployed = deployed_file_names(&self.paths);
         let scan = scan_local_mods_with_diagnostics(&self.paths, &mut metadata, &deployed)?;
@@ -556,6 +592,14 @@ impl AppState {
         self.logs.lock().unwrap().iter().cloned().collect()
     }
 
+    pub fn last_crash(&self) -> Option<crate::crash::CrashReport> {
+        self.last_crash.lock().unwrap().clone()
+    }
+
+    pub fn take_last_crash(&self) -> Option<crate::crash::CrashReport> {
+        self.last_crash.lock().unwrap().take()
+    }
+
     pub fn clear_logs(&self) {
         self.logs.lock().unwrap().clear();
         let _ = std::fs::write(self.paths.logs_dir.join("runtime.jsonl"), "");
@@ -569,23 +613,70 @@ impl AppState {
         }
     }
 
+    pub fn pending_links(&self) -> Vec<PendingLink> {
+        self.pending_links.lock().unwrap().clone()
+    }
+
+    /// 用户确认后回收残留链接；返回实际断开的数量。
+    pub fn reclaim_pending_links(&self) -> Result<usize> {
+        let settings = self.settings.lock().unwrap().clone();
+        let installs = vec![settings.scum_install_path, settings.server_install_path];
+        // 链接模式下部署目录里还有硬链接与清单，先按清单回收，再断链接。
+        if let Err(error) = reclaim_mods(&self.paths) {
+            self.log(
+                "warn",
+                "deploy",
+                &format!("回收部署文件未完全成功，继续断开残留链接：{error:#}"),
+            );
+        }
+        let removed = reclaim_pending_links(&self.paths, &installs)?;
+        *self.pending_links.lock().unwrap() = find_pending_links(&self.paths, &installs);
+        self.log(
+            "info",
+            "deploy",
+            &format!("已回收 {removed} 个残留目录链接，游戏目录恢复为真实目录"),
+        );
+        Ok(removed)
+    }
+
+    /// 用户选择“先保留”时只清空本次提醒，不动链接。
+    pub fn dismiss_pending_links(&self) {
+        self.pending_links.lock().unwrap().clear();
+        self.log("warn", "deploy", "用户选择保留残留目录链接，未做回收");
+    }
+
     pub fn reclaim_deployments_after_exit(&self) -> Result<Option<usize>> {
-        let settings = self.settings.lock().unwrap();
+        self.reclaim_deployments_after_exit_notified(|_| {})
+    }
+
+    /// 回收部署文件；被占用时把等待信息交给调用方（用于前端提示“正在回收”）。
+    pub fn reclaim_deployments_after_exit_notified(
+        &self,
+        notify: impl FnMut(&ReclaimWait),
+    ) -> Result<Option<usize>> {
+        let settings = self.settings.lock().unwrap().clone();
         // 两种模式默认都在退出后回收：复制模式删文件，链接模式只断链接（毫秒级，不搬数据）。
         if settings.keep_deployed_mods_on_exit {
             return Ok(None);
         }
-        drop(settings);
-        let reclaimed = reclaim_mods(&self.paths)?;
+        let installs = vec![settings.scum_install_path, settings.server_install_path];
+        let reclaimed = reclaim_mods_with_wait(&self.paths, notify);
+        *self.pending_links.lock().unwrap() = find_pending_links(&self.paths, &installs);
+        let reclaimed = reclaimed?;
         *self.last_deployed_at.lock().unwrap() = None;
         Ok(Some(reclaimed))
     }
 
+    #[cfg(test)]
     pub fn shutdown_cleanup(&self) {
+        self.shutdown_cleanup_notified(|_| {});
+    }
+
+    pub fn shutdown_cleanup_notified(&self, notify: impl FnMut(&ReclaimWait)) {
         if self.process.lock().unwrap().is_some() {
-            let _ = crate::launcher::stop(self);
+            let _ = crate::launcher::stop_with_notice(self, notify);
         } else {
-            let _ = self.reclaim_deployments_after_exit();
+            let _ = self.reclaim_deployments_after_exit_notified(notify);
         }
     }
 }

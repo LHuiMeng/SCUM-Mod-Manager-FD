@@ -819,6 +819,9 @@ textarea:focus-visible,
 .server-library-strip-actions {
   flex: none;
   display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 7px;
 }
 
@@ -4574,5 +4577,367 @@ body.is-row-dragging {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   工具条按钮组：扫描 / 导入必须左右并排，窄窗时整组换行而不是逐个堆叠
+   --------------------------------------------------------------------------- */
+.heading-actions {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.server-library-plan-state {
+  color: var(--muted);
+  font-size: var(--type-micro);
+  white-space: nowrap;
+}
+
+.server-library-provenance {
+  margin: 4px 0 0;
+  overflow: hidden;
+  color: var(--accent);
+  font-size: var(--type-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 服务器账户条：状态与两个操作同一行，账户下拉独占下一行 */
+.server-account-bar {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.server-account-bar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.server-account-bar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.server-account-bar-controls {
+  width: 100%;
+}
+
+.server-account-bar-controls select {
+  width: 100%;
+}
+
+/* 启动时残留链接提示 */
+.pending-link-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pending-link-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--paper-lo);
+}
+
+.pending-link-list b {
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  overflow-wrap: anywhere;
+}
+
+.pending-link-list span {
+  color: var(--muted);
+  font-size: var(--type-micro);
+  overflow-wrap: anywhere;
+}
+
+.pending-link-list small {
+  color: var(--accent);
+  font-size: var(--type-micro);
+}
+
+/* 崩溃取证 */
+.crash-report {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.crash-report section > b {
+  display: block;
+  margin-bottom: 8px;
+  font-size: var(--type-label);
+}
+
+.crash-report ol {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: var(--type-body);
+  line-height: 1.6;
+}
+
+.crash-suspect-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.crash-suspect-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 26%, var(--line));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 5%, var(--paper-lo));
+}
+
+.crash-suspect-list li > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.crash-suspect-list span {
+  color: var(--muted);
+  font-size: var(--type-micro);
+}
+
+.crash-report details {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.crash-report summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: var(--type-label);
+}
+
+.crash-report pre {
+  max-height: 220px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--paper-lo);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.crash-log-path {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+
+/* 备份找回页 */
+.page-backups {
+  overflow-y: auto;
+}
+
+.backups-summary {
+  color: var(--muted);
+  font-size: var(--type-micro);
+}
+
+.backups-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.backups-filters button {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--paper-lo);
+  font-size: var(--type-micro);
+}
+
+.backups-filters button.is-active {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+  background: color-mix(in srgb, var(--accent) 6%, var(--paper-lo));
+}
+
+.backups-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 24px;
+}
+
+.backup-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--paper-lo);
+}
+
+.backup-kind {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: var(--paper-hi);
+}
+
+.backup-kind.is-deleted {
+  color: var(--danger);
+}
+
+.backup-kind.is-deploy {
+  color: var(--accent);
+}
+
+.backup-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.backup-main b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--type-emphasis);
+}
+
+.backup-main span,
+.backup-meta span {
+  color: var(--muted);
+  font-size: var(--type-micro);
+}
+
+.backup-main code {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backup-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  white-space: nowrap;
+}
+
+.backup-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.backups-error {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--line));
+  border-radius: var(--radius-sm);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 5%, var(--paper-lo));
+  font-size: var(--type-label);
+}
+
+.backups-loading {
+  padding: 40px 0;
+  color: var(--muted);
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .backup-row {
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+  }
+
+  .backup-meta {
+    display: none;
+  }
+}
+
+/* 模组库标题行：标题最多占 430px，右侧切换/搜索/操作始终排成一行。
+   之前副标题太长会把工具栏挤到下一行（1100 宽时尤其明显）。 */
+.library-heading {
+  flex-direction: row;
+  align-items: flex-start;
+  flex-wrap: nowrap;
+  gap: 10px;
+}
+
+.library-heading > div:first-child {
+  min-width: 0;
+  max-width: 430px;
+}
+
+.library-heading .heading-tools {
+  width: auto;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.library-heading .search-field {
+  width: 190px;
+  flex: 0 1 190px;
+  min-width: 120px;
+}
+
+@media (max-width: 1200px) {
+  .library-heading {
+    align-items: center;
+  }
+
+  .library-heading p {
+    display: none;
+  }
+
+  .library-heading .search-field {
+    width: 132px;
+    flex-basis: 132px;
+    min-width: 100px;
+  }
+
+  .library-heading h1 {
+    font-size: 26px;
   }
 }

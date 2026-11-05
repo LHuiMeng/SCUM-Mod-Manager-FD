@@ -207,6 +207,33 @@ describe("server library model", () => {
     expect(result.snapshot.mods[0].enabled).toBe(true);
   });
 
+  it("hides pending deletions from the server list", () => {
+    const state = normalizeServerLibraryState(
+      {
+        order: [],
+        enabled: {},
+        winners: {},
+        deleted: ["/srv/mods/Beta.pak"],
+      },
+      scan,
+    );
+    const result = buildServerLibrarySnapshot({
+      base,
+      scan,
+      report,
+      state,
+      manifest: null,
+      labels: {
+        mergedName: "Merged",
+        mergedTag: "Merged",
+        mergedDescription: (sources) => sources.join(", "),
+      },
+    });
+    expect(result.state.deleted).toEqual(["/srv/mods/Beta.pak"]);
+    expect(result.snapshot.mods.map((mod) => mod.name)).toEqual(["Alpha.pak"]);
+    expect(result.conflicts).toEqual([]);
+  });
+
   it("hides deployment order prefixes from managed server PAK names", () => {
     const managedScan: SftpConnectionResult = {
       ...scan,

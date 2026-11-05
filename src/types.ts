@@ -1,6 +1,6 @@
 export type ThemeMode = "light" | "dark";
 export type Language = "zh-CN" | "en-US";
-export type NavSection = "library" | "cloud" | "server" | "logs" | "settings";
+export type NavSection = "library" | "cloud" | "server" | "backups" | "logs" | "settings";
 export type AppEdition = "public" | "server";
 export type ModType =
   | "clientPak"
@@ -238,6 +238,62 @@ export interface SftpManagedManifest {
   renames: SftpManagedRename[];
   createdPaths: string[];
   winners: Record<string, string>;
+  provenancePaths?: string[];
+}
+
+export interface SftpPrepareResult {
+  required: boolean;
+  hasConflicts: boolean;
+  analyzedMods: number;
+  mergedSources: SftpManagedSource[];
+  backupCount: number;
+  deleteCount: number;
+  renameCount: number;
+  mergedBytes: number;
+  provenancePath: string;
+  message: string;
+}
+
+export interface PendingLink {
+  path: string;
+  target: string;
+  kind: string;
+}
+
+export interface BackupEntry {
+  id: string;
+  kind: "deleted" | "import" | "replaced" | "deploy" | string;
+  name: string;
+  path: string;
+  size: number;
+  createdAt: string;
+  detail: string;
+  restorable: boolean;
+}
+
+export interface CrashSuspect {
+  modId: string;
+  name: string;
+  reason: string;
+  lines: string[];
+}
+
+export interface CrashReport {
+  abnormal: boolean;
+  cause: string;
+  summary: string;
+  logPath?: string | null;
+  ue4ssLogPath?: string | null;
+  evidence: string[];
+  suspects: CrashSuspect[];
+  suggestions: string[];
+}
+
+export interface ReclaimProgress {
+  phase: "waiting" | "still-waiting";
+  file: string;
+  waitedMs: number;
+  message: string;
 }
 
 export interface SftpApplyResult {

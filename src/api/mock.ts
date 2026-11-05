@@ -841,6 +841,29 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
           : `已分析 ${pakMods.length} 个远端 PAK，未发现资源冲突`,
       } as T;
     }
+    case "prepare_sftp_mod_layout": {
+      const pakMods = remoteFiles.filter(
+        (file) => !file.isDirectory && file.name.endsWith(".pak"),
+      );
+      const sources = pakMods.slice(0, 2).map((file) => ({
+        name: file.name,
+        path: file.path,
+      }));
+      return {
+        required: sources.length > 0,
+        hasConflicts: sources.length >= 2,
+        analyzedMods: pakMods.length,
+        mergedSources: sources,
+        backupCount: sources.length,
+        deleteCount: (args?.deleted as string[] | undefined)?.length ?? 0,
+        renameCount: 0,
+        mergedBytes: sources.length >= 2 ? 1400000000 : 0,
+        provenancePath: "~server-upload/demo/provenance.json",
+        message: sources.length
+          ? `演示环境已分析 ${pakMods.length} 个服务器模组，等待上传`
+          : "服务器模组没有需要上传的变更",
+      } as T;
+    }
     case "apply_sftp_mod_layout": {
       const pakMods = remoteFiles.filter(
         (file) => !file.isDirectory && file.name.endsWith(".pak"),
@@ -883,6 +906,7 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
           renames: [],
           createdPaths: [],
           winners: (args?.winners as Record<string, string> | undefined) ?? {},
+          provenancePaths: [],
         },
       } as T;
     }
@@ -934,6 +958,19 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
         message: `演示环境已覆盖 ${replaced} 个同名条目`,
       } as T;
     }
+    case "get_pending_links":
+      return [] as T;
+    case "reclaim_pending_links":
+      return 0 as T;
+    case "list_backups":
+      return [] as T;
+    case "get_last_crash":
+      return null as T;
+    case "restore_backup":
+      return "演示环境不执行真实备份恢复" as T;
+    case "dismiss_pending_links":
+    case "dismiss_crash":
+    case "delete_backup":
     case "open_path":
     case "open_mod_folder":
     case "window_minimize":

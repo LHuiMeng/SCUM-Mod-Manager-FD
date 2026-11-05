@@ -11,6 +11,8 @@ export interface ServerLibraryState {
   order: string[];
   enabled: Record<string, boolean>;
   winners: Record<string, string>;
+  /** 待上传的删除动作：文件仍留在服务器上，上传时才移入备份目录。 */
+  deleted: string[];
 }
 
 interface ServerLibraryLabels {
@@ -64,7 +66,13 @@ export function normalizeServerLibraryState(
           ),
         )
       : {};
-  return { order: requestedOrder, enabled, winners };
+  const deleted = Array.isArray(input.deleted)
+    ? input.deleted.filter(
+        (path): path is string =>
+          typeof path === "string" && availableSet.has(path),
+      )
+    : [];
+  return { order: requestedOrder, enabled, winners, deleted };
 }
 
 export function readStoredServerLibraryState(
@@ -106,6 +114,7 @@ export function buildServerLibrarySnapshot({
   report,
   state,
   manifest,
+  notes,
   labels,
   now = new Date().toISOString(),
 }: {
@@ -114,16 +123,20 @@ export function buildServerLibrarySnapshot({
   report: SftpConflictReport | null;
   state: ServerLibraryState;
   manifest: SftpManagedManifest | null;
+  notes?: Record<string, string>;
   labels: ServerLibraryLabels;
   now?: string;
 }): { snapshot: LibrarySnapshot; state: ServerLibraryState; conflicts: ConflictGroup[] } {
   const normalized = normalizeServerLibraryState(state, scan);
   const orderIndex = new Map(normalized.order.map((path, index) => [path, index]));
   const mergedPath = manifest?.mergedPath ?? null;
+  const deleted = new Set(normalized.deleted);
   const files = [
     ...scan.pakMods.map((file) => ({ ...file, type: "clientPak" as const })),
     ...scan.ue4ssMods.map((file) => ({ ...file, type: "ue4ssMod" as const })),
-  ].sort(
+  ]
+    .filter((file) => !deleted.has(file.path))
+    .sort(
     (left, right) =>
       (orderIndex.get(left.path) ?? Number.MAX_SAFE_INTEGER) -
         (orderIndex.get(right.path) ?? Number.MAX_SAFE_INTEGER) ||
@@ -148,7 +161,7 @@ export function buildServerLibrarySnapshot({
       type: file.type,
       loadOrder,
       tags: isMerged ? [labels.mergedTag] : [],
-      notes: "",
+      notes: isMerged ? "" : (notes?.[file.path] ?? ""),
       sha256: "",
       originSource: "cloud",
       deployed: false,

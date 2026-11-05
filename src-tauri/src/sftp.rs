@@ -3,9 +3,9 @@ use crate::models::{
     AppSettings, ImportResult, ModEntry, RemoteFile, SftpAccount, SftpApplyResult,
     SftpConflictGroup, SftpConflictOwner, SftpConflictProgress, SftpConflictReport,
     SftpConnectionResult, SftpManagedBackup, SftpManagedManifest, SftpManagedRename,
-    SftpManagedSource, SftpOperationResult, UploadResult,
+    SftpManagedSource, SftpOperationResult, SftpPrepareResult, UploadResult,
 };
-use crate::paths::{safe_file_component, AppPaths};
+use crate::paths::{path_string, safe_file_component, AppPaths};
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use chrono::{TimeZone, Utc};
@@ -403,8 +403,7 @@ pub fn mkdir_entry(
     // 根目录没有名称，validate 会拒绝；已存在的目录视为幂等成功。
     let name = validate_remote_name(&entry_name(&target))?;
     with_sftp(paths, &account, |sftp| {
-        let parent =
-            remote_parent(&target).context("远端目录路径缺少父目录")?;
+        let parent = remote_parent(&target).context("远端目录路径缺少父目录")?;
         if !remote_dir_exists(sftp, &parent) {
             ensure_remote_dir(sftp, &parent)?;
         }
@@ -435,9 +434,7 @@ pub fn move_entry(
             bail!("移动目标已存在：{}", plan.target);
         }
         sftp.rename(Path::new(&plan.source), Path::new(&plan.target), None)
-            .with_context(|| {
-                format!("无法移动远端条目 {} -> {}", plan.source, plan.target)
-            })?;
+            .with_context(|| format!("无法移动远端条目 {} -> {}", plan.source, plan.target))?;
         if let Some((source_sig, target_sig)) = &plan.signature_pair {
             if sftp.lstat(Path::new(source_sig)).is_ok() {
                 sftp.rename(Path::new(source_sig), Path::new(target_sig), None)
@@ -496,9 +493,7 @@ pub(crate) fn plan_move(
         bail!("不能移动模组根目录");
     }
     validate_remote_name(&entry_name(&target))?;
-    if source
-        .to_ascii_lowercase()
-        .ends_with(".pak")
+    if source.to_ascii_lowercase().ends_with(".pak")
         && !target.to_ascii_lowercase().ends_with(".pak")
     {
         bail!("PAK 模组必须保留 .pak 扩展名");
@@ -537,8 +532,8 @@ pub(crate) fn plan_library_download(
     if !is_clean_remote_path(&remote) {
         bail!("远端文件路径无效");
     }
-    let in_ue4ss = !account.ue4ss_path.trim().is_empty()
-        && remote_path_within(&account.ue4ss_path, &remote);
+    let in_ue4ss =
+        !account.ue4ss_path.trim().is_empty() && remote_path_within(&account.ue4ss_path, &remote);
     let in_pak = remote_path_within(&account.mods_path, &remote);
     if in_ue4ss {
         let name = validate_remote_name(&entry_name(&remote))?;
@@ -567,15 +562,11 @@ fn download_library_pak(
         bail!("不能把目录导入为 PAK 模组：{remote}");
     }
     let destination = paths.local_mods.join(name);
-    std::fs::create_dir_all(&paths.local_mods)
-        .with_context(|| "无法创建本地模组库目录")?;
+    std::fs::create_dir_all(&paths.local_mods).with_context(|| "无法创建本地模组库目录")?;
     if destination.exists() {
         let backup_root = paths.backups_dir.join("imports");
         std::fs::create_dir_all(&backup_root)?;
-        let backup = backup_root.join(format!(
-            "{}-{name}",
-            Uuid::new_v4()
-        ));
+        let backup = backup_root.join(format!("{}-{name}", Uuid::new_v4()));
         std::fs::rename(&destination, &backup)
             .with_context(|| format!("无法备份已存在的模组文件 {destination:?}"))?;
     }
@@ -584,13 +575,12 @@ fn download_library_pak(
         let mut remote_file = sftp
             .open(Path::new(remote))
             .with_context(|| format!("无法读取远端 PAK {remote}"))?;
-        let mut output = File::create(&partial)
-            .with_context(|| format!("无法创建本地文件 {partial:?}"))?;
+        let mut output =
+            File::create(&partial).with_context(|| format!("无法创建本地文件 {partial:?}"))?;
         std::io::copy(&mut remote_file, &mut output)
             .with_context(|| format!("无法下载远端 PAK {remote}"))?;
         output.flush()?;
-        std::fs::rename(&partial, &destination)
-            .with_context(|| "无法提交本地 PAK 文件")?;
+        std::fs::rename(&partial, &destination).with_context(|| "无法提交本地 PAK 文件")?;
         Ok(())
     })();
     if download.is_err() {
@@ -617,8 +607,7 @@ fn download_library_ue4ss_dir(
         bail!("远端 UE4SS 模组不是目录：{remote_root}");
     }
     let destination = paths.ue4ss_mods.join(name);
-    std::fs::create_dir_all(&paths.ue4ss_mods)
-        .with_context(|| "无法创建本地 UE4SS 模组目录")?;
+    std::fs::create_dir_all(&paths.ue4ss_mods).with_context(|| "无法创建本地 UE4SS 模组目录")?;
     let process_id = std::process::id();
     let staging = paths
         .ue4ss_mods
@@ -636,8 +625,7 @@ fn download_library_ue4ss_dir(
     let mut visited = 0usize;
     let result = (|| -> Result<()> {
         download_remote_tree(sftp, remote_root, &staging, 0, &mut visited)?;
-        std::fs::rename(&staging, &destination)
-            .with_context(|| "无法提交本地 UE4SS 模组目录")?;
+        std::fs::rename(&staging, &destination).with_context(|| "无法提交本地 UE4SS 模组目录")?;
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&staging);
@@ -679,8 +667,8 @@ fn download_remote_tree(
         let mut remote_file = sftp
             .open(Path::new(remote_path))
             .with_context(|| format!("无法读取远端文件 {remote_path}"))?;
-        let mut output = File::create(local_path)
-            .with_context(|| format!("无法写入本地文件 {local_path:?}"))?;
+        let mut output =
+            File::create(local_path).with_context(|| format!("无法写入本地文件 {local_path:?}"))?;
         std::io::copy(&mut remote_file, &mut output)?;
         output.flush()?;
         return Ok(());
@@ -850,12 +838,325 @@ fn plan_remote_ue4ss_config(
     })
 }
 
+/// 服务器模组「先分析、后上传」的准备阶段：把服务器上所有 PAK 下载到缓存、
+/// 解析资源冲突、在本地生成合并包与溯源文件，但**不修改服务器**。
+pub fn prepare_remote_layout(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    order: &[String],
+    disabled: &[String],
+    deleted: &[String],
+    winners: &BTreeMap<String, String>,
+    progress: SftpConflictProgressCallback,
+) -> Result<SftpPrepareResult> {
+    let account = active_account(settings, Some(account_id))?;
+    if account.mods_path.trim().is_empty() {
+        bail!("尚未定位远端 PAK 模组目录");
+    }
+    if normalize_remote_path(&account.mods_path) == "/" {
+        bail!("无法在服务器根目录准备模组布局，请先定位具体的 ~mods 目录");
+    }
+    send_conflict_progress(
+        &progress,
+        "preparing",
+        0,
+        0,
+        0,
+        0,
+        None,
+        "正在下载并分析服务器模组",
+    );
+    match prepare_remote_layout_inner(paths, account, order, disabled, deleted, winners, &progress)
+    {
+        Ok(result) => {
+            send_conflict_progress(
+                &progress,
+                "completed",
+                result.analyzed_mods,
+                result.analyzed_mods,
+                0,
+                result.merged_bytes,
+                None,
+                &result.message,
+            );
+            Ok(result)
+        }
+        Err(error) => {
+            send_conflict_progress(
+                &progress,
+                "error",
+                0,
+                0,
+                0,
+                0,
+                None,
+                &format!("准备服务器模组失败：{error:#}"),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn prepare_remote_layout_inner(
+    paths: &AppPaths,
+    account: &SftpAccount,
+    order: &[String],
+    disabled: &[String],
+    deleted: &[String],
+    winners: &BTreeMap<String, String>,
+    progress: &SftpConflictProgressCallback,
+) -> Result<SftpPrepareResult> {
+    let cache_dir = paths
+        .root
+        .join("cache")
+        .join("sftp_conflicts")
+        .join(safe_file_component(&account.id));
+    std::fs::create_dir_all(&cache_dir)?;
+    let report = analyze_remote_conflicts_inner(paths, account, &cache_dir, progress)?;
+
+    let pak_files = with_sftp(paths, account, |sftp| {
+        Ok(list_pak_mods(sftp, &account.mods_path))
+    })?;
+    let order_index = order
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut sorted_paks = pak_files;
+    sorted_paks.sort_by(|left, right| {
+        order_index
+            .get(&left.path)
+            .copied()
+            .unwrap_or(usize::MAX)
+            .cmp(&order_index.get(&right.path).copied().unwrap_or(usize::MAX))
+            .then_with(|| {
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    let mut metadata = MetadataFile::default();
+    let mut mods = Vec::new();
+    let mut files_by_path = BTreeMap::new();
+    for (load_order, file) in sorted_paks.iter().enumerate() {
+        files_by_path.insert(file.path.clone(), file.clone());
+        if disabled.contains(&file.path)
+            || deleted.contains(&file.path)
+            || is_managed_merged_name(&file.name)
+        {
+            continue;
+        }
+        let cache_name = conflict_cache_name(file);
+        let local = cache_dir.join(&cache_name);
+        if !local.is_file() {
+            bail!("远端 PAK 尚未完成缓存，无法准备布局：{}", file.name);
+        }
+        let entries_path = cache_dir.join(conflict_entries_cache_name(&cache_name));
+        let entries = match read_conflict_entries_cache(&entries_path) {
+            Some(entries) => entries,
+            None => crate::mods::list_pak_entries(paths, &local)?,
+        };
+        metadata.entry_mut(&file.path).pak_entries = entries;
+        mods.push(ModEntry {
+            id: file.path.clone(),
+            name: file.name.clone(),
+            file_name: file.name.clone(),
+            file_path: local.to_string_lossy().into_owned(),
+            file_size: file.size,
+            last_modified: file.modified_at.clone().unwrap_or_default(),
+            enabled: true,
+            mod_type: "clientPak".to_string(),
+            load_order,
+            description: String::new(),
+            origin_source: "local".to_string(),
+            ..ModEntry::default()
+        });
+    }
+
+    let mut valid_winners = BTreeMap::new();
+    let mut analysis = crate::mods::analyze_conflicts(&metadata, &mods);
+    for (key, winner) in winners {
+        if analysis
+            .groups
+            .iter()
+            .any(|group| group.key == *key && group.owners.iter().any(|owner| owner.id == *winner))
+        {
+            valid_winners.insert(key.clone(), winner.clone());
+        }
+    }
+    metadata.conflict_winners = valid_winners.clone();
+    analysis = crate::mods::analyze_conflicts(&metadata, &mods);
+    crate::mods::validate_conflict_winners(&analysis.groups, &valid_winners)?;
+
+    let conflicting_paths = analysis
+        .groups
+        .iter()
+        .flat_map(|group| group.owners.iter().map(|owner| owner.id.clone()))
+        .filter(|path| !deleted.contains(path))
+        .collect::<BTreeSet<_>>();
+
+    let stage_root = paths
+        .root
+        .join("~server-upload")
+        .join(safe_file_component(&account.id))
+        .join("plan");
+    let _ = std::fs::remove_dir_all(&stage_root);
+    std::fs::create_dir_all(&stage_root)?;
+    let merged_local = stage_root.join(REMOTE_MERGED_FILE);
+    let merged_created = if conflicting_paths.is_empty() {
+        false
+    } else {
+        build_remote_merged_pak(paths, &mods, &analysis, &metadata, &merged_local)?
+    };
+    if !conflicting_paths.is_empty() && !merged_created {
+        bail!("冲突分析完成，但未能生成合并 PAK");
+    }
+
+    let sources = conflicting_paths
+        .iter()
+        .filter_map(|path| {
+            files_by_path.get(path).map(|file| SftpManagedSource {
+                name: file.name.clone(),
+                path: path.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut backup_items = Vec::new();
+    for path in disabled {
+        if let Some(file) = files_by_path.get(path) {
+            backup_items.push(serde_json::json!({
+                "name": file.name,
+                "path": file.path,
+                "reason": "disabled",
+            }));
+        }
+    }
+    for path in deleted {
+        if let Some(file) = files_by_path.get(path) {
+            backup_items.push(serde_json::json!({
+                "name": file.name,
+                "path": file.path,
+                "reason": "deleted",
+            }));
+        }
+    }
+    for path in &conflicting_paths {
+        if let Some(file) = files_by_path.get(path) {
+            backup_items.push(serde_json::json!({
+                "name": file.name,
+                "path": file.path,
+                "reason": "merged",
+            }));
+        }
+    }
+    let prefix_width = remote_deployment_prefix_width(sorted_paks.len());
+    let rename_count = plan_remote_pak_renames(
+        &sorted_paks,
+        &disabled
+            .iter()
+            .cloned()
+            .chain(deleted.iter().cloned())
+            .collect::<HashSet<_>>(),
+        &conflicting_paths,
+        &account.mods_path,
+        prefix_width,
+    )
+    .len();
+    let merged_bytes = std::fs::metadata(&merged_local)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let provenance_path = stage_root.join("provenance.json");
+    let provenance = serde_json::json!({
+        "tool": "SCUM Mod Desk",
+        "version": env!("CARGO_PKG_VERSION"),
+        "createdAt": Utc::now().to_rfc3339(),
+        "account": {
+            "id": account.id,
+            "name": account.name,
+            "host": account.host,
+            "modsPath": account.mods_path,
+        },
+        "merged": merged_created.then(|| serde_json::json!({
+            "name": REMOTE_MERGED_FILE,
+            "localPath": path_string(&merged_local),
+            "bytes": merged_bytes,
+            "sources": &sources,
+        })),
+        "backups": &backup_items,
+        "deleted": deleted,
+        "winners": valid_winners,
+    });
+    std::fs::write(&provenance_path, serde_json::to_vec_pretty(&provenance)?)?;
+    let mut readable = String::from("SCUM Mod Desk 服务器融合溯源\n");
+    readable.push_str(&format!(
+        "生成时间：{}\n服务器：{}@{} {}\n\n",
+        Utc::now().to_rfc3339(),
+        account.username,
+        account.host,
+        account.mods_path
+    ));
+    if merged_created {
+        readable.push_str(&format!(
+            "合并包：{REMOTE_MERGED_FILE}（{merged_bytes} 字节）\n引用原模组：\n"
+        ));
+        for source in &sources {
+            readable.push_str(&format!("  - {}（{}）\n", source.name, source.path));
+        }
+    } else {
+        readable.push_str("本次没有资源冲突，未生成合并包。\n");
+    }
+    if !backup_items.is_empty() {
+        readable.push_str("\n上传时会备份的原模组：\n");
+        for item in &backup_items {
+            readable.push_str(&format!(
+                "  - [{}] {}（{}）\n",
+                item["reason"].as_str().unwrap_or(""),
+                item["name"].as_str().unwrap_or(""),
+                item["path"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    std::fs::write(stage_root.join("融合说明.txt"), readable)?;
+
+    let required = !backup_items.is_empty() || !conflicting_paths.is_empty() || rename_count > 0;
+    let message = if merged_created {
+        format!(
+            "已分析 {} 个服务器模组，融合 {} 个冲突来源，等待上传",
+            report.analyzed_mods,
+            sources.len()
+        )
+    } else if required {
+        format!(
+            "已分析 {} 个服务器模组，没有资源冲突，等待上传布局变更",
+            report.analyzed_mods
+        )
+    } else {
+        "服务器模组没有需要上传的变更".to_string()
+    };
+    Ok(SftpPrepareResult {
+        required,
+        has_conflicts: merged_created,
+        analyzed_mods: report.analyzed_mods,
+        merged_sources: sources,
+        backup_count: backup_items.len(),
+        delete_count: deleted.len(),
+        rename_count,
+        merged_bytes,
+        provenance_path: path_string(&provenance_path),
+        message,
+    })
+}
+
 pub fn apply_remote_layout(
     paths: &AppPaths,
     settings: &AppSettings,
     account_id: &str,
     order: &[String],
     disabled: &[String],
+    deleted: &[String],
     winners: &BTreeMap<String, String>,
     progress: SftpConflictProgressCallback,
 ) -> Result<SftpApplyResult> {
@@ -924,7 +1225,10 @@ pub fn apply_remote_layout(
     let mut files_by_path = BTreeMap::new();
     for (load_order, file) in sorted_paks.iter().enumerate() {
         files_by_path.insert(file.path.clone(), file.clone());
-        if disabled.contains(&file.path) || is_managed_merged_name(&file.name) {
+        if disabled.contains(&file.path)
+            || deleted.contains(&file.path)
+            || is_managed_merged_name(&file.name)
+        {
             continue;
         }
         let cache_name = conflict_cache_name(file);
@@ -980,8 +1284,13 @@ pub fn apply_remote_layout(
             to_backup.insert(path.clone(), "disabled".to_string());
         }
     }
-    for path in &conflicting_paths {
+    for path in deleted {
         if files_by_path.contains_key(path) {
+            to_backup.insert(path.clone(), "deleted".to_string());
+        }
+    }
+    for path in &conflicting_paths {
+        if files_by_path.contains_key(path) && !deleted.contains(path) {
             to_backup.insert(path.clone(), "merged".to_string());
         }
     }
@@ -1001,12 +1310,21 @@ pub fn apply_remote_layout(
     };
     let rename_candidates = plan_remote_pak_renames(
         &sorted_paks,
-        &disabled,
+        &disabled
+            .iter()
+            .cloned()
+            .chain(deleted.iter().cloned())
+            .collect::<HashSet<_>>(),
         &conflicting_paths,
         &account.mods_path,
         prefix_width,
     );
-    let ue4ss_plan = plan_remote_ue4ss_config(paths, account, order, &disabled)?;
+    let ue4ss_skipped = disabled
+        .iter()
+        .cloned()
+        .chain(deleted.iter().cloned())
+        .collect::<HashSet<_>>();
+    let ue4ss_plan = plan_remote_ue4ss_config(paths, account, order, &ue4ss_skipped)?;
     let ue4ss_changed = ue4ss_plan.is_some();
     if to_backup.is_empty()
         && conflicting_paths.is_empty()
@@ -1059,6 +1377,41 @@ pub fn apply_remote_layout(
         .keys()
         .filter_map(|path| files_by_path.get(path).cloned())
         .collect::<Vec<_>>();
+    let provenance_text = {
+        let backups = backup_files
+            .iter()
+            .map(|file| {
+                serde_json::json!({
+                    "name": file.name,
+                    "path": file.path,
+                    "reason": to_backup.get(&file.path).cloned().unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string_pretty(&serde_json::json!({
+            "tool": "SCUM Mod Desk",
+            "version": env!("CARGO_PKG_VERSION"),
+            "createdAt": created_at,
+            "account": {
+                "name": account.name,
+                "host": account.host,
+                "modsPath": account.mods_path,
+            },
+            "merged": merged_created.then(|| serde_json::json!({
+                "name": merged_remote_name,
+                "sources": sources
+                    .iter()
+                    .map(|source| serde_json::json!({
+                        "name": source.name,
+                        "path": source.path,
+                    }))
+                    .collect::<Vec<_>>(),
+            })),
+            "backups": backups,
+            "deleted": &deleted,
+            "winners": &valid_winners,
+        }))?
+    };
     let manifest = with_sftp(paths, account, |sftp| {
         let mut planned_renames = Vec::new();
         for (file, target_path) in &rename_candidates {
@@ -1088,7 +1441,7 @@ pub fn apply_remote_layout(
         );
         let backup_dir = remote_join(&account.mods_path, &backup_name);
         let ue4ss_backup_dir = remote_join(&account.ue4ss_path, &backup_name);
-        if !backup_files.is_empty() {
+        if !backup_files.is_empty() || merged_created || !deleted.is_empty() {
             ensure_remote_dir(sftp, &backup_dir)?;
         }
         if ue4ss_plan
@@ -1108,6 +1461,7 @@ pub fn apply_remote_layout(
             renames: Vec::new(),
             created_paths: Vec::new(),
             winners: valid_winners.clone(),
+            provenance_paths: Vec::new(),
         };
         let mutation = (|| -> Result<()> {
             for file in &backup_files {
@@ -1137,6 +1491,31 @@ pub fn apply_remote_layout(
                             )?);
                         }
                     }
+                }
+            }
+            // UE4SS 模组删除：整棵目录挪进同一批次备份目录，避免直接删掉。
+            if !account.ue4ss_path.trim().is_empty() {
+                for path in deleted {
+                    if !remote_path_within(&account.ue4ss_path, path) {
+                        continue;
+                    }
+                    let Ok(stat) = sftp.lstat(Path::new(path)) else {
+                        continue;
+                    };
+                    ensure_remote_dir(sftp, &ue4ss_backup_dir)?;
+                    let file = RemoteFile {
+                        name: entry_name(path),
+                        path: path.clone(),
+                        is_directory: stat.is_dir(),
+                        size: stat.size.unwrap_or(0),
+                        modified_at: None,
+                    };
+                    manifest.backups.push(backup_remote_file(
+                        sftp,
+                        &file,
+                        &ue4ss_backup_dir,
+                        "deleted",
+                    )?);
                 }
             }
             for (file, target_path, source_signature, target_signature, has_signature) in
@@ -1185,6 +1564,12 @@ pub fn apply_remote_layout(
                     bail!("服务器合并包目标已存在，拒绝覆盖：{merged_path}");
                 }
                 upload_local_file(sftp, &merged_local, &merged_path)?;
+            }
+            // 融合溯源与旧模组备份一起留在服务器上：多人共管时能查到合并包引用了哪些原模组。
+            if merged_created || !manifest.backups.is_empty() || !deleted.is_empty() {
+                let provenance_path = remote_join(&backup_dir, "融合溯源.json");
+                write_remote_text_file(sftp, &provenance_path, &provenance_text)?;
+                manifest.provenance_paths.push(provenance_path);
             }
             write_managed_manifest(sftp, &account.mods_path, &manifest)?;
             Ok(())
@@ -3029,13 +3414,13 @@ fn validate_managed_manifest_paths(
 mod tests {
     use super::{
         active_account, build_remote_merged_pak, build_remote_ue4ss_mods_txt,
-        conflict_entries_cache_name, download_file, DownloadKind, ensure_remote_operation_allowed,
+        conflict_entries_cache_name, download_file, ensure_remote_operation_allowed,
         load_remote_notes, move_remote_notes, numbered_remote_pak_file_name, pak_path_candidates,
         plan_library_download, plan_move, plan_remote_pak_renames, read_conflict_entries_cache,
         remote_deployment_prefix_width, remote_join, remove_remote_notes_under, root_from_pak_path,
         root_from_ue4ss_path, safe_pak_relative_path, save_remote_notes, ue4ss_path_candidates,
         validate_managed_manifest_paths, validate_remote_name, write_conflict_entries_cache,
-        RemoteNotesFile,
+        DownloadKind, RemoteNotesFile,
     };
     use crate::metadata::MetadataFile;
     use crate::models::{
@@ -3457,7 +3842,12 @@ mod tests {
         )
         .is_err());
         assert!(plan_move(&account, &mods_root, "/srv/scum/SCUM/Content/Paks/x").is_err());
-        assert!(plan_move(&account, &format!("{mods_root}/A.pak"), &format!("{mods_root}/A.pak")).is_err());
+        assert!(plan_move(
+            &account,
+            &format!("{mods_root}/A.pak"),
+            &format!("{mods_root}/A.pak")
+        )
+        .is_err());
     }
 
     #[test]
@@ -3473,14 +3863,20 @@ mod tests {
         assert_eq!(name, "ServerPak.pak");
         assert_eq!(remote, "/srv/scum/SCUM/Content/Paks/~mods/ServerPak.pak");
 
-        let (kind, _, name) =
-            plan_library_download(&account, "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/SCUMTweaks")
-                .unwrap();
+        let (kind, _, name) = plan_library_download(
+            &account,
+            "/srv/scum/SCUM/Binaries/Win64/ue4ss/Mods/SCUMTweaks",
+        )
+        .unwrap();
         assert_eq!(kind, DownloadKind::Ue4ss);
         assert_eq!(name, "SCUMTweaks");
 
-        assert!(plan_library_download(&account, "/srv/scum/SCUM/Content/Paks/~mods/notes.txt").is_err());
-        assert!(plan_library_download(&account, "/srv/scum/SCUM/Config/ServerSettings.ini").is_err());
+        assert!(
+            plan_library_download(&account, "/srv/scum/SCUM/Content/Paks/~mods/notes.txt").is_err()
+        );
+        assert!(
+            plan_library_download(&account, "/srv/scum/SCUM/Config/ServerSettings.ini").is_err()
+        );
     }
 
     fn build_test_pak(

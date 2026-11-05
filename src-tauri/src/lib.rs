@@ -1,7 +1,9 @@
 mod app_update;
+mod backups;
 mod cloud;
 mod commands;
 mod config;
+mod crash;
 mod edition;
 mod launcher;
 mod locales;
@@ -76,8 +78,17 @@ pub fn run() {
             commands::get_sftp_remote_notes,
             commands::save_sftp_remote_note,
             commands::analyze_sftp_conflicts,
+            commands::prepare_sftp_mod_layout,
             commands::apply_sftp_mod_layout,
             commands::restore_sftp_mod_layout,
+            commands::get_pending_links,
+            commands::reclaim_pending_links,
+            commands::dismiss_pending_links,
+            commands::list_backups,
+            commands::restore_backup,
+            commands::delete_backup,
+            commands::get_last_crash,
+            commands::dismiss_crash,
             commands::window_minimize,
             commands::window_toggle_maximize,
             commands::window_close,

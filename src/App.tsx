@@ -28,9 +28,13 @@ import type {
   SftpConflictReport,
   SftpConnectionResult,
   SftpManagedManifest,
+  SftpPrepareResult,
   SftpUploadKind,
   ThemeMode,
   ToastMessage,
+  CrashReport,
+  PendingLink,
+  ReclaimProgress,
 } from "./types";
 import { formatClock, formatBytes } from "./lib/format";
 import {
@@ -61,10 +65,13 @@ import {
 import { ImportConflictDialog } from "./components/library/ImportConflictDialog";
 import { CloudScreen } from "./components/cloud/CloudScreen";
 import { ServerScreen } from "./components/server/ServerScreen";
+import { BackupsScreen } from "./components/backups/BackupsScreen";
 import { LogScreen } from "./components/logs/LogScreen";
 import { SettingsScreen } from "./components/settings/SettingsScreen";
 import { UpdateDialog } from "./components/settings/UpdateDialog";
 import { ToastStack } from "./components/ui/ToastStack";
+import { Button } from "./components/ui/Button";
+import { Modal } from "./components/ui/Modal";
 
 interface SftpTrustPrompt {
   accountId: string;
@@ -128,6 +135,10 @@ function LocalizedApp() {
   const [libraryMode, setLibraryMode] = useState<"local" | "server">("local");
   const [serverLibraryState, setServerLibraryState] =
     useState<ServerLibraryState | null>(null);
+  const [serverPrepare, setServerPrepare] = useState<SftpPrepareResult | null>(null);
+  const [serverPrepareBusy, setServerPrepareBusy] = useState(false);
+  const [pendingLinks, setPendingLinks] = useState<PendingLink[]>([]);
+  const [crashReport, setCrashReport] = useState<CrashReport | null>(null);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [updatePhase, setUpdatePhase] = useState<AppUpdatePhase>("idle");
   const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
@@ -187,6 +198,7 @@ function LocalizedApp() {
       report: remoteConflicts,
       state,
       manifest: sftpScan.managedManifest ?? null,
+      notes: remoteNotes,
       labels: {
         mergedName: t("serverLibrary.mergedName"),
         mergedTag: t("serverLibrary.mergedTag"),
@@ -205,6 +217,7 @@ function LocalizedApp() {
   }, [
     activeServerAccountId,
     remoteConflicts,
+    remoteNotes,
     serverLibraryState,
     sftpScan,
     snapshot,
@@ -450,6 +463,55 @@ function LocalizedApp() {
       unlisten?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void api
+      .getPendingLinks()
+      .then((links) => setPendingLinks(links))
+      .catch(() => undefined);
+    void api
+      .getLastCrash()
+      .then((report) => {
+        if (report) setCrashReport(report);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlistenGame: (() => void) | null = null;
+    let unlistenReclaim: (() => void) | null = null;
+    const lastReclaimNotice = { at: 0 };
+    void import("@tauri-apps/api/event")
+      .then(async ({ listen }) => {
+        const stopGame = await listen<CrashReport>("game-crash-report", (event) => {
+          setCrashReport(event.payload);
+        });
+        const stopReclaim = await listen<ReclaimProgress>("reclaim-progress", (event) => {
+          const progress = event.payload;
+          const now = Date.now();
+          if (progress.waitedMs > 0 && now - lastReclaimNotice.at < 5000) return;
+          lastReclaimNotice.at = now;
+          notify(t("toast.reclaimWaiting.title"), progress.message, "default");
+        });
+        return [stopGame, stopReclaim] as const;
+      })
+      .then((stops) => {
+        if (disposed) stops.forEach((stop) => stop());
+        else {
+          unlistenGame = stops[0];
+          unlistenReclaim = stops[1];
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlistenGame?.();
+      unlistenReclaim?.();
+    };
+  }, [notify, t]);
 
   useEffect(() => {
     if (!activeServerAccountId || !sftpScan) {
@@ -1413,11 +1475,69 @@ function LocalizedApp() {
     }
   }
 
+  const serverLibraryViewRef = useRef<typeof serverLibraryView>(null);
+  serverLibraryViewRef.current = serverLibraryView;
+  const prepareTimer = useRef<number | null>(null);
+  const prepareBusyRef = useRef(false);
+  const serverLayoutRevision = useRef(0);
+
+  function scheduleServerPrepare() {
+    if (prepareTimer.current) window.clearTimeout(prepareTimer.current);
+    const revision = serverLayoutRevision.current;
+    prepareTimer.current = window.setTimeout(() => {
+      const view = serverLibraryViewRef.current;
+      if (!view || view.manifest || libraryMode !== "server") return;
+      void runServerPrepare(view, revision);
+    }, 900);
+  }
+
+  async function runServerPrepare(
+    view: NonNullable<typeof serverLibraryView>,
+    revision: number,
+  ) {
+    if (prepareBusyRef.current) return;
+    prepareBusyRef.current = true;
+    setServerPrepareBusy(true);
+    try {
+      const plan = await api.prepareSftpModLayout(
+        view.accountId,
+        view.state.order,
+        serverLibraryDisabledPaths(view.state),
+        view.state.deleted,
+        view.state.winners,
+      );
+      setServerPrepare(plan);
+      // 缓存已经热了，再取一次冲突报告，让右侧冲突面板与融合结果同源。
+      try {
+        setRemoteConflicts(await api.analyzeSftpConflicts(view.accountId));
+      } catch {
+        // 冲突报告失败不影响上传按钮，prepare 结果已经是可信的。
+      }
+      if (plan.required) {
+        notify(t("toast.serverPrepareReady.title"), plan.message, "default");
+      }
+    } catch (error) {
+      setServerError(String(error));
+      notify(t("toast.serverPrepareFailed.title"), String(error), "error");
+    } finally {
+      prepareBusyRef.current = false;
+      setServerPrepareBusy(false);
+      // 分析过程中用户又改了布局：结果已过期，按最新状态再跑一轮。
+      if (revision !== serverLayoutRevision.current) {
+        scheduleServerPrepare();
+      }
+    }
+  }
+
   function commitServerLibraryState(next: ServerLibraryState) {
     if (!activeServerAccountId || !sftpScan) return;
     const normalized = normalizeServerLibraryState(next, sftpScan);
     setServerLibraryState(normalized);
     storeServerLibraryState(activeServerAccountId, normalized, sftpScan);
+    // 任何布局改动都会让上一轮融合结果过期，等后台重新分析完再允许上传。
+    serverLayoutRevision.current += 1;
+    setServerPrepare(null);
+    scheduleServerPrepare();
   }
 
   function handleServerLibraryToggle(id: string, enabled: boolean) {
@@ -1433,6 +1553,55 @@ function LocalizedApp() {
     const state = serverLibraryView?.state;
     if (!state || serverLibraryView?.manifest) return;
     commitServerLibraryState({ ...state, order: ids });
+  }
+
+  async function handleServerLibraryDelete(id: string): Promise<boolean> {
+    const state = serverLibraryView?.state;
+    if (!state || serverLibraryView?.manifest) return false;
+    commitServerLibraryState({
+      ...state,
+      deleted: [...new Set([...state.deleted, id])],
+    });
+    notify(
+      t("toast.serverDeletePending.title"),
+      t("toast.serverDeletePending.detail"),
+      "default",
+    );
+    return true;
+  }
+
+  async function handleServerLibraryUndoDeleted() {
+    const state = serverLibraryView?.state;
+    if (!state || serverLibraryView?.manifest) return;
+    commitServerLibraryState({ ...state, deleted: [] });
+    notify(
+      t("toast.serverDeleteUndone.title"),
+      t("toast.serverDeleteUndone.detail"),
+      "success",
+    );
+  }
+
+  async function handleServerLibraryEdit(
+    id: string,
+    _tags: string[],
+    notes: string,
+  ): Promise<boolean> {
+    const state = serverLibraryView?.state;
+    const accountId = serverLibraryView?.accountId;
+    if (!state || !accountId || serverLibraryView?.manifest) return false;
+    try {
+      setRemoteNotes(await api.saveSftpRemoteNote(accountId, id, notes));
+      notify(
+        t("toast.remoteNoteSaved.title"),
+        t("toast.serverNotePreparing.detail"),
+        "success",
+      );
+      scheduleServerPrepare();
+      return true;
+    } catch (error) {
+      notify(t("toast.remoteNoteFailed.title"), String(error), "error");
+      return false;
+    }
   }
 
   async function handleServerLibrarySaveWinners(
@@ -1457,6 +1626,7 @@ function LocalizedApp() {
     setSftpScanAccountId(accountId);
     setSftpTrustPrompt(null);
     setRemoteConflictProgress(null);
+    setServerPrepare(null);
     setRemoteConflictLoading(true);
     try {
       const report = await api.analyzeSftpConflicts(accountId);
@@ -1504,9 +1674,11 @@ function LocalizedApp() {
         view.accountId,
         view.state.order,
         serverLibraryDisabledPaths(view.state),
+        view.state.deleted,
         view.state.winners,
       );
       notify(t("toast.serverLibraryApplied.title"), result.message, "success");
+      setServerPrepare(null);
       await refreshServerLibrary(view.accountId);
     } catch (error) {
       setServerError(String(error));
@@ -1525,6 +1697,7 @@ function LocalizedApp() {
     try {
       const result = await api.restoreSftpModLayout(accountId);
       notify(t("toast.serverLibraryRestored.title"), result.message, "success");
+      setServerPrepare(null);
       await refreshServerLibrary(accountId);
     } catch (error) {
       setServerError(String(error));
@@ -1532,6 +1705,48 @@ function LocalizedApp() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function handleReclaimPendingLinks() {
+    try {
+      const removed = await api.reclaimPendingLinks();
+      setPendingLinks([]);
+      notify(
+        t("toast.linksReclaimed.title"),
+        t("toast.linksReclaimed.detail", { count: removed }),
+        "success",
+      );
+    } catch (error) {
+      notify(t("toast.linksReclaimFailed.title"), String(error), "error");
+    }
+  }
+
+  function handleDismissPendingLinks() {
+    setPendingLinks([]);
+    void api.dismissPendingLinks();
+  }
+
+  async function handleDisableCrashSuspect(modId: string) {
+    try {
+      setSnapshot(await api.setModEnabled(modId, false));
+      setCrashReport((current) =>
+        current
+          ? { ...current, suspects: current.suspects.filter((item) => item.modId !== modId) }
+          : current,
+      );
+      notify(
+        t("toast.crashModDisabled.title"),
+        t("toast.crashModDisabled.detail"),
+        "success",
+      );
+    } catch (error) {
+      notify(t("toast.crashDisableFailed.title"), String(error), "error");
+    }
+  }
+
+  function handleCloseCrash() {
+    setCrashReport(null);
+    void api.dismissCrash();
   }
 
   async function handleChooseDirectory(kind: "client" | "server") {
@@ -1607,11 +1822,23 @@ function LocalizedApp() {
                       snapshot: serverLibraryView.snapshot,
                       state: serverLibraryView.state,
                       manifest: serverLibraryView.manifest,
+                      prepare: serverPrepare,
+                      preparing: serverPrepareBusy,
                       busy,
                       onRefresh: () => void handleServerLibraryRefresh(),
+                      onPrepare: () => {
+                        const view = serverLibraryViewRef.current;
+                        if (!view) return;
+                        serverLayoutRevision.current += 1;
+                        setServerPrepare(null);
+                        void runServerPrepare(view, serverLayoutRevision.current);
+                      },
                       onToggle: handleServerLibraryToggle,
                       onReorder: handleServerLibraryReorder,
                       onSaveConflictWinners: handleServerLibrarySaveWinners,
+                      onEdit: handleServerLibraryEdit,
+                      onDelete: handleServerLibraryDelete,
+                      onUndoDeleted: handleServerLibraryUndoDeleted,
                       onApply: () => void handleApplyServerLibrary(),
                       onRestore: () => void handleRestoreServerLibrary(),
                     } satisfies ServerLibraryView)
@@ -1692,6 +1919,17 @@ function LocalizedApp() {
               onSwitchAccount={(id) => void handleSwitchSftpAccount(id)}
             />
           ) : null}
+          {section === "backups" ? (
+            <BackupsScreen
+              onNotify={(title, detail, tone) => notify(title, detail, tone)}
+              onRestored={() => {
+                void api
+                  .scanLibrary()
+                  .then(setSnapshot)
+                  .catch(() => undefined);
+              }}
+            />
+          ) : null}
           {section === "logs" ? (
             <LogScreen
               logs={logs}
@@ -1730,6 +1968,95 @@ function LocalizedApp() {
           onClose={handleKeepExistingImport}
           onConfirm={() => void handleReplaceImport()}
         />
+      ) : null}
+      {pendingLinks.length > 0 ? (
+        <Modal
+          title={t("links.title")}
+          description={t("links.description")}
+          onClose={handleDismissPendingLinks}
+          footer={
+            <>
+              <Button onClick={handleDismissPendingLinks}>
+                {t("links.keep")}
+              </Button>
+              <Button
+                variant="primary"
+                icon="refresh"
+                onClick={() => void handleReclaimPendingLinks()}
+              >
+                {t("links.reclaim")}
+              </Button>
+            </>
+          }
+        >
+          <ul className="pending-link-list">
+            {pendingLinks.map((link) => (
+              <li key={link.path}>
+                <b>{link.path}</b>
+                <span>→ {link.target}</span>
+                <small>
+                  {link.kind === "pak"
+                    ? t("links.kind.pak")
+                    : link.kind === "ue4ss"
+                      ? t("links.kind.ue4ss")
+                      : t("links.kind.ue4ssMods")}
+                </small>
+              </li>
+            ))}
+          </ul>
+        </Modal>
+      ) : null}
+      {crashReport ? (
+        <Modal
+          title={t("crash.title")}
+          description={crashReport.summary}
+          onClose={handleCloseCrash}
+          footer={
+            <Button onClick={handleCloseCrash}>{t("crash.dismiss")}</Button>
+          }
+        >
+          <div className="crash-report">
+            {crashReport.suspects.length > 0 ? (
+              <section>
+                <b>{t("crash.suspects")}</b>
+                <ul className="crash-suspect-list">
+                  {crashReport.suspects.map((suspect) => (
+                    <li key={suspect.modId}>
+                      <div>
+                        <strong>{suspect.name}</strong>
+                        <span>{suspect.reason}</span>
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        onClick={() => void handleDisableCrashSuspect(suspect.modId)}
+                      >
+                        {t("crash.disable")}
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+            <section>
+              <b>{t("crash.suggestions")}</b>
+              <ol>
+                {crashReport.suggestions.map((suggestion) => (
+                  <li key={suggestion}>{suggestion}</li>
+                ))}
+              </ol>
+            </section>
+            {crashReport.evidence.length > 0 ? (
+              <details>
+                <summary>{t("crash.evidence")}</summary>
+                <pre>{crashReport.evidence.join("\n")}</pre>
+              </details>
+            ) : null}
+            {crashReport.logPath ? (
+              <code className="crash-log-path">{crashReport.logPath}</code>
+            ) : null}
+          </div>
+        </Modal>
       ) : null}
       {updateDialogOpen && updateInfo?.available ? (
         <UpdateDialog
