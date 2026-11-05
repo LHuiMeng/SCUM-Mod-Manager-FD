@@ -29,6 +29,9 @@ pub struct DeployedManifest {
     pub mode: String,
     #[serde(default)]
     pub file_sizes: BTreeMap<String, u64>,
+    /// 本次部署是否通过 junction + 硬链接完成（false = 直接复制进游戏目录）。
+    #[serde(default)]
+    pub use_links: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +200,7 @@ pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
         fingerprint: manifest.fingerprint,
         mode: manifest.mode,
         file_sizes: manifest.file_sizes,
+        use_links: manifest.use_links,
     };
     write_manifest(paths, &remaining)?;
     bail!(
@@ -276,8 +280,25 @@ pub fn deploy_local_mods(
             .join("Paks")
             .join("~mods")
     });
-    std::fs::create_dir_all(&pak_dir)
-        .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
+    // 链接模式：把 ~mods 变成指向启动器部署目录的 junction，部署只写硬链接（同卷 0 拷贝），
+    // 游戏直接读链接后的文件，退出也不用回收。复制模式保持原行为。
+    let use_links = settings.use_deploy_links;
+    let deploy_root = if use_links {
+        let root = paths
+            .root
+            .join("deployed")
+            .join(if is_server { "server" } else { "client" });
+        prepare_link_layout(paths, &pak_dir, &root)?;
+        root
+    } else {
+        if crate::mods::links::is_junction(&pak_dir) {
+            // 从链接模式切回来：先把 junction 换回真实目录，再按复制模式部署。
+            crate::mods::links::remove_junction(&pak_dir)?;
+        }
+        std::fs::create_dir_all(&pak_dir)
+            .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
+        pak_dir.clone()
+    };
 
     let canonical_mods = super::duplicates::collapse_identical_mods(
         mods.to_vec(),
@@ -294,9 +315,13 @@ pub fn deploy_local_mods(
             .as_ref()
             .map(merge_cache::ConflictMergePlan::fingerprint),
     );
-    if let Some(deployed_at) =
-        reusable_deployment(paths, install, is_server, &deployment_fingerprint)
-    {
+    if let Some(deployed_at) = reusable_deployment(
+        paths,
+        install,
+        is_server,
+        &deployment_fingerprint,
+        use_links,
+    ) {
         return Ok(Some(deployed_at));
     }
 
@@ -328,7 +353,8 @@ pub fn deploy_local_mods(
 
     let mut manifest = DeployedManifest {
         deployed_at: Utc::now().to_rfc3339(),
-        roots: vec![path_string(install), path_string(&pak_dir)],
+        roots: vec![path_string(install), path_string(&deploy_root)],
+        use_links,
         fingerprint: deployment_fingerprint,
         mode: if is_server { "server" } else { "client" }.to_string(),
         ..DeployedManifest::default()
@@ -369,20 +395,21 @@ pub fn deploy_local_mods(
             if !source.is_file() {
                 continue;
             }
-            let target = pak_dir.join(numbered_pak_file_name(
+            let target = deploy_root.join(numbered_pak_file_name(
                 index,
                 &item.file_name,
                 pak_prefix_width,
             ));
-            copy_file_record(&source, &target, &backup_root, &mut manifest)?;
+            place_file_record(&source, &target, &backup_root, &mut manifest, use_links)?;
         }
         if let Some(artifact) = &merge_artifact {
             let merged_file_name = conflict_merged_file_name(client_paks.len());
-            copy_file_record(
+            place_file_record(
                 &artifact.path,
-                &pak_dir.join(merged_file_name),
+                &deploy_root.join(merged_file_name),
                 &backup_root,
                 &mut manifest,
+                use_links,
             )?;
         }
 
@@ -479,11 +506,13 @@ fn reusable_deployment(
     install: &Path,
     is_server: bool,
     fingerprint: &str,
+    use_links: bool,
 ) -> Option<String> {
     let manifest = read_manifest(paths)?;
     let expected_mode = if is_server { "server" } else { "client" };
     if manifest.fingerprint != fingerprint
         || manifest.mode != expected_mode
+        || manifest.use_links != use_links
         || !manifest
             .roots
             .iter()
@@ -631,11 +660,75 @@ fn deploy_ue4ss_mod(
     Ok(())
 }
 
+/// 让游戏 `~mods` 指向启动器的部署目录。
+///
+/// 真实目录里如果还留着上一个版本复制的文件，先按清单回收；回收后仍有非管理器文件
+/// 就报错，绝不把用户自己的文件丢掉。
+fn prepare_link_layout(paths: &AppPaths, pak_dir: &Path, deployed_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(deployed_root)
+        .with_context(|| format!("无法创建部署目录 {}", deployed_root.display()))?;
+
+    if crate::mods::links::is_junction(pak_dir) {
+        crate::mods::links::ensure_junction(pak_dir, deployed_root).with_context(|| {
+            format!(
+                "无法把 {} 指向 {}",
+                pak_dir.display(),
+                deployed_root.display()
+            )
+        })?;
+        return Ok(());
+    }
+    if !pak_dir.exists() {
+        crate::mods::links::ensure_junction(pak_dir, deployed_root).with_context(|| {
+            format!(
+                "无法把 {} 指向 {}",
+                pak_dir.display(),
+                deployed_root.display()
+            )
+        })?;
+        return Ok(());
+    }
+    if !pak_dir.is_dir() {
+        bail!("游戏模组目录不是文件夹：{}", pak_dir.display());
+    }
+
+    reclaim_mods(paths)?;
+    let leftovers = std::fs::read_dir(pak_dir)?.filter_map(Result::ok).count();
+    if leftovers > 0 {
+        bail!(
+            "{} 里还有 {} 个非本管理器部署的文件，请先移走或清空后再切换链接模式",
+            pak_dir.display(),
+            leftovers
+        );
+    }
+    std::fs::remove_dir(pak_dir)
+        .with_context(|| format!("无法移除空目录 {}", pak_dir.display()))?;
+    crate::mods::links::ensure_junction(pak_dir, deployed_root).with_context(|| {
+        format!(
+            "无法把 {} 指向 {}",
+            pak_dir.display(),
+            deployed_root.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn copy_file_record(
     source: &Path,
     target: &Path,
     backup_root: &Path,
     manifest: &mut DeployedManifest,
+) -> Result<()> {
+    place_file_record(source, target, backup_root, manifest, false)
+}
+
+/// 同卷用硬链接落盘（0 字节写入），跨卷自动退回复制。
+fn place_file_record(
+    source: &Path,
+    target: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+    use_links: bool,
 ) -> Result<()> {
     if let Some(parent) = target.parent() {
         create_directory_recorded(parent, manifest)?;
@@ -669,8 +762,14 @@ fn copy_file_record(
     {
         manifest.files.push(path_string(target));
     }
-    std::fs::copy(source, target)
-        .with_context(|| format!("无法复制 {} 到 {}", source.display(), target.display()))?;
+    if use_links {
+        crate::mods::links::link_or_copy(source, target).with_context(|| {
+            format!("无法链接 {} 到 {}", source.display(), target.display())
+        })?;
+    } else {
+        std::fs::copy(source, target)
+            .with_context(|| format!("无法复制 {} 到 {}", source.display(), target.display()))?;
+    }
     let size = std::fs::metadata(target)
         .with_context(|| format!("无法读取部署文件 {}", target.display()))?
         .len();
@@ -926,6 +1025,88 @@ mod tests {
         assert!(!target.exists());
         assert!(!paths.deployment_manifest.exists());
         assert!(source.exists());
+    }
+
+    #[test]
+    fn deploys_through_a_junction_and_switches_back_to_copy() {
+        let temp = TempRoot::new("deploy-links");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let source = paths.local_mods.join("TestWeapon.pak");
+        fs::write(&source, b"pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .expect("PAK should be deployed");
+
+        assert!(
+            crate::mods::links::is_junction(&pak_dir),
+            "链接模式下 ~mods 必须是 junction"
+        );
+        let deployed_root = paths.root.join("deployed").join("client");
+        assert_eq!(
+            crate::mods::links::junction_target(&pak_dir).unwrap(),
+            deployed_root
+        );
+        let target = deployed_root.join("000_TestWeapon.pak");
+        assert_eq!(fs::read(&target).unwrap(), b"pak-content");
+        assert!(source.is_file(), "库文件不能被搬走或删掉");
+        let manifest = read_manifest(&paths).expect("manifest should exist");
+        assert!(manifest.use_links);
+        assert_eq!(manifest.files, vec![path_string(&target)]);
+
+        // 切回复制模式：junction 换回真实目录，文件复制进游戏目录。
+        let copy_settings = AppSettings {
+            use_deploy_links: false,
+            ..settings.clone()
+        };
+        deploy_local_mods(&paths, &copy_settings, &mods, false).unwrap();
+        assert!(!crate::mods::links::is_junction(&pak_dir));
+        assert_eq!(fs::read(pak_dir.join("000_TestWeapon.pak")).unwrap(), b"pak-content");
+        assert!(source.is_file());
+    }
+
+    #[test]
+    fn refuses_to_take_over_a_mods_dir_with_foreign_files() {
+        let temp = TempRoot::new("deploy-links-foreign");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::write(pak_dir.join("HandInstalled.pak"), b"user-mod").unwrap();
+        let source = paths.local_mods.join("TestWeapon.pak");
+        fs::write(&source, b"pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        let error = deploy_local_mods(&paths, &settings, &mods, false).unwrap_err();
+
+        assert!(
+            error.to_string().contains("非本管理器部署"),
+            "应为明确的接管拒绝：{error}"
+        );
+        assert!(pak_dir.join("HandInstalled.pak").is_file(), "用户文件必须保留");
+        assert!(!crate::mods::links::is_junction(&pak_dir));
     }
 
     #[test]

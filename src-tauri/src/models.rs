@@ -130,6 +130,9 @@ pub struct AppSettings {
     #[serde(alias = "cloud", alias = "cloud_sources")]
     pub cloud: CloudSettings,
     pub keep_deployed_mods_on_exit: bool,
+    /// 用 junction + 硬链接部署：游戏 ~mods 指向启动器部署目录，不复制、退出不删。
+    #[serde(default)]
+    pub use_deploy_links: bool,
     #[serde(default = "default_auto_merge_conflicts")]
     pub auto_merge_conflicts: bool,
     #[serde(alias = "sftpAccounts", alias = "sftp_accounts")]
@@ -152,6 +155,7 @@ impl Default for AppSettings {
             launch_options: LaunchOptions::default(),
             cloud: CloudSettings::default(),
             keep_deployed_mods_on_exit: false,
+            use_deploy_links: false,
             auto_merge_conflicts: true,
             sftp_accounts: Vec::new(),
             active_sftp_account_id: None,

@@ -52,7 +52,8 @@ impl AppState {
                 config::apply_default_cloud_sources(&mut settings, &secrets.cloud_base_urls);
                 settings
             });
-        if !settings.keep_deployed_mods_on_exit {
+        // 链接模式没有复制过任何文件，启动时不需要回收。
+        if !settings.keep_deployed_mods_on_exit && !settings.use_deploy_links {
             let _ = reclaim_mods(&paths);
         }
         let mut metadata = metadata::load_metadata(&paths).unwrap_or_else(|error| {
@@ -570,9 +571,12 @@ impl AppState {
     }
 
     pub fn reclaim_deployments_after_exit(&self) -> Result<Option<usize>> {
-        if self.settings.lock().unwrap().keep_deployed_mods_on_exit {
+        let settings = self.settings.lock().unwrap();
+        // 链接模式部署的是硬链接：游戏退出后保留，下次启动直接复用，不删也不重写。
+        if settings.keep_deployed_mods_on_exit || settings.use_deploy_links {
             return Ok(None);
         }
+        drop(settings);
         let reclaimed = reclaim_mods(&self.paths)?;
         *self.last_deployed_at.lock().unwrap() = None;
         Ok(Some(reclaimed))

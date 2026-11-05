@@ -297,6 +297,7 @@ let settings: AppSettings = {
   theme: "light",
   language: "zh-CN",
   keepDeployedModsOnExit: false,
+  useDeployLinks: false,
   autoMergeConflicts: true,
   launchOptions: {
     log: false,

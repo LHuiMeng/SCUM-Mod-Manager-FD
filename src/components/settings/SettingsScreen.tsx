@@ -249,6 +249,17 @@ export function SettingsScreen({
             </label>
             <label>
               <span>
+                <b>{t("settings.startup.useDeployLinks")}</b>
+                <small>{t("settings.startup.useDeployLinksDetail")}</small>
+              </span>
+              <Toggle
+                checked={draft.useDeployLinks}
+                onChange={(useDeployLinks) => update({ useDeployLinks })}
+                label={t("settings.startup.useDeployLinks")}
+              />
+            </label>
+            <label>
+              <span>
                 <b>{t("settings.startup.autoMergeConflicts")}</b>
                 <small>{t("settings.startup.autoMergeConflictsDetail")}</small>
               </span>

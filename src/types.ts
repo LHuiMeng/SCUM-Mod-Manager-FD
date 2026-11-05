@@ -84,6 +84,7 @@ export interface AppSettings {
   theme: ThemeMode;
   language: Language;
   keepDeployedModsOnExit: boolean;
+  useDeployLinks: boolean;
   autoMergeConflicts: boolean;
   launchOptions: LaunchOptions;
   cloud: CloudSettings;
