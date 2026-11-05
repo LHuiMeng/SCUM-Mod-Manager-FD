@@ -2490,65 +2490,14 @@ body.is-row-dragging {
   font-size: var(--type-body);
 }
 
-.sftp-url-import {
-  margin-top: 15px;
-  padding: 12px;
-  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--accent) 5%, var(--paper-hi));
-}
-
-.sftp-url-import label {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-
-.sftp-url-import label > span {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  color: var(--ink);
-  font-size: var(--type-label);
-}
-
-.sftp-url-import label small {
-  color: var(--muted);
-  font-size: var(--type-micro);
-  font-weight: 400;
-}
-
-.sftp-url-import label > div {
-  display: flex;
-  gap: 8px;
-}
-
-.sftp-url-import input {
-  flex: 1;
-  min-width: 0;
-  height: 36px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  color: var(--ink);
-  background: var(--paper-hi);
-  font-family: var(--mono);
-  font-size: var(--type-meta);
-}
-
-.sftp-url-import input:focus {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
-  box-shadow: 0 0 0 3px var(--accent-soft);
-}
-
-.sftp-import-message {
-  margin: 8px 0 0;
+/* 地址框下方的解析结果提示（成功为 good，失败为 danger） */
+.field-note {
   color: var(--good);
-  font-size: var(--type-meta);
+  font-size: var(--type-micro);
+  line-height: 1.45;
 }
 
-.sftp-import-message.is-error {
+.field-note.is-error {
   color: var(--danger);
 }
 
@@ -3500,12 +3449,6 @@ body.is-row-dragging {
 
   .form-span-2 {
     grid-column: span 1;
-  }
-
-  .sftp-url-import label > span {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 4px;
   }
 
   .remote-viewer-toolbar > div:first-child {
@@ -4567,12 +4510,6 @@ body.is-row-dragging {
   .remote-viewer-toolbar .search-field {
     max-width: none;
     margin-left: 0;
-  }
-
-  .sftp-url-import label > span {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 4px;
   }
 }
 

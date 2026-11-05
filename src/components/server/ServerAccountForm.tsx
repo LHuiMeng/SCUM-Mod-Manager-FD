@@ -1,7 +1,11 @@
 import { useEffect, useState, type FormEvent } from "react";
 import type { SftpAccount } from "../../types";
 import { useI18n } from "../../i18n";
-import { parseSftpConnectionUrl } from "../../lib/sftpUrl";
+import {
+  looksLikeConnectionString,
+  parseConnectionString,
+  parseHostPort,
+} from "../../lib/sftpUrl";
 import { Button } from "../ui/Button";
 
 export interface SftpTrustPrompt {
@@ -46,13 +50,12 @@ export function ServerAccountForm({
   const [secretInput, setSecretInput] = useState("");
   const [modsPath, setModsPath] = useState(editing?.modsPath ?? "");
   const [ue4ssPath, setUe4ssPath] = useState(editing?.ue4ssPath ?? "");
-  const [connectionUrl, setConnectionUrl] = useState("");
-  const [connectionMessage, setConnectionMessage] = useState<string | null>(
-    null,
-  );
-  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [addressNote, setAddressNote] = useState<{
+    text: string;
+    error: boolean;
+  } | null>(null);
 
-  // 编辑目标切换时重新灌字段，密码与 URL 永远清空。
+  // 编辑目标切换时重新灌字段，密码永远清空。
   useEffect(() => {
     setName(editing?.name ?? "");
     setHost(editing?.host ?? "");
@@ -61,37 +64,58 @@ export function ServerAccountForm({
     setModsPath(editing?.modsPath ?? "");
     setUe4ssPath(editing?.ue4ssPath ?? "");
     setSecretInput("");
-    setConnectionUrl("");
-    setConnectionMessage(null);
-    setConnectionError(null);
+    setAddressNote(null);
   }, [editing]);
 
-  function applyConnectionUrl(raw: string) {
-    try {
-      const parsed = parseSftpConnectionUrl(raw);
-      setHost(parsed.host);
-      setPort(parsed.port);
-      setUsername(parsed.username);
-      if (parsed.password) setSecretInput(parsed.password);
-      if (parsed.path) setModsPath(parsed.path);
-      if (!name.trim()) setName(parsed.username);
-      setConnectionUrl("");
-      setConnectionError(null);
-      setConnectionMessage(t("server.parsedConnection"));
-    } catch (parseError) {
-      setConnectionMessage(null);
-      setConnectionError(String(parseError));
-    }
-  }
+  /**
+   * 地址框里直接粘贴连接链接或 `主机:端口` 就自动拆分到各字段，不再额外占一个按钮控件。
+   * 纯主机名原样保留，不改写。
+   */
+  function applyAddressInput(raw: string): boolean {
+    const trimmed = raw.trim();
+    if (!trimmed) return false;
 
-  // 粘贴 / 输入停顿后自动解析连接串。
-  useEffect(() => {
-    const candidate = connectionUrl.trim();
-    if (!/^sftp:\/\/[^@\s]+@[^/\s]+:\d+(?:\/.*)?$/i.test(candidate)) return;
-    const timer = window.setTimeout(() => applyConnectionUrl(candidate), 450);
-    return () => window.clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionUrl]);
+    if (looksLikeConnectionString(trimmed)) {
+      try {
+        const parsed = parseConnectionString(trimmed);
+        setHost(parsed.host);
+        setPort(parsed.port);
+        setUsername(parsed.username);
+        if (parsed.password) setSecretInput(parsed.password);
+        if (parsed.path) setModsPath(parsed.path);
+        if (!name.trim()) setName(parsed.username);
+        setAddressNote({
+          text: t(
+            parsed.protocol === "sftp"
+              ? "server.parsedAddress"
+              : "server.parsedAddressOther",
+            { protocol: parsed.protocol },
+          ),
+          error: false,
+        });
+        return true;
+      } catch (parseError) {
+        setAddressNote({
+          text:
+            parseError instanceof Error
+              ? parseError.message
+              : String(parseError),
+          error: true,
+        });
+        return false;
+      }
+    }
+
+    const hostPort = parseHostPort(trimmed);
+    if (hostPort) {
+      setHost(hostPort.host);
+      setPort(hostPort.port);
+      setAddressNote({ text: t("server.parsedHostPort"), error: false });
+      return true;
+    }
+
+    return false;
+  }
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -123,57 +147,6 @@ export function ServerAccountForm({
         </div>
       </div>
 
-      <div className="sftp-url-import">
-        <label>
-          <span>
-            {t("server.connectionUrl")}
-            <small>{t("server.connectionUrlHint")}</small>
-          </span>
-          <div>
-            <input
-              value={connectionUrl}
-              onChange={(event) => {
-                setConnectionUrl(event.target.value);
-                setConnectionMessage(null);
-                setConnectionError(null);
-              }}
-              onPaste={(event) => {
-                const pasted = event.clipboardData.getData("text");
-                if (!pasted.trim()) return;
-                event.preventDefault();
-                setConnectionUrl(pasted);
-                applyConnectionUrl(pasted);
-              }}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter" || !connectionUrl.trim()) return;
-                event.preventDefault();
-                applyConnectionUrl(connectionUrl);
-              }}
-              placeholder={t("server.connectionUrlPlaceholder")}
-              spellCheck={false}
-            />
-            <Button
-              size="sm"
-              icon="arrow"
-              onClick={() => applyConnectionUrl(connectionUrl)}
-              disabled={!connectionUrl.trim()}
-            >
-              {t("server.parseConnection")}
-            </Button>
-          </div>
-        </label>
-        {connectionMessage ? (
-          <p className="sftp-import-message" role="status">
-            {connectionMessage}
-          </p>
-        ) : null}
-        {connectionError ? (
-          <p className="sftp-import-message is-error" role="alert">
-            {connectionError}
-          </p>
-        ) : null}
-      </div>
-
       <div className="form-grid">
         <label>
           <span>{t("server.accountName")}</span>
@@ -183,10 +156,34 @@ export function ServerAccountForm({
           <span>{t("server.host")}</span>
           <input
             value={host}
-            onChange={(event) => setHost(event.target.value)}
-            placeholder="sftp.example.com"
+            onChange={(event) => {
+              setHost(event.target.value);
+              setAddressNote(null);
+            }}
+            onPaste={(event) => {
+              const pasted = event.clipboardData.getData("text");
+              if (!pasted.trim()) return;
+              event.preventDefault();
+              setHost(pasted.trim());
+              applyAddressInput(pasted);
+            }}
+            onBlur={() => applyAddressInput(host)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              event.preventDefault();
+              applyAddressInput(host);
+            }}
+            placeholder={t("server.hostPlaceholder")}
             required
           />
+          {addressNote ? (
+            <small
+              className={addressNote.error ? "field-note is-error" : "field-note"}
+              role={addressNote.error ? "alert" : "status"}
+            >
+              {addressNote.text}
+            </small>
+          ) : null}
         </label>
         <label>
           <span>{t("server.port")}</span>
