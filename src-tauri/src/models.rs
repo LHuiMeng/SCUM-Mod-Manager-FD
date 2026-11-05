@@ -508,6 +508,18 @@ pub struct UploadResult {
     pub message: String,
 }
 
+/// 服务器上传进度：按文件与字节两个维度上报，前端用它显示“正在上传 X（2/5）”。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpUploadProgress {
+    pub file: String,
+    pub completed_files: usize,
+    pub total_files: usize,
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportResult {

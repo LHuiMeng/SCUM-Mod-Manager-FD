@@ -26,6 +26,8 @@ export interface ServerLibraryView {
   manifest: SftpManagedManifest | null;
   prepare: SftpPrepareResult | null;
   preparing: boolean;
+  analyzing: boolean;
+  uploading: boolean;
   busy: boolean;
   onRefresh: () => void;
   onPrepare: () => void;
@@ -147,11 +149,15 @@ export function LibraryScreen({
     const updates = mods.filter((mod) => mod.updateVersion).length;
     return { enabled, totalBytes, conflicts, updates };
   }, [activeSnapshot.conflicts.length, mods]);
-  const serverStatusTitle = server?.manifest
-    ? t("serverLibrary.managedSummary")
-    : summary.conflicts > 0
-      ? t("serverLibrary.conflictSummary", { count: summary.conflicts })
-      : t("serverLibrary.noConflictSummary");
+  const serverStatusTitle = server?.uploading
+    ? t("serverLibrary.uploadingHint")
+    : server?.analyzing
+      ? t("serverLibrary.analyzing")
+      : server?.manifest
+        ? t("serverLibrary.managedSummary")
+        : summary.conflicts > 0
+          ? t("serverLibrary.conflictSummary", { count: summary.conflicts })
+          : t("serverLibrary.noConflictSummary");
 
   return (
     <div className="library-layout">

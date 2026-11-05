@@ -675,5 +675,10 @@
   "toast.serverDeleteUndone.title": "已撤销删除",
   "toast.serverDeleteUndone.detail": "待删除列表已清空，服务器文件保持原样。",
   "serverLibrary.prepareUpload": "准备上传",
-  "backups.viewOnly": "仅可查看"
+  "backups.viewOnly": "仅可查看",
+  "serverLibrary.conflictsNotAnalyzed": "尚未分析服务器模组冲突，正在后台分析…",
+  "serverLibrary.analyzing": "正在分析服务器模组冲突…",
+  "toast.serverUploadStarted.title": "正在上传服务器模组",
+  "toast.serverUploadStarted.detail": "会先备份旧模组并写入融合溯源，完成前请不要关闭程序。",
+  "serverLibrary.uploadingHint": "正在上传服务器模组，请保持连接…"
 }

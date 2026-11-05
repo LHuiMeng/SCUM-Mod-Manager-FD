@@ -686,5 +686,10 @@
   "toast.serverDeleteUndone.title": "Deletions undone",
   "toast.serverDeleteUndone.detail": "Pending deletions cleared; server files are untouched.",
   "serverLibrary.prepareUpload": "Prepare upload",
-  "backups.viewOnly": "View only"
+  "backups.viewOnly": "View only",
+  "serverLibrary.conflictsNotAnalyzed": "Server mod conflicts are being analysed in the background.",
+  "serverLibrary.analyzing": "Analysing server mod conflicts…",
+  "toast.serverUploadStarted.title": "Uploading server mods",
+  "toast.serverUploadStarted.detail": "Old mods are backed up and provenance is written first. Keep the app open until it finishes.",
+  "serverLibrary.uploadingHint": "Uploading server mods, keep the connection open…"
 }

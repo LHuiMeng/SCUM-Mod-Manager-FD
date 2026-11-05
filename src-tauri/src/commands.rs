@@ -529,10 +529,21 @@ pub async fn upload_server_mods(
     kind: String,
     paths: Vec<String>,
 ) -> Result<UploadResult, String> {
+    let progress_app = app.clone();
+    let progress: sftp::SftpUploadProgressCallback = std::sync::Arc::new(move |payload| {
+        let _ = progress_app.emit("sftp-upload-progress", payload);
+    });
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let settings = state.settings.lock().unwrap().clone();
-        let result = sftp::upload_files(&state.paths, &settings, &account_id, &kind, &paths)?;
+        let result = sftp::upload_files(
+            &state.paths,
+            &settings,
+            &account_id,
+            &kind,
+            &paths,
+            progress,
+        )?;
         state.log("info", "sftp", &result.message);
         Ok::<_, anyhow::Error>(result)
     })

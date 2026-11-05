@@ -3,7 +3,7 @@ use crate::models::{
     AppSettings, ImportResult, ModEntry, RemoteFile, SftpAccount, SftpApplyResult,
     SftpConflictGroup, SftpConflictOwner, SftpConflictProgress, SftpConflictReport,
     SftpConnectionResult, SftpManagedBackup, SftpManagedManifest, SftpManagedRename,
-    SftpManagedSource, SftpOperationResult, SftpPrepareResult, UploadResult,
+    SftpManagedSource, SftpOperationResult, SftpPrepareResult, SftpUploadProgress, UploadResult,
 };
 use crate::paths::{path_string, safe_file_component, AppPaths};
 use anyhow::{bail, Context, Result};
@@ -42,6 +42,7 @@ const MAX_REMOTE_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_REMOTE_UE4SS_CONFIG_BYTES: u64 = 1024 * 1024;
 
 pub type SftpConflictProgressCallback = Arc<dyn Fn(SftpConflictProgress) + Send + Sync>;
+pub type SftpUploadProgressCallback = Arc<dyn Fn(SftpUploadProgress) + Send + Sync>;
 
 pub fn active_account<'a>(
     settings: &'a AppSettings,
@@ -281,11 +282,12 @@ pub fn upload_files(
     account_id: &str,
     kind: &str,
     local_paths: &[String],
+    progress: SftpUploadProgressCallback,
 ) -> Result<UploadResult> {
     let account = active_account(settings, Some(account_id))?;
     match kind {
-        "pak" => upload_pak_files(paths, account, local_paths),
-        "ue4ss" => upload_ue4ss_directories(paths, account, local_paths),
+        "pak" => upload_pak_files(paths, account, local_paths, progress),
+        "ue4ss" => upload_ue4ss_directories(paths, account, local_paths, progress),
         _ => bail!("不支持的远端模组类型：{kind}"),
     }
 }
@@ -1995,47 +1997,178 @@ fn safe_pak_relative_path(resource: &str) -> Result<PathBuf> {
     Ok(relative)
 }
 
+struct UploadItem {
+    local: PathBuf,
+    remote: String,
+    bytes: u64,
+    is_dir: bool,
+}
+
+/// 上传进度上报器：文件数 + 字节数，前端据此显示“正在上传 X（2/5，36%）”。
+struct UploadReporter {
+    progress: SftpUploadProgressCallback,
+    total_files: usize,
+    total_bytes: u64,
+    completed_files: usize,
+    completed_bytes: u64,
+    current: String,
+}
+
+impl UploadReporter {
+    fn new(progress: SftpUploadProgressCallback, total_files: usize, total_bytes: u64) -> Self {
+        Self {
+            progress,
+            total_files,
+            total_bytes,
+            completed_files: 0,
+            completed_bytes: 0,
+            current: String::new(),
+        }
+    }
+
+    fn announce(&self) {
+        (self.progress)(SftpUploadProgress {
+            file: String::new(),
+            completed_files: 0,
+            total_files: self.total_files,
+            completed_bytes: 0,
+            total_bytes: self.total_bytes,
+            message: format!(
+                "准备上传 {} 个文件（{}）",
+                self.total_files,
+                format_bytes(self.total_bytes)
+            ),
+        });
+    }
+
+    fn start(&mut self, file: &str) {
+        self.current = file.to_string();
+        self.emit();
+    }
+
+    fn add_bytes(&mut self, bytes: u64) {
+        self.completed_bytes = self
+            .completed_bytes
+            .saturating_add(bytes)
+            .min(self.total_bytes);
+        self.emit();
+    }
+
+    fn finish_file(&mut self) {
+        self.completed_files = self.completed_files.saturating_add(1).min(self.total_files);
+        self.emit();
+    }
+
+    fn emit(&self) {
+        let percent = if self.total_bytes > 0 {
+            self.completed_bytes.saturating_mul(100) / self.total_bytes
+        } else if self.total_files > 0 {
+            (self.completed_files as u64).saturating_mul(100) / self.total_files as u64
+        } else {
+            0
+        };
+        (self.progress)(SftpUploadProgress {
+            file: self.current.clone(),
+            completed_files: self.completed_files,
+            total_files: self.total_files,
+            completed_bytes: self.completed_bytes,
+            total_bytes: self.total_bytes,
+            message: format!(
+                "正在上传 {}（{}/{}，{}%）",
+                if self.current.is_empty() {
+                    "服务器模组"
+                } else {
+                    &self.current
+                },
+                self.completed_files,
+                self.total_files,
+                percent
+            ),
+        });
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn upload_pak_files(
     paths: &AppPaths,
     account: &SftpAccount,
     local_paths: &[String],
+    progress: SftpUploadProgressCallback,
 ) -> Result<UploadResult> {
     if account.mods_path.trim().is_empty() {
         bail!("尚未设置服务器远端 ~mods 路径");
     }
+    let mut plan = Vec::new();
+    for local in local_paths {
+        let local = Path::new(local);
+        if !local.is_file() {
+            continue;
+        }
+        if !local
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("pak"))
+        {
+            bail!("仅支持上传 .pak 文件：{}", local.display());
+        }
+        let name = validate_remote_name(
+            &local
+                .file_name()
+                .context("上传文件缺少文件名")?
+                .to_string_lossy(),
+        )?;
+        let remote = remote_join(&account.mods_path, &name);
+        let bytes = std::fs::metadata(local).map(|item| item.len()).unwrap_or(0);
+        plan.push(UploadItem {
+            local: local.to_path_buf(),
+            remote: remote.clone(),
+            bytes,
+            is_dir: false,
+        });
+        let local_signature = local.with_extension("sig");
+        if local_signature.is_file() {
+            let signature_bytes = std::fs::metadata(&local_signature)
+                .map(|item| item.len())
+                .unwrap_or(0);
+            plan.push(UploadItem {
+                local: local_signature,
+                remote: remote_with_extension(&remote, "sig"),
+                bytes: signature_bytes,
+                is_dir: false,
+            });
+        }
+    }
+    if plan.is_empty() {
+        bail!("没有可上传的 PAK 文件");
+    }
+    let total_bytes = plan.iter().map(|item| item.bytes).sum();
+    let reporter = UploadReporter::new(progress, plan.len(), total_bytes);
+    reporter.announce();
+    let mut reporter = reporter;
+
     let uploaded = with_sftp(paths, account, |sftp| {
         if !remote_dir_exists(sftp, &account.mods_path) {
             bail!("远端 PAK 目录不存在：{}", account.mods_path);
         }
         let mut uploaded = 0;
-        for local in local_paths {
-            let local = Path::new(local);
-            if !local.is_file() {
-                continue;
+        for item in &plan {
+            let name = entry_name(&item.remote);
+            reporter.start(&name);
+            upload_local_file_with_progress(sftp, &item.local, &item.remote, &mut |bytes| {
+                reporter.add_bytes(bytes);
+            })?;
+            reporter.finish_file();
+            if !item.remote.to_ascii_lowercase().ends_with(".sig") {
+                uploaded += 1;
             }
-            if !local
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("pak"))
-            {
-                bail!("仅支持上传 .pak 文件：{}", local.display());
-            }
-            let name = validate_remote_name(
-                &local
-                    .file_name()
-                    .context("上传文件缺少文件名")?
-                    .to_string_lossy(),
-            )?;
-            let remote = remote_join(&account.mods_path, &name);
-            upload_local_file(sftp, local, &remote)?;
-            let local_signature = local.with_extension("sig");
-            if local_signature.is_file() {
-                upload_local_file(
-                    sftp,
-                    &local_signature,
-                    &remote_with_extension(&remote, "sig"),
-                )?;
-            }
-            uploaded += 1;
         }
         Ok(uploaded)
     })?;
@@ -2045,32 +2178,102 @@ fn upload_pak_files(
     })
 }
 
+fn collect_ue4ss_plan(local_paths: &[String], ue4ss_path: &str) -> Result<Vec<UploadItem>> {
+    let mut plan = Vec::new();
+    for local in local_paths {
+        let local = Path::new(local);
+        if !local.is_dir() {
+            continue;
+        }
+        let name = validate_remote_name(
+            &local
+                .file_name()
+                .context("上传目录缺少名称")?
+                .to_string_lossy(),
+        )?;
+        let remote_root = remote_join(ue4ss_path, &name);
+        plan.push(UploadItem {
+            local: local.to_path_buf(),
+            remote: remote_root.clone(),
+            bytes: 0,
+            is_dir: true,
+        });
+        for entry in WalkDir::new(local).follow_links(false) {
+            let entry = entry.with_context(|| format!("无法遍历 {}", local.display()))?;
+            if entry.path() == local {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(local)
+                .context("UE4SS 上传路径越界")?;
+            if relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                bail!("UE4SS 上传路径包含非法目录");
+            }
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let remote = remote_join(&remote_root, &relative);
+            if entry.file_type().is_dir() {
+                plan.push(UploadItem {
+                    local: entry.path().to_path_buf(),
+                    remote,
+                    bytes: 0,
+                    is_dir: true,
+                });
+            } else if entry.file_type().is_file() {
+                let bytes = entry.metadata().map(|item| item.len()).unwrap_or(0);
+                plan.push(UploadItem {
+                    local: entry.path().to_path_buf(),
+                    remote,
+                    bytes,
+                    is_dir: false,
+                });
+            }
+            if plan.len() > MAX_REMOTE_TREE_ENTRIES {
+                bail!("UE4SS 上传文件数量超过 {MAX_REMOTE_TREE_ENTRIES} 个");
+            }
+        }
+    }
+    if plan.iter().all(|item| item.is_dir) {
+        bail!("没有可上传的 UE4SS 文件");
+    }
+    Ok(plan)
+}
+
 fn upload_ue4ss_directories(
     paths: &AppPaths,
     account: &SftpAccount,
     local_paths: &[String],
+    progress: SftpUploadProgressCallback,
 ) -> Result<UploadResult> {
     if account.ue4ss_path.trim().is_empty() {
         bail!("尚未设置服务器远端 UE4SS Mods 路径");
     }
+    let plan = collect_ue4ss_plan(local_paths, &account.ue4ss_path)?;
+    let file_count = plan.iter().filter(|item| !item.is_dir).count();
+    let total_bytes = plan.iter().map(|item| item.bytes).sum();
+    let mut reporter = UploadReporter::new(progress, file_count, total_bytes);
+    reporter.announce();
+
     let uploaded = with_sftp(paths, account, |sftp| {
         if !remote_dir_exists(sftp, &account.ue4ss_path) {
             bail!("远端 UE4SS Mods 目录不存在：{}", account.ue4ss_path);
         }
         let mut uploaded = 0;
-        for local in local_paths {
-            let local = Path::new(local);
-            if !local.is_dir() {
+        for item in &plan {
+            if item.is_dir {
+                ensure_remote_dir(sftp, &item.remote)?;
                 continue;
             }
-            let name = validate_remote_name(
-                &local
-                    .file_name()
-                    .context("上传目录缺少名称")?
-                    .to_string_lossy(),
-            )?;
-            let target = remote_join(&account.ue4ss_path, &name);
-            uploaded += upload_remote_tree(sftp, local, &target)?;
+            let name = entry_name(&item.remote);
+            reporter.start(&name);
+            upload_local_file_with_progress(sftp, &item.local, &item.remote, &mut |bytes| {
+                reporter.add_bytes(bytes);
+            })?;
+            reporter.finish_file();
+            uploaded += 1;
         }
         Ok(uploaded)
     })?;
@@ -2080,45 +2283,38 @@ fn upload_ue4ss_directories(
     })
 }
 
-fn upload_remote_tree(sftp: &Sftp, local_root: &Path, remote_root: &str) -> Result<usize> {
-    ensure_remote_dir(sftp, remote_root)?;
-    let mut uploaded = 0;
-    for entry in WalkDir::new(local_root).follow_links(false) {
-        let entry = entry.with_context(|| format!("无法遍历 {}", local_root.display()))?;
-        if entry.path() == local_root {
-            continue;
-        }
-        let relative = entry
-            .path()
-            .strip_prefix(local_root)
-            .context("UE4SS 上传路径越界")?;
-        if relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            bail!("UE4SS 上传路径包含非法目录");
-        }
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        let remote = remote_join(remote_root, &relative);
-        if entry.file_type().is_dir() {
-            ensure_remote_dir(sftp, &remote)?;
-        } else if entry.file_type().is_file() {
-            upload_local_file(sftp, entry.path(), &remote)?;
-            uploaded += 1;
-        }
-        if uploaded > MAX_REMOTE_TREE_ENTRIES {
-            bail!("UE4SS 上传文件数量超过 {MAX_REMOTE_TREE_ENTRIES} 个");
-        }
-    }
-    Ok(uploaded)
+fn upload_local_file(sftp: &Sftp, local: &Path, remote: &str) -> Result<()> {
+    upload_local_file_with_progress(sftp, local, remote, &mut |_| {})
 }
 
-fn upload_local_file(sftp: &Sftp, local: &Path, remote: &str) -> Result<()> {
+fn upload_local_file_with_progress(
+    sftp: &Sftp,
+    local: &Path,
+    remote: &str,
+    on_bytes: &mut dyn FnMut(u64),
+) -> Result<()> {
     let mut source = File::open(local).with_context(|| format!("无法读取 {}", local.display()))?;
     let mut target = sftp
         .create(Path::new(remote))
         .with_context(|| format!("无法创建远端文件 {remote}"))?;
-    std::io::copy(&mut source, &mut target)?;
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut reported = 0u64;
+    let mut uploaded = 0u64;
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        target.write_all(&buffer[..read])?;
+        uploaded += read as u64;
+        if uploaded - reported >= 512 * 1024 {
+            on_bytes(uploaded - reported);
+            reported = uploaded;
+        }
+    }
+    if uploaded > reported {
+        on_bytes(uploaded - reported);
+    }
     Ok(())
 }
 

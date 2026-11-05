@@ -30,6 +30,7 @@ import type {
   SftpManagedManifest,
   SftpPrepareResult,
   SftpUploadKind,
+  SftpUploadProgress,
   ThemeMode,
   ToastMessage,
   CrashReport,
@@ -132,11 +133,17 @@ function LocalizedApp() {
   const [remoteConflictLoading, setRemoteConflictLoading] = useState(false);
   const [remoteConflictProgress, setRemoteConflictProgress] =
     useState<SftpConflictProgress | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<SftpUploadProgress | null>(null);
+  const sftpAccountRef = useRef<string | null>(null);
+  const conflictRequestRef = useRef(0);
+  const uploadActiveRef = useRef(false);
+  const analyzedAccountRef = useRef<string | null>(null);
   const [libraryMode, setLibraryMode] = useState<"local" | "server">("local");
   const [serverLibraryState, setServerLibraryState] =
     useState<ServerLibraryState | null>(null);
   const [serverPrepare, setServerPrepare] = useState<SftpPrepareResult | null>(null);
   const [serverPrepareBusy, setServerPrepareBusy] = useState(false);
+  const [serverUploading, setServerUploading] = useState(false);
   const [pendingLinks, setPendingLinks] = useState<PendingLink[]>([]);
   const [crashReport, setCrashReport] = useState<CrashReport | null>(null);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo | null>(null);
@@ -525,6 +532,12 @@ function LocalizedApp() {
   }, [activeServerAccountId, sftpScan]);
 
   useEffect(() => {
+    if (libraryMode !== "server" || !activeServerAccountId) return;
+    if (analyzedAccountRef.current === activeServerAccountId) return;
+    void analyzeRemoteConflictsInBackground(activeServerAccountId);
+  }, [libraryMode, activeServerAccountId, sftpScan]);
+
+  useEffect(() => {
     if (libraryMode === "server" && !serverLibraryView) {
       setLibraryMode("local");
     }
@@ -538,6 +551,28 @@ function LocalizedApp() {
       .then(({ listen }) =>
         listen<SftpConflictProgress>("sftp-conflict-progress", (event) => {
           setRemoteConflictProgress(event.payload);
+        }),
+      )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<SftpUploadProgress>("sftp-upload-progress", (event) => {
+          if (!uploadActiveRef.current) return;
+          setUploadProgress(event.payload);
         }),
       )
       .then((stop) => {
@@ -1232,7 +1267,14 @@ function LocalizedApp() {
       setSnapshot(await api.getSnapshot());
       setSftpScan(result);
       setSftpScanAccountId(accountId);
-      setRemoteConflicts(null);
+      sftpAccountRef.current = accountId;
+      // 先给一个空报告，模组库的“服务器模组”标签立刻可用；冲突分析在后台补上。
+      setRemoteConflicts({
+        groups: [],
+        analyzedMods: 0,
+        skippedMods: 0,
+        message: t("serverLibrary.conflictsNotAnalyzed"),
+      });
       setRemoteConflictProgress(null);
       try {
         setRemoteNotes(await api.getSftpRemoteNotes(accountId));
@@ -1245,9 +1287,12 @@ function LocalizedApp() {
       } else {
         setRemoteFiles([]);
       }
+      // 不在这里自动下载全量服务器模组；等用户真正打开“服务器模组”时再分析。
+      analyzedAccountRef.current = null;
     } catch (error) {
       setSftpScan(null);
       setSftpScanAccountId(null);
+      sftpAccountRef.current = null;
       setRemoteNotes({});
       setRemoteConflicts(null);
       setRemoteConflictProgress(null);
@@ -1255,6 +1300,25 @@ function LocalizedApp() {
       notify(t("toast.sftpFailed.title"), String(error), "error");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function analyzeRemoteConflictsInBackground(accountId: string) {
+    const token = ++conflictRequestRef.current;
+    analyzedAccountRef.current = accountId;
+    setRemoteConflictLoading(true);
+    try {
+      const report = await api.analyzeSftpConflicts(accountId);
+      if (token !== conflictRequestRef.current) return;
+      setRemoteConflicts(report);
+      analyzedAccountRef.current = accountId;
+    } catch (error) {
+      if (token !== conflictRequestRef.current) return;
+      // 失败后允许下次切回服务器标签时重试；空报告仍让标签保持可用。
+      analyzedAccountRef.current = null;
+      setServerError(String(error));
+    } finally {
+      if (token === conflictRequestRef.current) setRemoteConflictLoading(false);
     }
   }
 
@@ -1314,6 +1378,15 @@ function LocalizedApp() {
       return;
     }
     setBusy(true);
+    uploadActiveRef.current = true;
+    setUploadProgress({
+      file: "",
+      completedFiles: 0,
+      totalFiles: selected.length,
+      completedBytes: 0,
+      totalBytes: 0,
+      message: kind === "pak" ? "正在上传 PAK 模组…" : "正在上传 UE4SS 模组…",
+    });
     try {
       const result = await api.uploadServerMods(accountId, kind, selected);
       notify(t("toast.uploadDone.title"), result.message, "success");
@@ -1323,6 +1396,8 @@ function LocalizedApp() {
       notify(t("toast.uploadFailed.title"), String(error), "error");
     } finally {
       setBusy(false);
+      uploadActiveRef.current = false;
+      setUploadProgress(null);
     }
   }
 
@@ -1495,7 +1570,7 @@ function LocalizedApp() {
     view: NonNullable<typeof serverLibraryView>,
     revision: number,
   ) {
-    if (prepareBusyRef.current) return;
+    if (prepareBusyRef.current || view.manifest) return;
     prepareBusyRef.current = true;
     setServerPrepareBusy(true);
     try {
@@ -1506,6 +1581,11 @@ function LocalizedApp() {
         view.state.deleted,
         view.state.winners,
       );
+      // 分析期间布局可能已经上传（manifest 出现），此时结果作废，避免“已托管”又被
+      // 一个陈旧的“等待上传”盖住。
+      if (revision !== serverLayoutRevision.current || serverLibraryViewRef.current?.manifest) {
+        return;
+      }
       setServerPrepare(plan);
       // 缓存已经热了，再取一次冲突报告，让右侧冲突面板与融合结果同源。
       try {
@@ -1619,6 +1699,11 @@ function LocalizedApp() {
   }
 
   async function refreshServerLibrary(accountId: string) {
+    serverLayoutRevision.current += 1;
+    if (prepareTimer.current) {
+      window.clearTimeout(prepareTimer.current);
+      prepareTimer.current = null;
+    }
     const result = await api.testSftpConnection(accountId);
     if (!result.ok) throw new Error(result.message);
     setSnapshot(await api.getSnapshot());
@@ -1669,6 +1754,12 @@ function LocalizedApp() {
     setServerError(null);
     setRemoteConflictLoading(true);
     setRemoteConflictProgress(null);
+    setServerUploading(true);
+    notify(
+      t("toast.serverUploadStarted.title"),
+      t("toast.serverUploadStarted.detail"),
+      "default",
+    );
     try {
       const result: SftpApplyResult = await api.applySftpModLayout(
         view.accountId,
@@ -1678,6 +1769,12 @@ function LocalizedApp() {
         view.state.winners,
       );
       notify(t("toast.serverLibraryApplied.title"), result.message, "success");
+      // 上传完成后任何未触发的融合计划都过期了，取消它，避免旧计划盖住“已托管”状态。
+      serverLayoutRevision.current += 1;
+      if (prepareTimer.current) {
+        window.clearTimeout(prepareTimer.current);
+        prepareTimer.current = null;
+      }
       setServerPrepare(null);
       await refreshServerLibrary(view.accountId);
     } catch (error) {
@@ -1685,6 +1782,7 @@ function LocalizedApp() {
       notify(t("toast.serverLibraryApplyFailed.title"), String(error), "error");
     } finally {
       setRemoteConflictLoading(false);
+      setServerUploading(false);
       setBusy(false);
     }
   }
@@ -1824,6 +1922,8 @@ function LocalizedApp() {
                       manifest: serverLibraryView.manifest,
                       prepare: serverPrepare,
                       preparing: serverPrepareBusy,
+                      analyzing: remoteConflictLoading && !serverUploading,
+                      uploading: serverUploading,
                       busy,
                       onRefresh: () => void handleServerLibraryRefresh(),
                       onPrepare: () => {
@@ -1899,6 +1999,7 @@ function LocalizedApp() {
               conflicts={remoteConflicts}
               conflictLoading={remoteConflictLoading}
               conflictProgress={remoteConflictProgress}
+              uploadProgress={uploadProgress}
               onSaveAccount={(account, password) =>
                 void handleSaveSftpAccount(account, password)
               }

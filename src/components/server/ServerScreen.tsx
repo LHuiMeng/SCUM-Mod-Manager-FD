@@ -6,6 +6,7 @@ import type {
   SftpConflictReport,
   SftpConnectionResult,
   SftpUploadKind,
+  SftpUploadProgress,
 } from "../../types";
 import { useI18n } from "../../i18n";
 import { isRemotePathWithin, normalizeRemotePath } from "../../lib/remotePath";
@@ -30,6 +31,7 @@ export interface ServerScreenProps {
   conflicts: SftpConflictReport | null;
   conflictLoading: boolean;
   conflictProgress: SftpConflictProgress | null;
+  uploadProgress: SftpUploadProgress | null;
   onSaveAccount: (
     account: Omit<SftpAccount, "id" | "hasPassword">,
     password: string,
@@ -63,6 +65,15 @@ export interface ServerScreenProps {
   onSwitchAccount: (accountId: string) => void;
 }
 
+function formatUploadBytes(done: number, total: number): string {
+  const unit = (value: number) => {
+    if (value >= 1024 * 1024) return `${(value / 1_048_576).toFixed(1)} MB`;
+    if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${value} B`;
+  };
+  return `${unit(done)} / ${unit(total)}`;
+}
+
 /**
  * 服务器页：连接后双列固定布局（左 = 账户条 + 文件浏览，右 = 模组布局查看器），
  * 未连接时整页内联账户表单。可拖动的浮动面板系统已移除。
@@ -80,6 +91,7 @@ export function ServerScreen({
   conflicts,
   conflictLoading,
   conflictProgress,
+  uploadProgress,
   onSaveAccount,
   onTestAccount,
   onTrustHost,
@@ -167,6 +179,38 @@ export function ServerScreen({
           </Button>
         </div>
       </header>
+
+      {uploadProgress ? (
+        <div className="server-upload-progress" role="status" aria-live="polite">
+          <div className="server-upload-progress-copy">
+            <b>{uploadProgress.message}</b>
+            <span>
+              {uploadProgress.totalBytes > 0
+                ? formatUploadBytes(uploadProgress.completedBytes, uploadProgress.totalBytes)
+                : `${uploadProgress.completedFiles}/${uploadProgress.totalFiles}`}
+            </span>
+          </div>
+          <div className="server-upload-progress-track" aria-hidden="true">
+            <i
+              style={{
+                width: `${
+                  uploadProgress.totalBytes > 0
+                    ? Math.min(
+                        100,
+                        (uploadProgress.completedBytes / uploadProgress.totalBytes) * 100,
+                      )
+                    : uploadProgress.totalFiles > 0
+                      ? Math.min(
+                          100,
+                          (uploadProgress.completedFiles / uploadProgress.totalFiles) * 100,
+                        )
+                      : 0
+                }%`,
+              }}
+            />
+          </div>
+        </div>
+      ) : null}
 
       {active && connected && scan ? (
         <div className="server-workspace-grid">

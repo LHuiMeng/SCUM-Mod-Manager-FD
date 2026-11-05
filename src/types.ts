@@ -209,6 +209,15 @@ export interface SftpConflictProgress {
   message: string;
 }
 
+export interface SftpUploadProgress {
+  file: string;
+  completedFiles: number;
+  totalFiles: number;
+  completedBytes: number;
+  totalBytes: number;
+  message: string;
+}
+
 export interface SftpManagedSource {
   name: string;
   path: string;

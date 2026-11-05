@@ -4941,3 +4941,60 @@ body.is-row-dragging {
     font-size: 26px;
   }
 }
+
+/* 服务器上传进度：文件数 + 字节数，上传大 PAK 时用户能看到确实在动 */
+.server-upload-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-bottom: 12px;
+  padding: 10px 13px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--line));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 5%, var(--paper-lo));
+}
+
+.server-upload-progress-copy {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.server-upload-progress-copy b {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--type-label);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.server-upload-progress-copy span {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+
+.server-upload-progress-track {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.server-upload-progress-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.18s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .server-upload-progress-track i {
+    transition: none;
+  }
+}

@@ -464,13 +464,21 @@ async function connect(url, appUrl) {
     await waitFor("document.querySelectorAll('.mod-row').length === 1");
     await setInput("搜索模组、标签或备注", "");
     await waitFor(`document.querySelectorAll('.mod-row').length === ${before}`);
-    await clickText("客户端 PAK");
+    const reflowing = await evaluate(`(() => {
+      const button = [...document.querySelectorAll(".filter-chip")]
+        .find(item => item.innerText.includes("客户端 PAK"));
+      button?.click();
+      return [...document.querySelectorAll(".mod-row")].some(row =>
+        row.getAnimations().some(animation => {
+          const timing = animation.effect?.getTiming();
+          return timing?.duration === 260;
+        }),
+      );
+    })()`);
+    await waitFor(
+      "document.querySelector('.filter-chip.is-active')?.innerText.includes('客户端 PAK')",
+    );
     const clientRows = await evaluate("document.querySelectorAll('.mod-row').length");
-    const reflowing = await evaluate(`[...document.querySelectorAll(".mod-row")]
-      .some(row => row.getAnimations().some(animation => {
-        const timing = animation.effect?.getTiming();
-        return timing?.duration === 260;
-      }))`);
     if (!reflowing) throw new Error("筛选后的列表重排动效未生效");
     await clickText("全部");
     const allRows = await evaluate("document.querySelectorAll('.mod-row').length");
@@ -977,6 +985,14 @@ async function connect(url, appUrl) {
     await waitFor(
       "document.querySelector('.library-source-switch button:not(:disabled)') !== null",
     );
+    const serverTabDisabled = await evaluate(`(() => {
+      const button = [...document.querySelectorAll(".library-source-switch button")]
+        .find(item => item.innerText.includes("服务器模组"));
+      return button ? button.disabled : true;
+    })()`);
+    if (serverTabDisabled) {
+      throw new Error("已连接服务器，但模组库的服务器模组标签仍被禁用");
+    }
     await clickText("服务器模组", ".library-source-switch button");
     await waitFor("document.querySelector('h1')?.innerText === '服务器模组库'");
     screenshots.push(await screenshot("1440-light-server-library"));
