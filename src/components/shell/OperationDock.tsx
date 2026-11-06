@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import type { OperationEntry } from "../../lib/operations";
-import { formatElapsed, operationKindKey, operationPercent } from "../../lib/operations";
+import {
+  formatElapsed,
+  operationDetail,
+  operationKindKey,
+  operationPercent,
+} from "../../lib/operations";
 import { useI18n } from "../../i18n";
 
 interface OperationDockProps {
@@ -32,8 +37,7 @@ export function OperationDock({ current, history }: OperationDockProps) {
       <div className="operation-dock-copy">
         <b>{t(operationKindKey(current.kind))}</b>
         <span>
-          {current.message}
-          {current.currentItem ? ` · ${current.currentItem}` : ""}
+          {operationDetail(current)}
         </span>
       </div>
       <div className="operation-dock-track" aria-hidden="true">

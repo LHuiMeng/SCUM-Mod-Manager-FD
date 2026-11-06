@@ -10,7 +10,7 @@ import type {
 } from "../../types";
 import type { ServerLibraryState } from "../../lib/serverLibrary";
 import type { OperationEntry } from "../../lib/operations";
-import { operationKindKey, operationPercent } from "../../lib/operations";
+import { operationDetail, operationKindKey, operationPercent } from "../../lib/operations";
 import { useI18n } from "../../i18n";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
@@ -265,10 +265,7 @@ export function LibraryScreen({
                   <div className="server-library-progress-copy">
                     <b>{t(operationKindKey(server.operation.kind))}</b>
                     <span>
-                      {server.operation.message}
-                      {server.operation.currentItem
-                        ? ` · ${server.operation.currentItem}`
-                        : ""}
+                      {operationDetail(server.operation)}
                     </span>
                   </div>
                   <div className="server-library-progress-track" aria-hidden="true">

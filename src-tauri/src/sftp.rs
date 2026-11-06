@@ -3041,6 +3041,8 @@ fn analyze_remote_conflicts_inner(
                                 break;
                             }
                             let task = &tasks[index];
+                            // 文件名只走 current_file：message 里再写一遍，界面会连成
+                            // 「正在下载 X.pak · X.pak」，看起来像两个相同模组在互相比对。
                             send_conflict_progress(
                                 &progress,
                                 "downloading",
@@ -3049,7 +3051,7 @@ fn analyze_remote_conflicts_inner(
                                 completed_bytes.load(Ordering::Relaxed),
                                 total_bytes,
                                 Some(task.file.name.clone()),
-                                &format!("正在下载 {}", task.file.name),
+                                "正在下载服务器模组",
                             );
                             let partial = task
                                 .local
@@ -3093,7 +3095,7 @@ fn analyze_remote_conflicts_inner(
                                             bytes,
                                             total_bytes,
                                             Some(task.file.name.clone()),
-                                            &format!("正在下载 {}", task.file.name),
+                                            "正在下载服务器模组",
                                         );
                                     }
                                 }
@@ -3124,7 +3126,7 @@ fn analyze_remote_conflicts_inner(
                                 completed_bytes.load(Ordering::Relaxed),
                                 total_bytes,
                                 Some(task.file.name.clone()),
-                                &format!("已完成 {}", task.file.name),
+                                &format!("已下载 {finished}/{total_files}"),
                             );
                         }
                         Ok(())
@@ -3180,15 +3182,16 @@ fn analyze_remote_conflicts_inner(
                         break;
                     }
                     let (file, local) = &downloaded[index];
+                    let parsed_so_far = parse_done.load(Ordering::Relaxed);
                     send_conflict_progress(
                         &progress,
                         "parsing",
-                        parse_done.load(Ordering::Relaxed),
+                        parsed_so_far,
                         total_files,
                         0,
                         total_bytes,
                         Some(file.name.clone()),
-                        &format!("正在解析 {}", file.name),
+                        &format!("正在解析 PAK 资源清单 {parsed_so_far}/{total_files}"),
                     );
                     match crate::mods::list_pak_entries(paths, local) {
                         Ok(entries) => {
@@ -3214,7 +3217,7 @@ fn analyze_remote_conflicts_inner(
                         0,
                         total_bytes,
                         Some(file.name.clone()),
-                        &format!("已解析 {}", file.name),
+                        &format!("已解析 {finished}/{total_files}"),
                     );
                 }));
             }

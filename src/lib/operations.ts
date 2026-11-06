@@ -42,6 +42,19 @@ export function operationPercent(entry: OperationEntry | null): number | null {
   return Math.min(100, Math.round((entry.completed / entry.total) * 100));
 }
 
+type OperationCopy = Pick<SftpOperationProgress, "message" | "currentItem">;
+
+/**
+ * 操作条正文：`message + · 当前项`。
+ * 后端有些阶段（旧版下载/解析）会把文件名写进 message，再拼一次就变成
+ * 「正在下载 X.pak · X.pak」，看着像两个相同模组——这里做一次去重。
+ */
+export function operationDetail(entry: OperationCopy): string {
+  const item = entry.currentItem?.trim() ?? "";
+  if (!item || entry.message.includes(item)) return entry.message;
+  return `${entry.message} · ${item}`;
+}
+
 export function formatElapsed(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000));
   const hours = Math.floor(total / 3600);

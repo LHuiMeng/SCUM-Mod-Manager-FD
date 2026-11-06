@@ -5,6 +5,7 @@ import {
   clearOperation,
   emptyOperations,
   formatElapsed,
+  operationDetail,
   operationKindKey,
   operationPercent,
 } from "./operations";
@@ -62,6 +63,33 @@ describe("operations", () => {
     expect(operationKindKey("prepare")).toBe("operation.kind.prepare");
     expect(operationKindKey("download")).toBe("operation.kind.download");
     expect(operationKindKey("unknown-kind")).toBe("operation.kind.other");
+  });
+});
+
+describe("operationDetail", () => {
+  it("message 里已经写了文件名就不再拼一次", () => {
+    // 后端旧版会把文件名塞进 message，同时又在 currentItem 里给同一个名字：
+    // 拼起来就成了「正在下载 X.pak · X.pak」，看起来像两个相同模组。
+    expect(
+      operationDetail({
+        message: "正在下载 1144整合包_15件套_2026-11-01.pak",
+        currentItem: "1144整合包_15件套_2026-11-01.pak",
+      }),
+    ).toBe("正在下载 1144整合包_15件套_2026-11-01.pak");
+  });
+
+  it("message 不含当前项时补上 · 分隔", () => {
+    expect(operationDetail({ message: "正在下载服务器模组", currentItem: "Alpha.pak" })).toBe(
+      "正在下载服务器模组 · Alpha.pak",
+    );
+  });
+
+  it("没有当前项就只显示 message", () => {
+    expect(operationDetail({ message: "服务器模组没有待上传的变更", currentItem: null })).toBe(
+      "服务器模组没有待上传的变更",
+    );
+    expect(operationDetail({ message: "分析完成" })).toBe("分析完成");
+    expect(operationDetail({ message: "分析完成", currentItem: "   " })).toBe("分析完成");
   });
 });
 
