@@ -353,6 +353,10 @@ describe("server library model", () => {
     );
 
     expect(state.enabled["/srv/mods/Alpha.pak"]).toBe(false);
+    // 备份里没被用户显式打开的条目必须默认禁用，否则会被当成 released 重新启用
+    const fresh = normalizeServerLibraryState(null, scanWithBackup);
+    expect(fresh.enabled["/srv/mods/Alpha.pak"]).toBe(false);
+    expect(serverLibraryReleasedPaths(fresh, scanWithBackup)).toEqual([]);
     expect(serverLibraryDisabledPaths(state)).toEqual(["/srv/mods/Alpha.pak"]);
     expect(state.order).toEqual(["/srv/mods/Alpha.pak", "/srv/mods/Beta.pak"]);
     expect(serverLibraryReleasedPaths(state, scanWithBackup)).toEqual([]);

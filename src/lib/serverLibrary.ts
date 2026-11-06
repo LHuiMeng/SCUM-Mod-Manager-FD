@@ -66,9 +66,12 @@ export function normalizeServerLibraryState(
   for (const path of available) {
     if (!requestedOrder.includes(path)) requestedOrder.push(path);
   }
+  const listed = new Set([...scan.pakMods, ...scan.ue4ssMods].map((file) => file.path));
   const enabled: Record<string, boolean> = {};
   for (const path of available) {
-    enabled[path] = input.enabled?.[path] !== false;
+    // 只存在于备份批次的条目默认是「禁用」：否则清空 localStorage 后它会被当成启用，
+    // 下一次 apply 就把它当成 released 又启用回来（用户问题 3 的复发路径）。
+    enabled[path] = input.enabled?.[path] ?? listed.has(path);
   }
   const winners =
     input.winners && typeof input.winners === "object"
