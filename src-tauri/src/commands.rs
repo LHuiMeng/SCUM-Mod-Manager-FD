@@ -591,6 +591,22 @@ pub async fn download_remote_mod(app: AppHandle, id: String) -> Result<DownloadR
 }
 
 #[tauri::command]
+pub async fn sftp_directory_usage(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+) -> Result<sftp::RemoteDirectoryUsage, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        sftp::remote_directory_usage(&state.paths, &settings, &account_id, &path)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(error_text)?
+}
+
+#[tauri::command]
 pub async fn trust_sftp_host(
     app: AppHandle,
     account_id: String,
@@ -873,6 +889,54 @@ pub async fn save_sftp_remote_note(
     .await
     .map_err(error_text)?
     .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn list_remote_config_files(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+) -> Result<Vec<RemoteFile>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        sftp::list_remote_config_files(&state.paths, &settings, &account_id, &path)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(error_text)?
+}
+
+#[tauri::command]
+pub async fn read_remote_config_file(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        sftp::read_remote_config(&state.paths, &settings, &account_id, &path).map_err(error_text)
+    })
+    .await
+    .map_err(error_text)?
+}
+
+#[tauri::command]
+pub async fn write_remote_config_file(
+    app: AppHandle,
+    account_id: String,
+    path: String,
+    content: String,
+) -> Result<SftpOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let settings = state.settings.lock().unwrap().clone();
+        sftp::write_remote_config(&state.paths, &settings, &account_id, &path, &content)
+            .map_err(error_text)
+    })
+    .await
+    .map_err(error_text)?
 }
 
 #[tauri::command]

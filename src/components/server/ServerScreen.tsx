@@ -250,6 +250,7 @@ export function ServerScreen({
           <div className="server-pane server-pane-viewer panel-viewer">
             <RemoteModViewer
               scan={scan}
+              accountId={active.id}
               notes={notes}
               conflicts={conflicts}
               conflictLoading={conflictLoading}

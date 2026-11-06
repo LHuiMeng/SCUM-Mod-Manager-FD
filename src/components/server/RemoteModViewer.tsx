@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
+  ModConfigFile,
+  RemoteDirectoryUsage,
   RemoteFile,
   SftpConflictProgress,
   SftpConflictReport,
@@ -8,6 +10,8 @@ import type {
 } from "../../types";
 import { useI18n } from "../../i18n";
 import { formatBytes, formatDate } from "../../lib/format";
+import { api } from "../../api/tauri";
+import { ConfigEditorDialog } from "../library/ConfigEditorDialog";
 import { Button } from "../ui/Button";
 import { EmptyState } from "../ui/EmptyState";
 import { Icon } from "../ui/Icon";
@@ -16,6 +20,7 @@ import { SearchField } from "../ui/SearchField";
 
 interface RemoteModViewerProps {
   scan: SftpConnectionResult;
+  accountId: string;
   notes: Record<string, string>;
   conflicts: SftpConflictReport | null;
   conflictLoading: boolean;
@@ -36,6 +41,7 @@ type ViewerFilter = "all" | SftpUploadKind;
 
 export function RemoteModViewer({
   scan,
+  accountId,
   notes,
   conflicts,
   conflictLoading,
@@ -57,6 +63,9 @@ export function RemoteModViewer({
   const [renameValue, setRenameValue] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [operationBusy, setOperationBusy] = useState(false);
+  const [usage, setUsage] = useState<Record<string, RemoteDirectoryUsage>>({});
+  const [configFiles, setConfigFiles] = useState<ModConfigFile[] | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
 
   const items = useMemo<ViewerItem[]>(
     () => [
@@ -137,6 +146,21 @@ export function RemoteModViewer({
     setDraftNote(selected ? notes[selected.path] ?? "" : "");
   }, [selected?.path]);
 
+  // 远端目录体积按需统计：不进连接扫描，选中时算一次并缓存。
+  useEffect(() => {
+    if (!selected || !selected.isDirectory || usage[selected.path]) return;
+    let cancelled = false;
+    void api
+      .sftpDirectoryUsage(accountId, selected.path)
+      .then((value) => {
+        if (!cancelled) setUsage((current) => ({ ...current, [selected.path]: value }));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId, selected, usage]);
+
   const noteChanged = Boolean(selected && draftNote !== (notes[selected.path] ?? ""));
   const invalidRename =
     !renameValue.trim() ||
@@ -178,6 +202,29 @@ export function RemoteModViewer({
       }
     } finally {
       setOperationBusy(false);
+    }
+  }
+
+  async function openConfigEditor() {
+    if (!selected) return;
+    setConfigError(null);
+    try {
+      const files = await api.listRemoteConfigFiles(accountId, selected.path);
+      if (files.length === 0) {
+        setConfigError(t("config.empty"));
+        return;
+      }
+      setConfigFiles(
+        files.map((file) => ({
+          name: file.name,
+          relativePath: file.path,
+          size: file.size,
+          editable: true,
+          managedByApp: false,
+        })),
+      );
+    } catch (error) {
+      setConfigError(String(error));
     }
   }
 
@@ -339,7 +386,13 @@ export function RemoteModViewer({
               <dl className="remote-viewer-facts">
                 <div>
                   <dt>{t("remoteViewer.size")}</dt>
-                  <dd>{selected.isDirectory ? t("common.directory") : formatBytes(selected.size)}</dd>
+                  <dd>
+                    {selected.isDirectory
+                      ? usage[selected.path]
+                        ? `${formatBytes(usage[selected.path].bytes)}${usage[selected.path].truncated ? "+" : ""} · ${t("config.fileCount", { count: usage[selected.path].files })}`
+                        : t("common.calculating")
+                      : formatBytes(selected.size)}
+                  </dd>
                 </div>
                 <div>
                   <dt>{t("remoteViewer.modified")}</dt>
@@ -379,6 +432,21 @@ export function RemoteModViewer({
                       </div>
                     ))}
                   </div>
+                </section>
+              ) : null}
+
+              {selected.kind === "ue4ss" && selected.isDirectory ? (
+                <section className="remote-viewer-conflicts">
+                  <div className="section-title">
+                    <span>{t("config.title")}</span>
+                    <b>{configFiles ? configFiles.length : 0}</b>
+                  </div>
+                  {configError ? (
+                    <p className="remote-viewer-modal-error">{configError}</p>
+                  ) : null}
+                  <Button size="sm" icon="edit" onClick={() => void openConfigEditor()}>
+                    {t("config.edit")}
+                  </Button>
                 </section>
               ) : null}
 
@@ -474,6 +542,24 @@ export function RemoteModViewer({
           )}
         </div>
       </div>
+
+      {configFiles ? (
+        <ConfigEditorDialog
+          modName={selected?.name ?? ""}
+          files={configFiles}
+          load={(relativePath) => api.readRemoteConfigFile(accountId, relativePath)}
+          save={async (relativePath, content) => {
+            try {
+              await api.writeRemoteConfigFile(accountId, relativePath, content);
+              return true;
+            } catch (error) {
+              setConfigError(String(error));
+              return false;
+            }
+          }}
+          onClose={() => setConfigFiles(null)}
+        />
+      ) : null}
 
       {renameOpen && selected ? (
         <Modal

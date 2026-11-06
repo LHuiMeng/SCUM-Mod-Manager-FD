@@ -864,6 +864,32 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       else delete remoteNotes[path];
       return structuredClone(remoteNotes) as T;
     }
+    case "sftp_directory_usage": {
+      return {
+        path: String(args?.path ?? ""),
+        bytes: 3_400_000,
+        files: 23,
+        truncated: false,
+      } as T;
+    }
+    case "list_remote_config_files": {
+      return [
+        {
+          name: "config.ini",
+          path: `${String(args?.path ?? "")}/config.ini`,
+          isDirectory: false,
+          size: 42,
+          modifiedAt: new Date().toISOString(),
+        },
+      ] as T;
+    }
+    case "read_remote_config_file":
+      return "[General]\nenabled=true\n" as T;
+    case "write_remote_config_file":
+      return {
+        message: "已保存远端配置（演示环境）",
+        path: String(args?.path ?? ""),
+      } as T;
     case "analyze_sftp_conflicts": {
       simulateMockOperation("analyze", "冲突分析完成");
       const pakMods = remoteFiles.filter(

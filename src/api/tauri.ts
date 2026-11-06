@@ -11,6 +11,7 @@ import type {
   ImportResult,
   Language,
   LibrarySnapshot,
+  RemoteDirectoryUsage,
   ModConfigFile,
   ModConfigFileContent,
   LocaleBundle,
@@ -68,6 +69,14 @@ export const api = {
     call<ImportResult>("import_mods", { paths, replaceExisting }),
   openPath: (path: string) => call<void>("open_path", { path }),
   openModFolder: (id: string) => call<void>("open_mod_folder", { id }),
+  sftpDirectoryUsage: (accountId: string, path: string) =>
+    call<RemoteDirectoryUsage>("sftp_directory_usage", { accountId, path }),
+  listRemoteConfigFiles: (accountId: string, path: string) =>
+    call<RemoteFile[]>("list_remote_config_files", { accountId, path }),
+  readRemoteConfigFile: (accountId: string, path: string) =>
+    call<string>("read_remote_config_file", { accountId, path }),
+  writeRemoteConfigFile: (accountId: string, path: string, content: string) =>
+    call<SftpOperationResult>("write_remote_config_file", { accountId, path, content }),
   listModConfigFiles: (id: string) =>
     call<ModConfigFile[]>("list_mod_config_files", { id }),
   readModConfigFile: (id: string, relativePath: string) =>

@@ -218,6 +218,13 @@ export interface SftpUploadProgress {
   message: string;
 }
 
+export interface RemoteDirectoryUsage {
+  path: string;
+  bytes: number;
+  files: number;
+  truncated: boolean;
+}
+
 export interface ModConfigFile {
   name: string;
   relativePath: string;

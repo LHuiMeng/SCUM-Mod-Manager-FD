@@ -3388,6 +3388,233 @@ fn remote_with_extension(path: &str, extension: &str) -> String {
         .into_owned()
 }
 
+const MAX_REMOTE_CONFIG_BYTES: u64 = 512 * 1024;
+const MAX_REMOTE_CONFIG_FILES: usize = 200;
+
+fn is_editable_config_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let managed = ["mods.txt", "mods.json", ".scum_mm_managed.txt"];
+    if managed.iter().any(|item| lower == *item) {
+        return false;
+    }
+    [
+        "ini", "json", "txt", "lua", "cfg", "toml", "xml", "yaml", "yml", "csv", "md",
+    ]
+    .iter()
+    .any(|extension| lower.ends_with(&format!(".{extension}")))
+}
+
+pub fn list_remote_config_files(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    dir_path: &str,
+) -> Result<Vec<RemoteFile>> {
+    let account = active_account(settings, Some(account_id))?;
+    let root = normalize_remote_path(dir_path);
+    ensure_remote_operation_allowed(account, &root)?;
+    with_sftp(paths, account, |sftp| {
+        let mut found = Vec::new();
+        collect_remote_configs(sftp, &root, 0, &mut found)?;
+        found.sort_by(|left, right| left.path.cmp(&right.path));
+        found.truncate(MAX_REMOTE_CONFIG_FILES);
+        Ok(found)
+    })
+}
+
+fn collect_remote_configs(
+    sftp: &Sftp,
+    dir: &str,
+    depth: usize,
+    out: &mut Vec<RemoteFile>,
+) -> Result<()> {
+    if depth > 3 || out.len() >= MAX_REMOTE_CONFIG_FILES {
+        return Ok(());
+    }
+    let entries = match sftp.readdir(Path::new(dir)) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for (entry_path, stat) in entries {
+        let name = entry_name(&entry_path.to_string_lossy());
+        if name == "." || name == ".." || name.starts_with(REMOTE_BACKUP_DIRECTORY) {
+            continue;
+        }
+        let child = remote_join(dir, &name);
+        if stat.is_dir() {
+            collect_remote_configs(sftp, &child, depth + 1, out)?;
+            continue;
+        }
+        if is_editable_config_name(&name) {
+            out.push(RemoteFile {
+                name,
+                path: child,
+                is_directory: false,
+                size: stat.size.unwrap_or(0),
+                modified_at: stat.mtime.map(|seconds| {
+                    Utc.timestamp_opt(seconds as i64, 0)
+                        .single()
+                        .unwrap_or_else(Utc::now)
+                        .to_rfc3339()
+                }),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn read_remote_config(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+) -> Result<String> {
+    let account = active_account(settings, Some(account_id))?;
+    let path = normalize_remote_path(remote_path);
+    ensure_remote_operation_allowed(account, &path)?;
+    if !is_editable_config_name(&entry_name(&path)) {
+        bail!("这个文件不允许在这里编辑");
+    }
+    with_sftp(paths, account, |sftp| {
+        let Some((_, content)) = read_remote_text_file(sftp, &path, MAX_REMOTE_CONFIG_BYTES)?
+        else {
+            bail!("远端配置文件不存在：{path}");
+        };
+        Ok(content)
+    })
+}
+
+pub fn write_remote_config(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+    content: &str,
+) -> Result<SftpOperationResult> {
+    let account = active_account(settings, Some(account_id))?;
+    let path = normalize_remote_path(remote_path);
+    ensure_remote_operation_allowed(account, &path)?;
+    let name = validate_remote_name(&entry_name(&path))?;
+    if !is_editable_config_name(&name) {
+        bail!("这个文件不允许在这里编辑");
+    }
+    if content.len() as u64 > MAX_REMOTE_CONFIG_BYTES {
+        bail!("配置内容超过 512 KB 上限");
+    }
+    if name.to_ascii_lowercase().ends_with(".json") {
+        serde_json::from_str::<serde_json::Value>(content)
+            .with_context(|| format!("{name} 不是合法 JSON，已拒绝保存"))?;
+    }
+    with_sftp(paths, account, |sftp| {
+        // 写前把旧内容复制进独立批次目录（不写进托管清单：manifest 只管布局）。
+        if let Some((file, old)) = read_remote_text_file(sftp, &path, MAX_REMOTE_CONFIG_BYTES)? {
+            let backup_root = account
+                .ue4ss_path
+                .trim()
+                .is_empty()
+                .then(|| account.mods_path.clone())
+                .unwrap_or_else(|| account.ue4ss_path.clone());
+            let backup_dir = remote_join(
+                &backup_root,
+                &format!(
+                    "{REMOTE_BACKUP_DIRECTORY}/config-{}",
+                    Utc::now().format("%Y%m%d-%H%M%S")
+                ),
+            );
+            ensure_remote_dir(sftp, &backup_dir)?;
+            let target = remote_join(&backup_dir, &format!("{}.bak", file.name));
+            write_remote_text_file(sftp, &target, &old)?;
+        }
+        write_remote_text_file(sftp, &path, content)?;
+        Ok(SftpOperationResult {
+            message: format!("已保存远端配置 {name}"),
+            path: path.clone(),
+        })
+    })
+}
+
+const MAX_USAGE_ENTRIES: usize = 20_000;
+const MAX_USAGE_DEPTH: usize = 12;
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDirectoryUsage {
+    pub path: String,
+    pub bytes: u64,
+    pub files: u64,
+    pub truncated: bool,
+}
+
+/// 按需统计远端目录体积：连接扫描里不做这件事，否则每次连接都要遍历整棵目录树。
+pub fn remote_directory_usage(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    account_id: &str,
+    remote_path: &str,
+) -> Result<RemoteDirectoryUsage> {
+    let account = active_account(settings, Some(account_id))?;
+    let root = normalize_remote_path(remote_path);
+    ensure_remote_operation_allowed(account, &root)?;
+    with_sftp(paths, account, |sftp| {
+        let mut bytes = 0u64;
+        let mut files = 0u64;
+        let mut visited = 0usize;
+        let mut truncated = false;
+        walk_usage(
+            sftp,
+            &root,
+            0,
+            &mut bytes,
+            &mut files,
+            &mut visited,
+            &mut truncated,
+        )?;
+        Ok(RemoteDirectoryUsage {
+            path: root.clone(),
+            bytes,
+            files,
+            truncated,
+        })
+    })
+}
+
+fn walk_usage(
+    sftp: &Sftp,
+    dir: &str,
+    depth: usize,
+    bytes: &mut u64,
+    files: &mut u64,
+    visited: &mut usize,
+    truncated: &mut bool,
+) -> Result<()> {
+    if *truncated || depth > MAX_USAGE_DEPTH {
+        return Ok(());
+    }
+    let entries = match sftp.readdir(Path::new(dir)) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for (entry_path, stat) in entries {
+        let name = entry_name(&entry_path.to_string_lossy());
+        if name == "." || name == ".." {
+            continue;
+        }
+        *visited += 1;
+        if *visited > MAX_USAGE_ENTRIES {
+            *truncated = true;
+            return Ok(());
+        }
+        let child = remote_join(dir, &name);
+        if stat.is_dir() {
+            walk_usage(sftp, &child, depth + 1, bytes, files, visited, truncated)?;
+        } else {
+            *files += 1;
+            *bytes = bytes.saturating_add(stat.size.unwrap_or(0));
+        }
+    }
+    Ok(())
+}
+
 fn read_remote_files(sftp: &Sftp, path: &str) -> Vec<RemoteFile> {
     let Ok(entries) = sftp.readdir(Path::new(path)) else {
         return Vec::new();
