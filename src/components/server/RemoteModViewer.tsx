@@ -260,7 +260,8 @@ export function RemoteModViewer({
           size="sm"
           icon="refresh"
           onClick={() => void onAnalyzeConflicts()}
-          disabled={loading || conflictLoading || scan.pakMods.length < 2}
+          disabled={loading || conflictLoading}
+          title={scan.pakMods.length < 2 ? t("remoteViewer.needTwoPaks") : undefined}
         >
           {conflictActionLabel}
         </Button>

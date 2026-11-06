@@ -700,7 +700,6 @@
   "toast.serverUploadStarted.title": "Uploading server mods",
   "toast.serverUploadStarted.detail": "Old mods are backed up and provenance is written first. Keep the app open until it finishes.",
   "serverLibrary.uploadingHint": "Uploading server mods, keep the connection open…",
-
   "operation.kind.analyze": "Analyzing server conflicts",
   "operation.kind.prepare": "Building merge plan",
   "operation.kind.apply": "Applying server layout",
@@ -750,5 +749,9 @@
   "settings.nav.appearanceHint": "Theme, language, typography",
   "settings.nav.about": "Updates & about",
   "settings.nav.aboutHint": "Version, updates, data folder",
-  "settings.unsaved": "Unsaved changes"
+  "settings.unsaved": "Unsaved changes",
+  "settings.about.title": "About",
+  "settings.about.note": "Version and data folder",
+  "settings.about.version": "Current version",
+  "settings.about.dataRoot": "Data folder"
 }

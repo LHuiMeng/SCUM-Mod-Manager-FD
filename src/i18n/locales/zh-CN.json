@@ -700,7 +700,6 @@
   "toast.serverUploadStarted.title": "正在上传服务器模组",
   "toast.serverUploadStarted.detail": "会先备份旧模组并写入融合溯源，完成前请不要关闭程序。",
   "serverLibrary.uploadingHint": "正在上传服务器模组，请保持连接…",
-
   "operation.kind.analyze": "分析服务器冲突",
   "operation.kind.prepare": "生成融合方案",
   "operation.kind.apply": "应用服务器布局",
@@ -750,5 +749,9 @@
   "settings.nav.appearanceHint": "主题、语言与排版",
   "settings.nav.about": "更新与关于",
   "settings.nav.aboutHint": "版本、更新与数据目录",
-  "settings.unsaved": "有未保存的修改"
+  "settings.unsaved": "有未保存的修改",
+  "settings.about.title": "关于本程序",
+  "settings.about.note": "版本与数据目录",
+  "settings.about.version": "当前版本",
+  "settings.about.dataRoot": "数据目录"
 }

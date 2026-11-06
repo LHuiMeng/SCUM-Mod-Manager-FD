@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type {
   AppEdition,
   AppSettings,
@@ -8,17 +8,25 @@ import type {
   Language,
   ThemeMode,
 } from "../../types";
-import { SUPPORTED_LANGUAGES, useI18n } from "../../i18n";
+import type { TranslationKey } from "../../i18n";
+import { useI18n } from "../../i18n";
 import { clampCloudDownloadSegments } from "../../lib/cloudDownload";
+import { normalizePort } from "../../lib/serverPort";
 import { Button } from "../ui/Button";
-import { Toggle } from "../ui/Toggle";
-import { UpdateSettings } from "./UpdateSettings";
+import { AboutSection } from "./sections/AboutSection";
+import { AppearanceSection } from "./sections/AppearanceSection";
+import { CloudSection } from "./sections/CloudSection";
+import { PathsSection } from "./sections/PathsSection";
+import { StartupSection } from "./sections/StartupSection";
+import { useSettingsDraft } from "./useSettingsDraft";
 
 interface SettingsScreenProps {
   settings: AppSettings;
   theme: ThemeMode;
   language: Language;
   edition: AppEdition;
+  version?: string | null;
+  dataRoot?: string | null;
   onSave: (settings: AppSettings) => void;
   onDetectPaths: () => Promise<{
     scumInstallPath: string;
@@ -36,11 +44,33 @@ interface SettingsScreenProps {
   onShowUpdate: () => void;
 }
 
+const SECTIONS: Array<{
+  id: string;
+  labelKey: TranslationKey;
+  hintKey: TranslationKey;
+}> = [
+  { id: "paths", labelKey: "settings.nav.paths", hintKey: "settings.nav.pathsHint" },
+  { id: "startup", labelKey: "settings.nav.startup", hintKey: "settings.nav.startupHint" },
+  { id: "cloud", labelKey: "settings.nav.cloud", hintKey: "settings.nav.cloudHint" },
+  {
+    id: "appearance",
+    labelKey: "settings.nav.appearance",
+    hintKey: "settings.nav.appearanceHint",
+  },
+  { id: "about", labelKey: "settings.nav.about", hintKey: "settings.nav.aboutHint" },
+];
+
+/**
+ * 设置页：左侧分类导航 + 右侧单页内容。所有分类共用一个 draft，
+ * 保存仍然只有 header 里的一个按钮，避免「改一半生效一半」。
+ */
 export function SettingsScreen({
   settings,
   theme,
   language,
   edition,
+  version = null,
+  dataRoot = null,
   onSave,
   onDetectPaths,
   onLaunchOptionsChange,
@@ -55,51 +85,31 @@ export function SettingsScreen({
   onShowUpdate,
 }: SettingsScreenProps) {
   const { t } = useI18n();
-  const [draft, setDraft] = useState(settings);
-  const [hint, setHint] = useState<string | null>(null);
-
-  // 只跟随即时生效的字段（主题、启动参数），路径与云源的未保存草稿不能被外部刷新冲掉。
-  useEffect(() => {
-    setDraft((current) => ({
-      ...current,
-      theme: settings.theme,
-      launchOptions: settings.launchOptions,
-    }));
-  }, [settings.launchOptions, settings.theme]);
-
-  useEffect(() => {
-    setDraft((current) =>
-      current.theme === theme ? current : { ...current, theme },
-    );
-  }, [theme]);
-
-  useEffect(() => {
-    setDraft((current) =>
-      current.language === language ? current : { ...current, language },
-    );
-  }, [language]);
-
-  function update(patch: Partial<AppSettings>) {
-    setDraft((current) => ({ ...current, ...patch }));
-  }
-
-  function updateLaunchOptions(patch: Partial<AppSettings["launchOptions"]>) {
-    const next = { ...draft.launchOptions, ...patch };
-    update({ launchOptions: next });
-    onLaunchOptionsChange(next);
-  }
+  const { draft, update, hint, setHint } = useSettingsDraft(settings, theme, language);
+  const [active, setActive] = useState<string>("paths");
+  const dirty = JSON.stringify(draft) !== JSON.stringify(settings);
 
   async function handleDetect() {
     const paths = await onDetectPaths();
     if (!paths) return;
     update(paths);
     const found = Boolean(paths.scumInstallPath.trim() || paths.serverInstallPath.trim());
-    setHint(
-      found
-        ? t("settings.hint.detected")
-        : t("settings.hint.notFound"),
-    );
+    setHint(found ? t("settings.hint.detected") : t("settings.hint.notFound"));
     window.setTimeout(() => setHint(null), 6000);
+  }
+
+  function handleSave() {
+    onSave({
+      ...draft,
+      launchOptions: {
+        ...draft.launchOptions,
+        port: normalizePort(draft.launchOptions.port),
+      },
+      cloud: {
+        ...draft.cloud,
+        maxDownloadSegments: clampCloudDownloadSegments(draft.cloud.maxDownloadSegments),
+      },
+    });
   }
 
   return (
@@ -110,23 +120,11 @@ export function SettingsScreen({
           <p>{t("settings.subtitle")}</p>
         </div>
         <div className="heading-tools">
+          {dirty ? <span className="settings-dirty">{t("settings.unsaved")}</span> : null}
           <Button icon="search" onClick={() => void handleDetect()}>
             {t("settings.autoDetect")}
           </Button>
-          <Button
-            variant="primary"
-            onClick={() =>
-              onSave({
-                ...draft,
-                cloud: {
-                  ...draft.cloud,
-                  maxDownloadSegments: clampCloudDownloadSegments(
-                    draft.cloud.maxDownloadSegments,
-                  ),
-                },
-              })
-            }
-          >
+          <Button variant="primary" onClick={handleSave}>
             {t("settings.save")}
           </Button>
         </div>
@@ -138,292 +136,61 @@ export function SettingsScreen({
         </p>
       ) : null}
 
-      <div className="settings-sheet">
-        <section className="settings-group">
-          <div className="section-title">
-            <span>{t("settings.paths.title")}</span>
-            <b>{t("settings.paths.note")}</b>
-          </div>
-          <div className="form-grid">
-            <label className="form-span-2">
-              <span>{t("settings.paths.client")}</span>
-              <div className="input-with-button">
-                <input
-                  value={draft.scumInstallPath}
-                  onChange={(event) => update({ scumInstallPath: event.target.value })}
-                  placeholder="X:/SteamLibrary/steamapps/common/SCUM"
-                />
-                <Button
-                  size="sm"
-                  icon="folder"
-                  onClick={async () => {
-                    const path = await onChooseDirectory("client");
-                    if (path) update({ scumInstallPath: path });
-                  }}
-                >
-                  {t("settings.paths.select")}
-                </Button>
-              </div>
-            </label>
-            <label className="form-span-2">
-              <span>{t("settings.paths.server")}</span>
-              <div className="input-with-button">
-                <input
-                  value={draft.serverInstallPath}
-                  onChange={(event) => update({ serverInstallPath: event.target.value })}
-                  placeholder="X:/SteamLibrary/steamapps/common/SCUM Server"
-                />
-                <Button
-                  size="sm"
-                  icon="folder"
-                  onClick={async () => {
-                    const path = await onChooseDirectory("server");
-                    if (path) update({ serverInstallPath: path });
-                  }}
-                >
-                  {t("settings.paths.select")}
-                </Button>
-              </div>
-            </label>
-          </div>
-        </section>
-
-        <UpdateSettings
-          info={updateInfo}
-          phase={updatePhase}
-          progress={updateProgress}
-          error={updateError}
-          onCheck={onCheckUpdate}
-          onShowDetails={onShowUpdate}
-        />
-
-        <section className="settings-group">
-          <div className="section-title">
-            <span>{t("settings.startup.title")}</span>
-            <b>{t("settings.startup.note")}</b>
-          </div>
-          <div className="setting-switches">
-            <label>
-              <span>
-                <b>{t("settings.startup.log")}</b>
-                <small>{t("settings.startup.logDetail")}</small>
-              </span>
-              <Toggle
-                checked={draft.launchOptions.log}
-                onChange={(log) => updateLaunchOptions({ log })}
-                label={t("settings.startup.log")}
-              />
-            </label>
-            <label>
-              <span>
-                <b>{t("settings.startup.fileLog")}</b>
-                <small>{t("settings.startup.fileLogDetail")}</small>
-              </span>
-              <Toggle
-                checked={draft.launchOptions.fileOpenLog}
-                onChange={(fileOpenLog) => updateLaunchOptions({ fileOpenLog })}
-                label={t("settings.startup.fileLog")}
-              />
-            </label>
-            <label>
-              <span>
-                <b>{t("settings.startup.battlEye")}</b>
-                <small>{t("settings.startup.battlEyeDetail")}</small>
-              </span>
-              <Toggle
-                checked={draft.launchOptions.noBattlEye}
-                onChange={(noBattlEye) => updateLaunchOptions({ noBattlEye })}
-                label={t("settings.startup.battlEye")}
-              />
-            </label>
-            <label>
-              <span>
-                <b>{t("settings.startup.keepDeployed")}</b>
-                <small>{t("settings.startup.keepDeployedDetail")}</small>
-              </span>
-              <Toggle
-                checked={draft.keepDeployedModsOnExit}
-                onChange={(keepDeployedModsOnExit) => update({ keepDeployedModsOnExit })}
-                label={t("settings.startup.keepDeployed")}
-              />
-            </label>
-            <label>
-              <span>
-                <b>{t("settings.startup.useDeployLinks")}</b>
-                <small>{t("settings.startup.useDeployLinksDetail")}</small>
-              </span>
-              <Toggle
-                checked={draft.useDeployLinks}
-                onChange={(useDeployLinks) => update({ useDeployLinks })}
-                label={t("settings.startup.useDeployLinks")}
-              />
-            </label>
-            <label>
-              <span>
-                <b>{t("settings.startup.autoMergeConflicts")}</b>
-                <small>{t("settings.startup.autoMergeConflictsDetail")}</small>
-              </span>
-              <Toggle
-                checked={draft.autoMergeConflicts}
-                onChange={(autoMergeConflicts) => update({ autoMergeConflicts })}
-                label={t("settings.startup.autoMergeConflicts")}
-              />
-            </label>
-            <label>
-              <span>
-                <b>{t("settings.startup.port")}</b>
-                <small>{t("settings.startup.portDetail")}</small>
-              </span>
-              <input
-                className="compact-input"
-                value={draft.launchOptions.port}
-                inputMode="numeric"
-                onChange={(event) =>
-                  update({ launchOptions: { ...draft.launchOptions, port: event.target.value } })
-                }
-                onBlur={() => updateLaunchOptions({ port: draft.launchOptions.port })}
-              />
-            </label>
-          </div>
-        </section>
-
-        <section className="settings-group">
-          <div className="section-title">
-            <span>{t("settings.appearance.title")}</span>
-            <b>{t("settings.appearance.note")}</b>
-          </div>
-          <div className="theme-options">
+      <div className="settings-layout">
+        <nav className="settings-nav" role="tablist" aria-label={t("settings.title")}>
+          {SECTIONS.map((section) => (
             <button
+              key={section.id}
               type="button"
-              className={draft.theme === "light" ? "is-active" : ""}
-              onClick={() => {
-                update({ theme: "light" });
-                onThemePreview("light");
-              }}
+              role="tab"
+              aria-selected={active === section.id}
+              className={active === section.id ? "is-active" : ""}
+              onClick={() => setActive(section.id)}
             >
-              <span className="theme-swatch theme-light">
-                <i />
-                <i />
-              </span>
-              <b>{t("settings.appearance.light")}</b>
-              <small>{t("settings.appearance.lightDetail")}</small>
+              <b>{t(section.labelKey)}</b>
+              <small>{t(section.hintKey)}</small>
             </button>
-            <button
-              type="button"
-              className={draft.theme === "dark" ? "is-active" : ""}
-              onClick={() => {
-                update({ theme: "dark" });
-                onThemePreview("dark");
-              }}
-            >
-              <span className="theme-swatch theme-dark">
-                <i />
-                <i />
-              </span>
-              <b>{t("settings.appearance.dark")}</b>
-              <small>{t("settings.appearance.darkDetail")}</small>
-            </button>
-          </div>
-        </section>
-
-        <section className="settings-group settings-cloud">
-          <div className="section-title">
-            <span>{t("settings.cloud.title")}</span>
-            <b>
-              {t(
-                edition === "server"
-                  ? "settings.cloud.serverNote"
-                  : "settings.cloud.publicNote",
-              )}
-            </b>
-          </div>
-          <div className="settings-cloud-fields">
-            <label>
-              <span>{t("settings.cloud.urls")}</span>
-              <textarea
-                className="note-input settings-textarea"
-                rows={4}
-                value={draft.cloud.baseUrls.join("\n")}
-                placeholder="https://your-catalog.example"
-                onChange={(event) =>
-                  update({
-                    cloud: {
-                      ...draft.cloud,
-                      baseUrls: event.target.value
-                        .split("\n")
-                        .map((line) => line.trim())
-                        .filter(Boolean),
-                    },
-                  })
-                }
-              />
-            </label>
-            <label className="settings-segment-field">
-              <span>{t("settings.cloud.segments")}</span>
-              <input
-                type="number"
-                min={8}
-                max={128}
-                step={1}
-                value={draft.cloud.maxDownloadSegments}
-                onChange={(event) => {
-                  const value = Number(event.target.value);
-                  update({
-                    cloud: {
-                      ...draft.cloud,
-                      maxDownloadSegments: Number.isFinite(value) ? value : 8,
-                    },
-                  });
-                }}
-                onBlur={() =>
-                  update({
-                    cloud: {
-                      ...draft.cloud,
-                      maxDownloadSegments: clampCloudDownloadSegments(
-                        draft.cloud.maxDownloadSegments,
-                      ),
-                    },
-                  })
-                }
-              />
-              <small>{t("settings.cloud.segmentsHelp")}</small>
-            </label>
-          </div>
-          <div className="settings-note">
-            {t(
-              edition === "server"
-                ? "settings.cloud.serverSecret"
-                : "settings.cloud.publicSecret",
-            )}
-          </div>
-        </section>
-
-        <section
-          className="settings-group settings-language"
-          aria-label={t("settings.language.switch")}
-        >
-          <div className="section-title">
-            <span>{t("settings.language.title")}</span>
-            <b>{t("settings.language.note")}</b>
-          </div>
-          <div className="language-options">
-            {SUPPORTED_LANGUAGES.map((language) => (
-              <button
-                type="button"
-                key={language.id}
-                className={draft.language === language.id ? "is-active" : ""}
-                onClick={() => {
-                  update({ language: language.id });
-                  onLanguagePreview(language.id);
-                }}
-              >
-                <b>{language.label}</b>
-                <small>{language.id}</small>
-              </button>
-            ))}
-          </div>
-          <p className="settings-note">{t("settings.language.overrideNote")}</p>
-        </section>
+          ))}
+        </nav>
+        <div className="settings-body" role="tabpanel">
+          {active === "paths" ? (
+            <PathsSection
+              draft={draft}
+              update={update}
+              onChooseDirectory={onChooseDirectory}
+            />
+          ) : null}
+          {active === "startup" ? (
+            <StartupSection
+              draft={draft}
+              update={update}
+              onLaunchOptionsChange={onLaunchOptionsChange}
+            />
+          ) : null}
+          {active === "cloud" ? (
+            <CloudSection draft={draft} update={update} edition={edition} />
+          ) : null}
+          {active === "appearance" ? (
+            <AppearanceSection
+              draft={draft}
+              update={update}
+              onThemePreview={onThemePreview}
+              onLanguagePreview={onLanguagePreview}
+            />
+          ) : null}
+          {active === "about" ? (
+            <AboutSection
+              version={version}
+              dataRoot={dataRoot}
+              updateInfo={updateInfo}
+              updatePhase={updatePhase}
+              updateProgress={updateProgress}
+              updateError={updateError}
+              onCheckUpdate={onCheckUpdate}
+              onShowUpdate={onShowUpdate}
+            />
+          ) : null}
+        </div>
       </div>
     </section>
   );

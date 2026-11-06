@@ -5306,3 +5306,84 @@ body.is-row-dragging {
   color: var(--muted);
   font-size: var(--type-micro);
 }
+
+/* ── 设置页分类导航 ───────────────────────────────────────────────────── */
+.page-settings .settings-layout {
+  display: grid;
+  grid-template-columns: 188px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: sticky;
+  top: 0;
+}
+.settings-nav button {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+.settings-nav button:hover {
+  background: var(--soft-fill);
+}
+.settings-nav button.is-active {
+  border-color: var(--line-strong);
+  background: var(--paper-hi);
+}
+.settings-nav button b {
+  font-size: var(--type-label);
+  font-weight: 600;
+}
+.settings-nav button small {
+  color: var(--muted);
+  font-size: var(--type-micro);
+  line-height: 1.35;
+}
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.settings-dirty {
+  color: var(--warn);
+  font-size: var(--type-meta);
+}
+.settings-about-facts {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+.settings-about-facts div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: var(--type-meta);
+}
+.settings-about-facts dt {
+  color: var(--muted);
+}
+.settings-about-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.settings-about-facts code {
+  font-family: var(--mono);
+  font-size: var(--type-micro);
+}
+@media (max-width: 1180px) {
+  .page-settings .settings-layout {
+    grid-template-columns: 156px minmax(0, 1fr);
+    gap: 14px;
+  }
+}

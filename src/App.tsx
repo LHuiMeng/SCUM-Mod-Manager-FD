@@ -2168,6 +2168,8 @@ function LocalizedApp() {
               theme={theme}
               language={language}
               edition={appInfo?.edition ?? "public"}
+              version={appInfo?.version ?? null}
+              dataRoot={appInfo?.dataRoot ?? null}
               onSave={(settings) => void handleSaveSettings(settings)}
               onDetectPaths={handleDetectPaths}
               onLaunchOptionsChange={handleLaunchOptionsChange}
