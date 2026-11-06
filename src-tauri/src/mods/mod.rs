@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
+pub mod config_files;
 pub mod deploy;
 mod duplicates;
 pub mod links;
@@ -1757,4 +1758,5 @@ mod tests {
         assert!(budget <= available, "预算不能超过可用空间");
         let _ = fs::remove_dir_all(&root);
     }
+
 }

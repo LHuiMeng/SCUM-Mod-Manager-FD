@@ -7,7 +7,8 @@ use crate::models::{
     AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, ConflictMergeResult,
     DetectPathsResult, DownloadResult, GameStatus, ImportConflict, ImportResult,
     InstallUpdateResult, LibrarySnapshot, LocaleBundle, RemoteFile, RemoteMod, RuntimeLog,
-    SftpAccountInput, SftpApplyResult, SftpConflictReport, SftpConnectionResult,
+    ModConfigFile, ModConfigFileContent, SftpAccountInput, SftpApplyResult,
+    SftpConflictReport, SftpConnectionResult,
     SftpOperationProgress, SftpOperationResult, SftpPrepareResult, UploadResult,
 };
 use crate::mods::links::PendingLink;
@@ -371,6 +372,65 @@ pub fn open_mod_folder(state: State<'_, AppState>, id: String) -> Result<(), Str
     } else {
         open_path(path_string(&path))
     }
+}
+
+fn mod_directory(state: &AppState, id: &str) -> Result<std::path::PathBuf, String> {
+    let mods = state.mods.read().unwrap();
+    let item = mods
+        .iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| format!("找不到模组：{id}"))?;
+    let path = std::path::PathBuf::from(&item.file_path);
+    if path.is_file() {
+        return path
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .ok_or_else(|| "模组文件没有父目录".to_string());
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+pub fn list_mod_config_files(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<ModConfigFile>, String> {
+    let root = mod_directory(&state, &id)?;
+    crate::mods::config_files::list_config_files(&root).map_err(error_text)
+}
+
+#[tauri::command]
+pub fn read_mod_config_file(
+    state: State<'_, AppState>,
+    id: String,
+    relative_path: String,
+) -> Result<ModConfigFileContent, String> {
+    let root = mod_directory(&state, &id)?;
+    crate::mods::config_files::read_config_file(&root, &relative_path).map_err(error_text)
+}
+
+#[tauri::command]
+pub fn write_mod_config_file(
+    state: State<'_, AppState>,
+    id: String,
+    relative_path: String,
+    content: String,
+) -> Result<ModConfigFile, String> {
+    let root = mod_directory(&state, &id)?;
+    let result = crate::mods::config_files::write_config_file(
+        &state.paths,
+        &id,
+        &root,
+        &relative_path,
+        &content,
+    )
+    .map_err(error_text)?;
+    state.log(
+        "info",
+        "mods",
+        &format!("已保存配置文件 {}（模组 {id}）", result.relative_path),
+    );
+    Ok(result)
 }
 
 #[tauri::command]

@@ -61,6 +61,7 @@ interface LibraryScreenProps {
   onLaunch: () => void;
   onKill: () => void;
   onOpenFolder: (id: string) => void;
+  onOpenConfig?: (id: string) => void;
   onLaunchOptionsChange: (options: AppSettings["launchOptions"]) => void;
   onNavigate: (section: NavSection) => void;
   gameStatus: GameStatus;
@@ -89,6 +90,7 @@ export function LibraryScreen({
   onLaunch,
   onKill,
   onOpenFolder,
+  onOpenConfig,
   onLaunchOptionsChange,
   onNavigate,
   gameStatus,
@@ -412,6 +414,9 @@ export function LibraryScreen({
         onDelete={() => visibleSelected && setDeleting(visibleSelected)}
         onOpenFolder={() => visibleSelected && onOpenFolder(visibleSelected.id)}
         onOpenConflicts={() => visibleSelected && setConflictsOpen(true)}
+        onOpenConfig={
+          onOpenConfig ? () => visibleSelected && onOpenConfig(visibleSelected.id) : undefined
+        }
       />
 
       {conflictsOpen && visibleSelected ? (

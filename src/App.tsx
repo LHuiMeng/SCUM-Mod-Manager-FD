@@ -27,6 +27,7 @@ import type {
   SftpConflictProgress,
   SftpConflictReport,
   SftpConnectionResult,
+  ModConfigFile,
   SftpManagedManifest,
   SftpOperationProgress,
   SftpPrepareResult,
@@ -73,6 +74,7 @@ import {
 } from "./components/library/LibraryScreen";
 import { ImportConflictDialog } from "./components/library/ImportConflictDialog";
 import { ServerUploadPlanDialog } from "./components/library/ServerUploadPlanDialog";
+import { ConfigEditorDialog } from "./components/library/ConfigEditorDialog";
 import { CloudScreen } from "./components/cloud/CloudScreen";
 import { ServerScreen } from "./components/server/ServerScreen";
 import { BackupsScreen } from "./components/backups/BackupsScreen";
@@ -167,6 +169,11 @@ function LocalizedApp() {
   const [bootAttempt, setBootAttempt] = useState(0);
   const [serverRestoreConfirm, setServerRestoreConfirm] = useState<string | null>(null);
   const [serverPlanOpen, setServerPlanOpen] = useState(false);
+  const [configEditor, setConfigEditor] = useState<{
+    modId: string;
+    modName: string;
+    files: ModConfigFile[];
+  } | null>(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
   const bootUpdateChecked = useRef(false);
   const importPathsRef = useRef<(paths: string[]) => Promise<void>>(async () => undefined);
@@ -1803,6 +1810,21 @@ function LocalizedApp() {
     }
   }
 
+  async function handleOpenConfig(modId: string) {
+    const mod = snapshot?.mods.find((item) => item.id === modId);
+    if (!mod) return;
+    try {
+      const files = await api.listModConfigFiles(modId);
+      if (files.length === 0) {
+        notify(t("config.empty"), mod.name, "default");
+        return;
+      }
+      setConfigEditor({ modId, modName: mod.name, files });
+    } catch (error) {
+      notify(t("config.loadFailed"), String(error), "error");
+    }
+  }
+
   async function handleApplyServerLibrary() {
     const view = serverLibraryView;
     if (!view || busy) return;
@@ -2055,6 +2077,7 @@ function LocalizedApp() {
               onLaunch={handleLaunch}
               onKill={handleKill}
               onOpenFolder={(id) => void api.openModFolder(id)}
+              onOpenConfig={(id) => void handleOpenConfig(id)}
               onLaunchOptionsChange={handleLaunchOptionsChange}
               onNavigate={setSection}
               gameStatus={snapshot.gameStatus}
@@ -2205,6 +2228,28 @@ function LocalizedApp() {
             ))}
           </ul>
         </Modal>
+      ) : null}
+      {configEditor ? (
+        <ConfigEditorDialog
+          modName={configEditor.modName}
+          files={configEditor.files}
+          load={(relativePath) =>
+            api
+              .readModConfigFile(configEditor.modId, relativePath)
+              .then((file) => file.content)
+          }
+          save={async (relativePath, content) => {
+            try {
+              await api.writeModConfigFile(configEditor.modId, relativePath, content);
+              notify(t("config.saved"), configEditor.modName, "success");
+              return true;
+            } catch (error) {
+              notify(t("config.saveFailed"), String(error), "error");
+              return false;
+            }
+          }}
+          onClose={() => setConfigEditor(null)}
+        />
       ) : null}
       {serverPlanOpen && serverPrepare && serverLibraryView ? (
         <ServerUploadPlanDialog

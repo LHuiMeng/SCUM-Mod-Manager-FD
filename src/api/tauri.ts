@@ -11,6 +11,8 @@ import type {
   ImportResult,
   Language,
   LibrarySnapshot,
+  ModConfigFile,
+  ModConfigFileContent,
   LocaleBundle,
   PendingLink,
   RemoteFile,
@@ -66,6 +68,12 @@ export const api = {
     call<ImportResult>("import_mods", { paths, replaceExisting }),
   openPath: (path: string) => call<void>("open_path", { path }),
   openModFolder: (id: string) => call<void>("open_mod_folder", { id }),
+  listModConfigFiles: (id: string) =>
+    call<ModConfigFile[]>("list_mod_config_files", { id }),
+  readModConfigFile: (id: string, relativePath: string) =>
+    call<ModConfigFileContent>("read_mod_config_file", { id, relativePath }),
+  writeModConfigFile: (id: string, relativePath: string, content: string) =>
+    call<ModConfigFile>("write_mod_config_file", { id, relativePath, content }),
   getLogs: () => call<RuntimeLog[]>("get_logs"),
   clearLogs: () => call<void>("clear_logs"),
   getAppInfo: () => call<AppInfo>("get_app_info"),

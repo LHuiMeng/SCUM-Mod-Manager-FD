@@ -14,6 +14,7 @@ interface ModInspectorProps {
   onDelete: () => void;
   onOpenFolder: () => void;
   onOpenConflicts: () => void;
+  onOpenConfig?: () => void;
 }
 
 export function ModInspector({
@@ -24,6 +25,7 @@ export function ModInspector({
   onDelete,
   onOpenFolder,
   onOpenConflicts,
+  onOpenConfig,
 }: ModInspectorProps) {
   const { t, language } = useI18n();
   if (!mod) {
@@ -103,6 +105,11 @@ export function ModInspector({
         {!readOnly ? (
           <Button className="detail-action" trailingIcon="edit" onClick={onEdit}>
             {t("inspector.edit")}
+          </Button>
+        ) : null}
+        {!readOnly && mod.type === "ue4ssMod" && onOpenConfig ? (
+          <Button className="detail-action" trailingIcon="edit" onClick={onOpenConfig}>
+            {t("config.edit")}
           </Button>
         ) : null}
 

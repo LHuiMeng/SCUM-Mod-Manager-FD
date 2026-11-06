@@ -218,6 +218,22 @@ export interface SftpUploadProgress {
   message: string;
 }
 
+export interface ModConfigFile {
+  name: string;
+  relativePath: string;
+  size: number;
+  editable: boolean;
+  managedByApp: boolean;
+}
+
+export interface ModConfigFileContent {
+  relativePath: string;
+  content: string;
+  size: number;
+  modifiedAt?: string | null;
+  editable: boolean;
+}
+
 export interface SftpOperationProgress {
   kind: string;
   phase: string;

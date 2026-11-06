@@ -9,6 +9,7 @@ import type {
   Language,
   LibrarySnapshot,
   LocaleBundle,
+  ModConfigFile,
   ModEntry,
   RemoteFile,
   RemoteMod,
@@ -17,6 +18,23 @@ import type {
 } from "../types";
 
 const now = Date.now();
+
+const mockConfigFiles: Record<string, ModConfigFile[]> = {
+  betterai_core: [
+    { name: "config.ini", relativePath: "config.ini", size: 42, editable: true, managedByApp: false },
+    {
+      name: "settings.json",
+      relativePath: "scripts/settings.json",
+      size: 128,
+      editable: true,
+      managedByApp: false,
+    },
+  ],
+};
+const mockConfigBodies: Record<string, string> = {
+  "betterai_core:config.ini": "[General]\nenabled=true\n",
+  "betterai_core:scripts/settings.json": "{\n  \"debug\": false\n}\n",
+};
 
 /** 浏览器预览用：把「后端推送」模拟成 window 事件，App 里的 mock 桥接会订阅它。 */
 export function emitMockOperation(progress: SftpOperationProgress) {
@@ -1006,6 +1024,35 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
     case "dismiss_crash":
     case "delete_backup":
     case "open_path":
+    case "list_mod_config_files": {
+      const id = String(args?.id ?? "");
+      return structuredClone(mockConfigFiles[id] ?? []) as T;
+    }
+    case "read_mod_config_file": {
+      const id = String(args?.id ?? "");
+      const relativePath = String(args?.relativePath ?? "");
+      const body = mockConfigBodies[`${id}:${relativePath}`] ?? "";
+      return {
+        relativePath,
+        content: body,
+        size: body.length,
+        modifiedAt: new Date().toISOString(),
+        editable: true,
+      } as T;
+    }
+    case "write_mod_config_file": {
+      const id = String(args?.id ?? "");
+      const relativePath = String(args?.relativePath ?? "");
+      const content = String(args?.content ?? "");
+      mockConfigBodies[`${id}:${relativePath}`] = content;
+      return {
+        name: relativePath.split("/").pop() ?? relativePath,
+        relativePath,
+        size: content.length,
+        editable: true,
+        managedByApp: false,
+      } as T;
+    }
     case "open_mod_folder":
     case "window_minimize":
     case "window_toggle_maximize":

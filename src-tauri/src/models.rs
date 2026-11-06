@@ -520,6 +520,26 @@ pub struct SftpUploadProgress {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModConfigFile {
+    pub name: String,
+    pub relative_path: String,
+    pub size: u64,
+    pub editable: bool,
+    pub managed_by_app: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModConfigFileContent {
+    pub relative_path: String,
+    pub content: String,
+    pub size: u64,
+    pub modified_at: Option<String>,
+    pub editable: bool,
+}
+
 /// 面向 UI 的统一「正在做什么」事件。所有长操作都会发一条，前端只订阅这一条流。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

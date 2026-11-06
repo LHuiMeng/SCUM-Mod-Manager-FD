@@ -5218,3 +5218,91 @@ body.is-row-dragging {
     transition: none;
   }
 }
+
+/* ── 模组配置文件编辑器 ───────────────────────────────────────────────── */
+.config-editor {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 14px;
+  min-height: 380px;
+}
+.config-editor-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-right: 1px solid var(--line);
+  padding-right: 10px;
+  max-height: 52vh;
+  overflow: auto;
+}
+.config-editor-list button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-size: var(--type-meta);
+  cursor: pointer;
+}
+.config-editor-list button.is-active {
+  border-color: var(--line-strong);
+  background: var(--soft-fill);
+}
+.config-editor-list button span {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.config-editor-list small {
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.config-editor-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.config-editor-body textarea {
+  flex: 1 1 auto;
+  min-height: 360px;
+  max-height: 52vh;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: var(--type-meta);
+  line-height: 1.6;
+  resize: vertical;
+}
+.config-editor-body textarea:read-only {
+  color: var(--muted);
+}
+.config-editor-meta {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: var(--type-micro);
+}
+.config-editor-meta b {
+  color: var(--accent-strong);
+}
+.config-editor-locked {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: var(--type-meta);
+}
+.config-editor-hint {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: var(--type-micro);
+}
