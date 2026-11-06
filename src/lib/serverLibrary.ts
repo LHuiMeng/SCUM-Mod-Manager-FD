@@ -27,14 +27,26 @@ interface ServerLibraryLabels {
 
 const STORAGE_PREFIX = "scum-server-library-v1:";
 
+/**
+ * 服务器路径统一用 `/`：Windows 上 ssh2 拼出来的 `/a/b\c.pak` 会让 rename 直接失败，
+ * 也和老状态里的键对不上。历史状态读回来时同过这一道，禁用的模组才不会掉。
+ */
+export function normalizeRemotePath(path: string): string {
+  const unified = path.split("\\").join("/");
+  const parts = unified.split("/").filter(Boolean);
+  return `${unified.startsWith("/") ? "/" : ""}${parts.join("/")}`;
+}
+
 function serverPaths(scan: SftpConnectionResult): string[] {
-  const paths = new Set([...scan.pakMods, ...scan.ue4ssMods].map((file) => file.path));
+  const paths = new Set(
+    [...scan.pakMods, ...scan.ue4ssMods].map((file) => normalizeRemotePath(file.path)),
+  );
   // 被移进备份批次的条目仍算「可用路径」：否则 normalize 会把禁用/删除状态删掉，
   // 下一次 apply 先 restore 再按 disabled 列表处理时，用户关掉的模组会被静默重新启用。
   // merged / previous-merged / signature 不并进来——它们是融合产物，不是独立模组。
   for (const backup of scan.managedManifest?.backups ?? []) {
     if (backup.reason === "disabled" || backup.reason === "deleted") {
-      paths.add(backup.originalPath);
+      paths.add(normalizeRemotePath(backup.originalPath));
     }
   }
   return [...paths];
@@ -55,23 +67,30 @@ export function normalizeServerLibraryState(
       : {};
   const available = serverPaths(scan);
   const availableSet = new Set(available);
-  const requestedOrder = Array.isArray(input.order)
-    ? input.order.filter(
-        (path, index, list): path is string =>
-          typeof path === "string" &&
-          availableSet.has(path) &&
-          list.indexOf(path) === index,
-      )
+  const storedOrder = Array.isArray(input.order)
+    ? input.order.filter((path): path is string => typeof path === "string")
     : [];
+  const requestedOrder = storedOrder
+    .map(normalizeRemotePath)
+    .filter(
+      (path, index, list): path is string =>
+        availableSet.has(path) && list.indexOf(path) === index,
+    );
   for (const path of available) {
     if (!requestedOrder.includes(path)) requestedOrder.push(path);
   }
-  const listed = new Set([...scan.pakMods, ...scan.ue4ssMods].map((file) => file.path));
+  const listed = new Set(
+    [...scan.pakMods, ...scan.ue4ssMods].map((file) => normalizeRemotePath(file.path)),
+  );
+  const storedEnabled: Record<string, boolean> = {};
+  for (const [path, value] of Object.entries(input.enabled ?? {})) {
+    if (typeof value === "boolean") storedEnabled[normalizeRemotePath(path)] = value;
+  }
   const enabled: Record<string, boolean> = {};
   for (const path of available) {
     // 只存在于备份批次的条目默认是「禁用」：否则清空 localStorage 后它会被当成启用，
     // 下一次 apply 就把它当成 released 又启用回来（用户问题 3 的复发路径）。
-    enabled[path] = input.enabled?.[path] ?? listed.has(path);
+    enabled[path] = storedEnabled[path] ?? listed.has(path);
   }
   const winners =
     input.winners && typeof input.winners === "object"
@@ -83,10 +102,10 @@ export function normalizeServerLibraryState(
         )
       : {};
   const deleted = Array.isArray(input.deleted)
-    ? input.deleted.filter(
-        (path): path is string =>
-          typeof path === "string" && availableSet.has(path),
-      )
+    ? input.deleted
+        .filter((path): path is string => typeof path === "string")
+        .map(normalizeRemotePath)
+        .filter((path) => availableSet.has(path))
     : [];
   return { order: requestedOrder, enabled, winners, deleted };
 }

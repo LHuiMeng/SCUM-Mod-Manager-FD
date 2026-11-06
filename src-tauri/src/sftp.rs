@@ -1201,6 +1201,28 @@ pub fn apply_remote_layout(
     if normalize_remote_path(&account.mods_path) == "/" {
         bail!("拒绝在服务器根目录应用模组布局，请先定位具体的 ~mods 目录");
     }
+    // 前端可能还握着旧扫描结果（路径里带 `\`），进来先统一分隔符，
+    // 否则禁用/删除清单和本次扫描对不上，坏路径会一路带到 rename。
+    let order_normalized = order
+        .iter()
+        .map(|path| normalize_remote_path(path))
+        .collect::<Vec<_>>();
+    let order: &[String] = &order_normalized;
+    let disabled_normalized = disabled
+        .iter()
+        .map(|path| normalize_remote_path(path))
+        .collect::<Vec<_>>();
+    let disabled: &[String] = &disabled_normalized;
+    let released_normalized = released
+        .iter()
+        .map(|path| normalize_remote_path(path))
+        .collect::<Vec<_>>();
+    let released: &[String] = &released_normalized;
+    let deleted_normalized = deleted
+        .iter()
+        .map(|path| normalize_remote_path(path))
+        .collect::<Vec<_>>();
+    let deleted: &[String] = &deleted_normalized;
     send_conflict_progress(
         &progress,
         "preparing",
@@ -1690,6 +1712,37 @@ pub fn restore_remote_layout(
     })
 }
 
+/// 历史版本把 ssh2 在 Windows 上拼出来的 `/a\b.pak` 直接写进了服务器清单。
+/// 读回来先归一化，恢复/再应用才不会照着坏路径发 rename（那会得到 SFTP(4) failure）。
+fn normalize_manifest_paths(manifest: &mut SftpManagedManifest) {
+    fn wash(value: &mut String) {
+        *value = normalize_remote_separators(value);
+    }
+    if let Some(path) = manifest.merged_path.as_mut() {
+        wash(path);
+    }
+    for source in manifest.sources.iter_mut() {
+        wash(&mut source.path);
+    }
+    for backup in manifest.backups.iter_mut() {
+        wash(&mut backup.original_path);
+        wash(&mut backup.backup_path);
+    }
+    for rename in manifest.renames.iter_mut() {
+        wash(&mut rename.original_path);
+        wash(&mut rename.deployed_path);
+    }
+    for path in manifest.created_paths.iter_mut() {
+        wash(path);
+    }
+    for path in manifest.provenance_paths.iter_mut() {
+        wash(path);
+    }
+    for value in manifest.winners.values_mut() {
+        wash(value);
+    }
+}
+
 fn read_managed_manifest(
     sftp: &Sftp,
     mods_path: &str,
@@ -1711,8 +1764,9 @@ fn read_managed_manifest(
     if bytes.len() as u64 > MAX_REMOTE_MANIFEST_BYTES {
         return Ok(None);
     }
-    let manifest = serde_json::from_slice::<SftpManagedManifest>(&bytes).ok();
-    if let Some(manifest) = &manifest {
+    let mut manifest = serde_json::from_slice::<SftpManagedManifest>(&bytes).ok();
+    if let Some(manifest) = manifest.as_mut() {
+        normalize_manifest_paths(manifest);
         validate_managed_manifest_paths(mods_path, ue4ss_path, manifest)?;
     }
     Ok(manifest)
@@ -1805,8 +1859,18 @@ fn backup_remote_file(
     if sftp.lstat(Path::new(&backup_path)).is_ok() {
         bail!("服务器备份目标已存在：{backup_path}");
     }
+    // SFTP 的 rename 失败只会回一个 SSH_FX_FAILURE，看不出是「源不存在」还是被占用。
+    // 先确认源真实存在，报错才能指到具体原因（历史上这里被反斜杠路径坑过）。
+    if sftp.lstat(Path::new(&file.path)).is_err() {
+        bail!("无法备份远端文件：服务器上找不到 {}（路径可能已过期，请刷新后重试）", file.path);
+    }
     sftp.rename(Path::new(&file.path), Path::new(&backup_path), None)
-        .with_context(|| format!("无法备份远端文件 {} -> {backup_path}", file.path))?;
+        .with_context(|| {
+            format!(
+                "无法备份远端文件 {} -> {backup_path}（文件可能被服务器进程占用）",
+                file.path
+            )
+        })?;
     Ok(SftpManagedBackup {
         name,
         original_path: file.path.clone(),
@@ -2425,7 +2489,7 @@ fn remove_remote_tree(sftp: &Sftp, path: &str, depth: usize, visited: &mut usize
         if name == "." || name == ".." {
             continue;
         }
-        let child = normalize_remote_path(&entry_path.to_string_lossy());
+        let child = remote_join(path, &name);
         if child != path {
             remove_remote_tree(sftp, &child, depth + 1, visited)?;
         }
@@ -3629,8 +3693,8 @@ fn read_remote_files(sftp: &Sftp, path: &str) -> Vec<RemoteFile> {
             continue;
         }
         files.push(RemoteFile {
-            name,
-            path: remote_join(path, &entry_path.to_string_lossy()),
+            name: name.clone(),
+            path: remote_join(path, &name),
             is_directory: stat.is_dir(),
             size: stat.size.unwrap_or(0),
             modified_at: stat.mtime.map(|seconds| {
@@ -3682,8 +3746,32 @@ fn entry_name(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// ssh2 的 `readdir` 在 Windows 上用 `Path::join` 拼目录项，返回 `/a/b\c.pak`。
+/// 服务器只认 `/`，这种混了反斜杠的路径在 rename / unlink 上会直接给 SFTP(4) failure。
+/// 所有远端路径在进入内存、清单、前端之前都必须先过这一道。
+pub(crate) fn normalize_remote_separators(path: &str) -> String {
+    if !path.contains('\\') && !path.contains("//") {
+        return path.to_string();
+    }
+    let replaced = path.replace('\\', "/");
+    let mut out = String::with_capacity(replaced.len());
+    let mut last_slash = false;
+    for ch in replaced.chars() {
+        if ch == '/' {
+            if last_slash {
+                continue;
+            }
+            last_slash = true;
+        } else {
+            last_slash = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn normalize_remote_path(path: &str) -> String {
-    let trimmed = path.trim();
+    let trimmed = normalize_remote_separators(path.trim());
     if trimmed == "/" {
         return "/".to_string();
     }
@@ -3691,8 +3779,10 @@ fn normalize_remote_path(path: &str) -> String {
 }
 
 fn remote_join(parent: &str, child: &str) -> String {
+    let parent = normalize_remote_separators(parent);
+    let child = normalize_remote_separators(child);
     if child.starts_with('/') {
-        child.to_string()
+        child
     } else {
         format!(
             "{}/{}",
@@ -3914,7 +4004,8 @@ mod tests {
         inherit_disabled_paths,
         load_remote_notes, move_remote_notes, numbered_remote_pak_file_name, pak_path_candidates,
         plan_library_download, plan_move, plan_remote_pak_renames, read_conflict_entries_cache,
-        is_deletable_remote_child, remote_deployment_prefix_width, remote_join,
+        is_deletable_remote_child, normalize_manifest_paths, normalize_remote_separators,
+        remote_deployment_prefix_width, remote_join,
         remove_remote_notes_under, root_from_pak_path,
         root_from_ue4ss_path, safe_pak_relative_path, save_remote_notes, ue4ss_path_candidates,
         validate_managed_manifest_paths, validate_remote_name, write_conflict_entries_cache,
@@ -3923,10 +4014,10 @@ mod tests {
     use crate::metadata::MetadataFile;
     use crate::models::{
         AppSettings, ModEntry, RemoteFile, SftpAccount, SftpManagedBackup, SftpManagedManifest,
-        SftpManagedRename,
+        SftpManagedRename, SftpManagedSource,
     };
     use crate::test_support::TempRoot;
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::path::Path;
     use std::process::Command;
 
@@ -4423,6 +4514,77 @@ mod tests {
         assert!(
             is_deletable_remote_child(root, "/srv/ue4ss/Mods/Evil"),
             "根目录下的正常模组路径应当被接受"
+        );
+    }
+
+
+    #[test]
+    fn normalize_remote_separators_rewrites_windows_joins() {
+        // ssh2 的 readdir 在 Windows 上是 `dirname.join(filename)`，
+        // 于是远端路径会变成 `/Content/Paks/~mods\\1144.pak`。
+        assert_eq!(
+            normalize_remote_separators("/Content/Paks/~mods\\1144整合包.pak"),
+            "/Content/Paks/~mods/1144整合包.pak"
+        );
+        assert_eq!(normalize_remote_separators("//srv//mods///A.pak"), "/srv/mods/A.pak");
+        assert_eq!(normalize_remote_separators("/srv/mods/A.pak"), "/srv/mods/A.pak");
+        assert_eq!(normalize_remote_separators(""), "");
+    }
+
+    #[test]
+    fn remote_join_flattens_backslashes_from_readdir() {
+        // readdir 返回的已经是绝对路径，remote_join 会原样返回——必须顺便洗掉反斜杠。
+        assert_eq!(
+            remote_join("/Content/Paks/~mods", "/Content/Paks/~mods\\1144.pak"),
+            "/Content/Paks/~mods/1144.pak"
+        );
+        assert_eq!(
+            remote_join("/Content/Paks/~mods", "1144.pak"),
+            "/Content/Paks/~mods/1144.pak"
+        );
+    }
+
+    #[test]
+    fn manifest_paths_are_flattened_on_read() {
+        // 历史清单里存的是坏路径，恢复布局时会照着它发 rename，必须在读入时就修好。
+        let mut manifest = SftpManagedManifest {
+            version: 1,
+            created_at: String::new(),
+            merged_path: Some("/srv/mods\\999_Merged.pak".into()),
+            merged_name: Some("999_Merged.pak".into()),
+            sources: vec![SftpManagedSource {
+                name: "Alpha.pak".into(),
+                path: "/srv/mods\\Alpha.pak".into(),
+            }],
+            backups: vec![SftpManagedBackup {
+                name: "Alpha.pak".into(),
+                original_path: "/srv/mods\\Alpha.pak".into(),
+                backup_path: "/srv/mods/_SCUM_Mod_Desk_Backups\\1/Alpha.pak.bak".into(),
+                reason: "disabled".into(),
+            }],
+            renames: vec![SftpManagedRename {
+                name: "Beta.pak".into(),
+                original_path: "/srv/mods\\Beta.pak".into(),
+                deployed_path: "/srv/mods\\001_Beta.pak".into(),
+                has_signature: false,
+            }],
+            created_paths: vec!["/srv/mods\\999_Merged.pak".into()],
+            winners: BTreeMap::new(),
+            provenance_paths: vec!["/srv/mods\\_scum_mm_provenance.json".into()],
+        };
+        normalize_manifest_paths(&mut manifest);
+        assert_eq!(manifest.merged_path.as_deref(), Some("/srv/mods/999_Merged.pak"));
+        assert_eq!(manifest.sources[0].path, "/srv/mods/Alpha.pak");
+        assert_eq!(manifest.backups[0].original_path, "/srv/mods/Alpha.pak");
+        assert_eq!(
+            manifest.backups[0].backup_path,
+            "/srv/mods/_SCUM_Mod_Desk_Backups/1/Alpha.pak.bak"
+        );
+        assert_eq!(manifest.renames[0].deployed_path, "/srv/mods/001_Beta.pak");
+        assert_eq!(manifest.created_paths[0], "/srv/mods/999_Merged.pak");
+        assert_eq!(
+            manifest.provenance_paths[0],
+            "/srv/mods/_scum_mm_provenance.json"
         );
     }
 

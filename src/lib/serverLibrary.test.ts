@@ -6,6 +6,7 @@ import type {
 } from "../types";
 import {
   buildServerLibrarySnapshot,
+  normalizeRemotePath,
   normalizeServerLibraryState,
   serverLibraryDisabledPaths,
   serverLibraryReleasedPaths,
@@ -449,5 +450,32 @@ describe("server library model", () => {
     expect(alpha?.enabled).toBe(false);
     expect(alpha?.tags).toEqual(["Disabled"]);
     expect(result.snapshot.mods.map((mod) => mod.name)).toEqual(["Beta.pak", "Alpha.pak"]);
+  });
+});
+
+describe("normalizeRemotePath", () => {
+  const bs = String.fromCharCode(92);
+
+  it("把 ssh2 在 Windows 上拼出来的反斜杠路径掰成服务器认的斜杠", () => {
+    expect(normalizeRemotePath(`/Content/Paks/~mods${bs}1144整合包.pak`)).toBe(
+      "/Content/Paks/~mods/1144整合包.pak",
+    );
+  });
+
+  it("折叠重复分隔符，保留开头那一个", () => {
+    expect(normalizeRemotePath("//srv//mods///Alpha.pak")).toBe("/srv/mods/Alpha.pak");
+    expect(normalizeRemotePath("/srv/mods/Alpha.pak")).toBe("/srv/mods/Alpha.pak");
+  });
+
+  it("老状态里的反斜杠键迁移后仍能对上扫描结果", () => {
+    const legacy = {
+      order: [`${bs}srv${bs}mods${bs}Alpha.pak`.replace(/^[\/]/, "/")],
+      enabled: { [`${bs}srv${bs}mods${bs}Alpha.pak`.replace(/^[\/]/, "/")]: false },
+      winners: {},
+      deleted: [],
+    };
+    const state = normalizeServerLibraryState(legacy, scan);
+    expect(state.enabled["/srv/mods/Alpha.pak"]).toBe(false);
+    expect(serverLibraryDisabledPaths(state)).toEqual(["/srv/mods/Alpha.pak"]);
   });
 });
