@@ -22,7 +22,7 @@
   "common.today": "今天",
   "common.notRecorded": "未记录",
   "common.notCalculated": "尚未计算",
-  "common.sizePending": "大小待确认",
+  "common.sizePending": "待统计",
   "common.client": "客户端",
   "common.server": "服务端",
   "common.working": "处理中…",

@@ -355,8 +355,9 @@ let settings: AppSettings = {
     port: "7042",
   },
   cloud: {
-    baseUrls: [],
-    activeBaseUrl: "",
+    // 浏览器预览没有后端云源配置，给一个演示线路，否则云端页永远停在「尚未配置云源」。
+    baseUrls: ["https://catalog.example.test"],
+    activeBaseUrl: "https://catalog.example.test",
     maxDownloadSegments: 16,
   },
   sftpAccounts: [],

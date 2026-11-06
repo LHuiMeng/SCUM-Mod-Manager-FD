@@ -54,6 +54,7 @@ import { cloudDownloadIsActive } from "./lib/cloudDownload";
 
 import {
   applyOperationEvent,
+  clearOperation,
   emptyOperations,
 } from "./lib/operations";
 import { CLOUD_AUTO_ATTEMPTS, runCloudCatalogAttempts } from "./lib/cloudCatalog";
@@ -1863,6 +1864,8 @@ function LocalizedApp() {
       setRemoteConflictLoading(false);
       setServerUploading(false);
       setBusy(false);
+      // 命令结束就收掉操作条：后端若因断连漏发 finished，界面也不会一直转。
+      setOperations((state) => clearOperation(state));
     }
   }
 
@@ -1889,6 +1892,7 @@ function LocalizedApp() {
       notify(t("toast.serverLibraryRestoreFailed.title"), String(error), "error");
     } finally {
       setBusy(false);
+      setOperations((state) => clearOperation(state));
     }
   }
 

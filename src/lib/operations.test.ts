@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { SftpOperationProgress } from "../types";
 import {
   applyOperationEvent,
+  clearOperation,
   emptyOperations,
   formatElapsed,
   operationKindKey,
@@ -61,5 +62,20 @@ describe("operations", () => {
     expect(operationKindKey("prepare")).toBe("operation.kind.prepare");
     expect(operationKindKey("download")).toBe("operation.kind.download");
     expect(operationKindKey("unknown-kind")).toBe("operation.kind.other");
+  });
+});
+
+describe("clearOperation", () => {
+  it("清掉当前操作，历史保留", () => {
+    const running = applyOperationEvent(emptyOperations, event({ finished: false }), 0);
+    const cleared = clearOperation(running);
+    expect(cleared.current).toBeNull();
+    expect(cleared.history).toHaveLength(1);
+  });
+
+  it("kind 不匹配时不动当前操作", () => {
+    const running = applyOperationEvent(emptyOperations, event({ finished: false }), 0);
+    expect(clearOperation(running, "download").current).not.toBeNull();
+    expect(clearOperation(running, "prepare").current).toBeNull();
   });
 });

@@ -152,7 +152,9 @@ export function ModRow({
         </span>
       </div>
       <span className="mod-type">{t(modTypeKey(mod.type))}</span>
-      <span className="mod-size">{formatBytes(mod.fileSize)}</span>
+      <span className="mod-size">
+        {mod.fileSize > 0 ? formatBytes(mod.fileSize) : t("common.sizePending")}
+      </span>
       <span
         className="mod-toggle-cell"
         onClick={(event) => event.stopPropagation()}

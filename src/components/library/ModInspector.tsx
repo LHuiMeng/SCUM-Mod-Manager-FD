@@ -144,7 +144,9 @@ export function ModInspector({
           <div className="detail-facts">
             <div>
               <span>{t("inspector.fileSize")}</span>
-              <b>{formatBytes(mod.fileSize)}</b>
+              <b>
+                {mod.fileSize > 0 ? formatBytes(mod.fileSize) : t("common.sizePending")}
+              </b>
             </div>
             <div>
               <span>{t("inspector.loadOrder")}</span>

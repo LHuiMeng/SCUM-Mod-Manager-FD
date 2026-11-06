@@ -30,6 +30,13 @@ export function applyOperationEvent(
   return event.finished ? { current: null, history } : { current: entry, history };
 }
 
+/** 命令返回后兜底：即使后端漏发 finished（断连/被杀），操作条也不会一直转。 */
+export function clearOperation(state: OperationState, kind?: string): OperationState {
+  if (!state.current) return state;
+  if (kind && state.current.kind !== kind) return state;
+  return { ...state, current: null };
+}
+
 export function operationPercent(entry: OperationEntry | null): number | null {
   if (!entry || entry.total <= 0) return null;
   return Math.min(100, Math.round((entry.completed / entry.total) * 100));

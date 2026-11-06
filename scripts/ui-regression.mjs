@@ -859,6 +859,13 @@ async function connect(url, appUrl) {
 
   await test("设置页路径检测、云源保存与保存反馈", async () => {
     await navigate("设置");
+    if (!(await evaluate("document.querySelectorAll('.settings-nav button').length === 5"))) {
+      throw new Error("设置页分类导航未渲染");
+    }
+    screenshots.push(await screenshot("1440-light-settings-paths"));
+
+    await clickText("启动与部署", ".settings-nav button");
+    await waitFor("document.body.innerText.includes('启动参数')");
     const autoMerge = await evaluate(`(() => {
       const toggle = document.querySelector('button[aria-label="自动融合冲突"]');
       return {
@@ -869,18 +876,39 @@ async function connect(url, appUrl) {
     if (!autoMerge.visible || autoMerge.checked !== "true") {
       throw new Error(`自动融合设置未正确显示：${JSON.stringify(autoMerge)}`);
     }
+    screenshots.push(await screenshot("1440-light-settings-startup"));
+
     await clickText("自动检测路径");
     await waitFor("document.body.innerText.includes('已填入检测到的路径')");
     await wait(400);
+
+    await clickText("云端与下载", ".settings-nav button");
+    const originalCatalog = await evaluate("document.querySelector('textarea')?.value ?? ''");
+    if (originalCatalog === null) throw new Error("云源输入框未渲染");
     await setInput("https://your-catalog.example", "https://catalog.example.test", "textarea");
-    await waitFor(
-      "document.querySelector('textarea[placeholder=\"https://your-catalog.example\"]')?.value === 'https://catalog.example.test'",
+    const cloudSourceValue = await evaluate(
+      "document.querySelector('textarea')?.value ?? ''",
     );
+    if (!cloudSourceValue.includes("catalog.example.test")) {
+      throw new Error(`云源输入没有被写入：${cloudSourceValue}`);
+    }
+    screenshots.push(await screenshot("1440-light-settings-cloud"));
+
+    await clickText("外观与语言", ".settings-nav button");
+    await waitFor("document.querySelector('.settings-body')?.innerText.includes('外观') === true");
+    screenshots.push(await screenshot("1440-light-settings-appearance"));
+
+    await clickText("更新与关于", ".settings-nav button");
+    await waitFor("document.querySelector('.settings-body')?.innerText.includes('当前版本') === true");
+    screenshots.push(await screenshot("1440-light-settings-about"));
+
+    // 还原真实云源，避免后续云端用例因为假地址拿不到目录。
+    await clickText("云端与下载", ".settings-nav button");
+    await setInput("https://your-catalog.example", originalCatalog, "textarea");
     await clickText("保存设置");
     await waitFor("document.body.innerText.includes('设置已保存')");
     const info = await layout();
     if (info.horizontalOverflow) throw new Error("设置页横向溢出");
-    screenshots.push(await screenshot("1440-light-settings"));
     return info;
   });
 
@@ -1055,7 +1083,9 @@ async function connect(url, appUrl) {
     }
     screenshots.push(await screenshot("1440-light-server-library-ready"));
     await clickText("上传到服务器");
-    await waitFor("document.body.innerText.includes('服务器布局已应用')", 10000);
+    await waitFor("document.body.innerText.includes('上传前确认')", 10000);
+    await clickText("开始上传", ".modal-foot button");
+    await waitFor("document.body.innerText.includes('服务器布局已应用')", 15000);
     await waitFor(
       "document.body.innerText.includes('服务器已应用托管布局') && document.body.innerText.includes('SCUM Mod Desk 合并模组')",
       10000,
@@ -1147,6 +1177,8 @@ async function connect(url, appUrl) {
     await clickText("服务器模组", ".library-source-switch button");
     await waitFor("document.body.innerText.includes('服务器已应用托管布局')");
     await clickText("恢复服务器原状");
+    await waitFor("document.querySelector('.modal-foot button') !== null", 5000);
+    await clickText("恢复服务器原状", ".modal-foot button");
     await waitFor("document.body.innerText.includes('服务器原始模组已恢复')", 10000);
     await waitFor(
       "document.body.innerText.includes('尚未应用服务器布局') && document.body.innerText.includes('SCUM_WeaponPack_Elite.pak')",
@@ -1379,6 +1411,8 @@ async function connect(url, appUrl) {
 
   await test("中英文切换、持久化与英文窄窗布局", async () => {
     await navigate("设置");
+    await clickText("外观与语言", ".settings-nav button");
+    await waitFor("document.querySelector('.language-options') !== null");
     await clickText("English", ".language-options button");
     await waitFor("document.documentElement.lang === 'en-US'");
     await waitFor("document.querySelector('h1')?.innerText === 'Settings'");
@@ -1472,6 +1506,8 @@ async function connect(url, appUrl) {
 
     await clickText("Settings", ".rail-button");
     await waitFor("document.querySelector('h1')?.innerText === 'Settings'");
+    await clickText("Look & language", ".settings-nav button");
+    await waitFor("document.querySelector('.language-options') !== null");
     await clickText("简体中文", ".language-options button");
     await waitFor("document.documentElement.lang === 'zh-CN'");
     await waitFor("document.querySelector('h1')?.innerText === '设置'");
