@@ -6,10 +6,10 @@ use crate::launcher;
 use crate::models::{
     AppInfo, AppSettings, AppUpdateInfo, CloudDownloadProgress, ConflictMergeResult,
     DetectPathsResult, DownloadResult, GameStatus, ImportConflict, ImportResult,
-    InstallUpdateResult, LibrarySnapshot, LocaleBundle, RemoteFile, RemoteMod, RuntimeLog,
-    ModConfigFile, ModConfigFileContent, SftpAccountInput, SftpApplyResult,
-    SftpConflictReport, SftpConnectionResult,
-    SftpOperationProgress, SftpOperationResult, SftpPrepareResult, UploadResult,
+    InstallUpdateResult, LibrarySnapshot, LocaleBundle, ModConfigFile, ModConfigFileContent,
+    RemoteFile, RemoteMod, RenameModResult, RuntimeLog, SftpAccountInput, SftpApplyResult,
+    SftpConflictReport, SftpConnectionResult, SftpOperationProgress, SftpOperationResult,
+    SftpPrepareResult, UploadResult,
 };
 use crate::mods::links::PendingLink;
 use crate::paths::path_string;
@@ -192,6 +192,32 @@ pub async fn set_mod_enabled(
     .await
     .map_err(error_text)?
     .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn set_mods_enabled(
+    app: AppHandle,
+    ids: Vec<String>,
+    enabled: bool,
+) -> Result<LibrarySnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AppState>().set_mods_enabled(&ids, enabled)
+    })
+    .await
+    .map_err(error_text)?
+    .map_err(error_text)
+}
+
+#[tauri::command]
+pub async fn rename_mod(
+    app: AppHandle,
+    id: String,
+    new_name: String,
+) -> Result<RenameModResult, String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AppState>().rename_mod(&id, &new_name))
+        .await
+        .map_err(error_text)?
+        .map_err(error_text)
 }
 
 #[tauri::command]

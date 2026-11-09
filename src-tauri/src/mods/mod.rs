@@ -68,6 +68,7 @@ pub fn scan_local_mods_with_diagnostics(
 ) -> Result<LocalScanResult> {
     let mut mods = Vec::new();
     let mut diagnostics = Vec::new();
+    let known_ids_before: HashSet<String> = metadata.entries.keys().cloned().collect();
 
     if paths.local_mods.exists() {
         for entry in std::fs::read_dir(&paths.local_mods)? {
@@ -102,6 +103,7 @@ pub fn scan_local_mods_with_diagnostics(
         }
     }
 
+    reconcile_renamed_file_metadata(metadata, &mut mods, &known_ids_before);
     duplicates::promote_duplicate_metadata(&mods, metadata);
     let mut mods = duplicates::collapse_identical_mods(mods, metadata);
     let order: HashMap<&str, usize> = metadata
@@ -128,6 +130,72 @@ pub fn scan_local_mods_with_diagnostics(
     refresh_conflicts(metadata, &mut mods);
     metadata.order = mods.iter().map(|item| item.id.clone()).collect();
     Ok(LocalScanResult { mods, diagnostics })
+}
+
+/// 用户在资源管理器里改名后，文件会得到新的稳定 ID。
+/// 用“内容哈希 + 大小 + 修改时间”找回旧元数据，既保留启停/标签/备注，
+/// 也把显示名标记为跟随文件名，避免云端目录名把新名字盖回去。
+fn reconcile_renamed_file_metadata(
+    metadata: &mut MetadataFile,
+    mods: &mut [ModEntry],
+    known_ids_before: &HashSet<String>,
+) {
+    let current_ids: HashSet<String> = mods.iter().map(|item| item.id.clone()).collect();
+    let orphan_ids: Vec<String> = known_ids_before
+        .iter()
+        .filter(|id| !current_ids.contains(*id))
+        .cloned()
+        .collect();
+
+    for item in mods.iter_mut() {
+        if known_ids_before.contains(&item.id) || item.sha256.len() != 64 {
+            continue;
+        }
+        let Some((file_size, modified_at)) = metadata
+            .entries
+            .get(&item.id)
+            .map(|meta| (meta.file_size, meta.modified_at))
+        else {
+            continue;
+        };
+        let matches: Vec<String> = orphan_ids
+            .iter()
+            .filter(|old_id| {
+                metadata.entries.get(*old_id).is_some_and(|old_meta| {
+                    old_meta.sha256.eq_ignore_ascii_case(&item.sha256)
+                        && old_meta.file_size == file_size
+                        && old_meta.modified_at == modified_at
+                })
+            })
+            .cloned()
+            .collect();
+        if matches.len() != 1 {
+            continue;
+        }
+        let old_id = matches[0].clone();
+        let Some(mut migrated) = metadata.entries.remove(&old_id) else {
+            continue;
+        };
+        migrated.name = None;
+        migrated.name_from_file_name = true;
+        migrated.file_size = file_size;
+        migrated.modified_at = modified_at;
+        metadata.entries.remove(&item.id);
+        metadata.entries.insert(item.id.clone(), migrated.clone());
+        for id in &mut metadata.order {
+            if *id == old_id {
+                *id = item.id.clone();
+            }
+        }
+        for winner in metadata.conflict_winners.values_mut() {
+            if *winner == old_id {
+                *winner = item.id.clone();
+            }
+        }
+        item.enabled = migrated.enabled;
+        item.tags = migrated.tags.clone();
+        item.notes = migrated.notes.clone();
+    }
 }
 
 fn build_file_mod(
@@ -165,16 +233,19 @@ fn build_file_mod(
         meta.sha256 = compute_sha256(path).unwrap_or_default();
     }
 
-    let name = meta
-        .name
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        });
+    let file_stem = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let name = if meta.name_from_file_name {
+        file_stem.clone()
+    } else {
+        meta.name
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(file_stem)
+    };
     let tags = meta.tags.clone();
     let notes = meta.notes.clone();
     let enabled = meta.enabled;
@@ -268,11 +339,14 @@ fn build_directory_mod(
     let meta = metadata.entry_mut(&id);
     meta.file_size = Some(file_size);
     meta.modified_at = Some(epoch_millis(modified));
-    let name = meta
-        .name
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| file_name.clone());
+    let name = if meta.name_from_file_name {
+        file_name.clone()
+    } else {
+        meta.name
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| file_name.clone())
+    };
     let tags = meta.tags.clone();
     let notes = meta.notes.clone();
     let enabled = meta.enabled;
@@ -773,9 +847,12 @@ pub fn install_ue4ss_zip(
         return Ok((0, 1));
     }
 
-    let staging = paths
-        .ue4ss_mods
-        .join(format!(".staging-{}-{}-{}", std::process::id(), uuid::Uuid::new_v4(), folder_name));
+    let staging = paths.ue4ss_mods.join(format!(
+        ".staging-{}-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4(),
+        folder_name
+    ));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)?;
     let extracted = match extract_zip_all_with_wrapper(archive, &staging, wrapper.as_deref()) {
@@ -878,9 +955,7 @@ fn zip_extract_budget(destination: &Path) -> u64 {
 
 fn ensure_zip_entry_budget(entry_count: usize) -> Result<()> {
     if entry_count > MAX_ZIP_ENTRIES {
-        anyhow::bail!(
-            "压缩包条目过多（{entry_count}），超过上限 {MAX_ZIP_ENTRIES}，已拒绝解压"
-        );
+        anyhow::bail!("压缩包条目过多（{entry_count}），超过上限 {MAX_ZIP_ENTRIES}，已拒绝解压");
     }
     Ok(())
 }
@@ -1125,6 +1200,38 @@ mod tests {
         assert_eq!(mods.len(), 1);
         assert_eq!(mods[0].name, "衣物容器嵌套");
         assert_eq!(mods[0].file_name, "______.pak");
+    }
+
+    #[test]
+    fn follows_an_external_file_rename_and_keeps_metadata() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        fs::write(paths.local_mods.join("Alpha.pak"), b"same pak bytes").unwrap();
+        let mut metadata = crate::metadata::MetadataFile::default();
+        let first = scan_local_mods(&paths, &mut metadata, &HashSet::new()).unwrap();
+        let old_id = first[0].id.clone();
+        metadata.entry_mut(&old_id).name = Some("云端显示名".to_string());
+        metadata.entry_mut(&old_id).tags = vec!["服务器".to_string()];
+        metadata.entry_mut(&old_id).notes = "外部改名后仍要保留".to_string();
+        metadata.entry_mut(&old_id).enabled = false;
+
+        fs::rename(
+            paths.local_mods.join("Alpha.pak"),
+            paths.local_mods.join("Renamed On Disk.pak"),
+        )
+        .unwrap();
+        let mods = scan_local_mods(&paths, &mut metadata, &HashSet::new()).unwrap();
+
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].name, "Renamed On Disk");
+        assert_eq!(mods[0].file_name, "Renamed On Disk.pak");
+        assert!(!mods[0].enabled);
+        assert_eq!(mods[0].tags, vec!["服务器"]);
+        assert_eq!(mods[0].notes, "外部改名后仍要保留");
+        assert_ne!(mods[0].id, old_id);
+        assert!(!metadata.entries.contains_key(&old_id));
+        assert!(metadata.entries[&mods[0].id].name_from_file_name);
+        assert_eq!(metadata.order, vec![mods[0].id.clone()]);
     }
 
     #[test]
@@ -1758,5 +1865,4 @@ mod tests {
         assert!(budget <= available, "预算不能超过可用空间");
         let _ = fs::remove_dir_all(&root);
     }
-
 }

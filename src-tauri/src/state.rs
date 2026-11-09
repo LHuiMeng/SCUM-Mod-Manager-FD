@@ -5,7 +5,7 @@ use crate::launcher::ManagedProcess;
 use crate::metadata::{self, MetadataFile};
 use crate::models::{
     AppInfo, AppSettings, ConflictGroup, ConflictMergeResult, GameStatus, LibrarySnapshot,
-    ModEntry, RuntimeLog, SftpAccount, SftpAccountInput,
+    ModEntry, RenameModResult, RuntimeLog, SftpAccount, SftpAccountInput,
 };
 use crate::mods::deploy::{
     deployed_file_names, read_manifest, reclaim_mods, reclaim_mods_with_wait,
@@ -55,13 +55,24 @@ impl AppState {
 
     fn from_paths(paths: AppPaths) -> Result<Self> {
         let secrets = load_runtime_secrets(&paths, edition::current());
-        let settings = config::load_settings_with_cloud_defaults(&paths, &secrets.cloud_base_urls)
-            .unwrap_or_else(|error| {
-                eprintln!("读取配置失败，使用默认值：{error:#}");
-                let mut settings = AppSettings::default();
-                config::apply_default_cloud_sources(&mut settings, &secrets.cloud_base_urls);
-                settings
-            });
+        let mut settings =
+            config::load_settings_with_cloud_defaults(&paths, &secrets.cloud_base_urls)
+                .unwrap_or_else(|error| {
+                    eprintln!("读取配置失败，使用默认值：{error:#}");
+                    let mut settings = AppSettings::default();
+                    config::apply_default_cloud_sources(&mut settings, &secrets.cloud_base_urls);
+                    settings
+                });
+        // 首次启动，或配置里还没有绑定安装目录时，直接检测 Steam 库并落盘。
+        // 不要让用户先点「自动检测」再点「保存设置」。
+        let detected_paths = crate::steam::detect_game_paths();
+        let auto_detected_paths =
+            crate::steam::fill_missing_settings_paths(&mut settings, detected_paths);
+        if auto_detected_paths {
+            if let Err(error) = config::save_settings(&paths, &settings) {
+                eprintln!("自动检测路径后保存配置失败：{error:#}");
+            }
+        }
         let installs = vec![
             settings.scum_install_path.clone(),
             settings.server_install_path.clone(),
@@ -119,6 +130,32 @@ impl AppState {
             launch_lock: Mutex::new(()),
         };
         state.log("info", "app", "Rust 后端已初始化，本地模组扫描完成");
+        if auto_detected_paths {
+            let (client_path, server_path) = {
+                let settings = state.settings.lock().unwrap();
+                (
+                    settings.scum_install_path.clone(),
+                    settings.server_install_path.clone(),
+                )
+            };
+            state.log(
+                "info",
+                "settings",
+                &format!(
+                    "已自动检测安装路径并保存：客户端 {}；服务端 {}",
+                    if client_path.trim().is_empty() {
+                        "未找到"
+                    } else {
+                        &client_path
+                    },
+                    if server_path.trim().is_empty() {
+                        "未找到"
+                    } else {
+                        &server_path
+                    }
+                ),
+            );
+        }
         log_pak_diagnostics(&state, &scan.diagnostics);
         let pending = state.pending_links.lock().unwrap().clone();
         if let Some(links) = pending.first() {
@@ -266,11 +303,189 @@ impl AppState {
         Ok(self.snapshot())
     }
 
+    /// 批量启停：一次落盘、一次刷新冲突，避免“全选”时反复写 mods_meta.json。
+    pub fn set_mods_enabled(&self, ids: &[String], enabled: bool) -> Result<LibrarySnapshot> {
+        if self.process_running() {
+            anyhow::bail!("游戏运行期间不能更改模组启用状态");
+        }
+        let requested: std::collections::HashSet<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !id.is_empty())
+            .collect();
+        if requested.is_empty() {
+            return Ok(self.snapshot());
+        }
+
+        let mut mods_snapshot = self.mods.read().unwrap().clone();
+        let mut changed = 0usize;
+        for item in &mut mods_snapshot {
+            if requested.contains(item.id.as_str()) && item.enabled != enabled {
+                item.enabled = enabled;
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            return Ok(self.snapshot());
+        }
+
+        let mut metadata = self.metadata.lock().unwrap();
+        let mut previous = Vec::new();
+        for item in &mods_snapshot {
+            if !requested.contains(item.id.as_str()) {
+                continue;
+            }
+            let entry = metadata.entry_mut(&item.id);
+            if entry.enabled != enabled {
+                previous.push((item.id.clone(), entry.enabled));
+                entry.enabled = enabled;
+            }
+        }
+        let conflicts = refresh_conflicts(&mut metadata, &mut mods_snapshot);
+        if let Err(error) = metadata::save_metadata(&self.paths, &metadata) {
+            for (id, previous_enabled) in previous {
+                metadata.entry_mut(&id).enabled = previous_enabled;
+            }
+            return Err(error);
+        }
+        drop(metadata);
+        *self.mods.write().unwrap() = mods_snapshot.clone();
+        *self.conflicts.write().unwrap() = conflicts;
+        if let Err(error) = sync_ue4ss_state(&self.paths, &mods_snapshot) {
+            self.log("warn", "ue4ss", &format!("同步 mods.txt 失败：{error:#}"));
+        }
+        self.log(
+            "info",
+            "library",
+            &format!(
+                "已{} {} 个模组",
+                if enabled { "启用" } else { "停用" },
+                changed
+            ),
+        );
+        Ok(self.snapshot())
+    }
+
+    /// 重命名本地模组文件或 UE4SS 目录，并把启停、标签、备注等元数据迁移到新 ID。
+    pub fn rename_mod(&self, id: &str, new_name: &str) -> Result<RenameModResult> {
+        if self.process_running() {
+            anyhow::bail!("游戏运行期间不能重命名模组");
+        }
+        let item = self
+            .mods
+            .read()
+            .unwrap()
+            .iter()
+            .find(|item| item.id == id)
+            .cloned()
+            .context("找不到指定模组")?;
+        let (root, extension) = match item.mod_type.as_str() {
+            "clientPak" => (self.paths.local_mods.as_path(), Some("pak")),
+            "ue4ssMod" => (self.paths.ue4ss_mods.as_path(), None),
+            _ => anyhow::bail!("这个模组类型不支持重命名"),
+        };
+        let old_path = PathBuf::from(&item.file_path);
+        if !is_direct_child(&old_path, root) {
+            anyhow::bail!("拒绝重命名模组库之外的路径");
+        }
+        if extension.is_some() && !old_path.is_file() {
+            anyhow::bail!("PAK 模组文件不存在");
+        }
+        if extension.is_none() && !old_path.is_dir() {
+            anyhow::bail!("UE4SS 模组目录不存在");
+        }
+
+        let new_file_name = normalized_mod_file_name(new_name, extension)?;
+        let new_path = root.join(&new_file_name);
+        if new_path == old_path {
+            return Ok(RenameModResult {
+                snapshot: self.snapshot(),
+                previous_id: id.to_string(),
+                id: id.to_string(),
+                name: item.name.clone(),
+            });
+        }
+        let same_path_ignoring_case =
+            path_string(&new_path).eq_ignore_ascii_case(&path_string(&old_path));
+        if new_path.exists() && !same_path_ignoring_case {
+            anyhow::bail!("模组库里已经存在同名文件：{new_file_name}");
+        }
+
+        rename_local_entry(&old_path, &new_path)?;
+        let new_id = crate::mods::stable_id(root, &new_file_name);
+        let mut metadata = self.metadata.lock().unwrap();
+        let previous_metadata = metadata.clone();
+        let mut migrated = metadata.entries.remove(id).unwrap_or_default();
+        // 物理改名后应让库里的名称跟随磁盘；清掉云端显示名缓存，避免看起来“没改名”。
+        migrated.name = None;
+        migrated.name_from_file_name = true;
+        migrated.file_size = None;
+        migrated.modified_at = None;
+        metadata.entries.insert(new_id.clone(), migrated);
+        for entry in &mut metadata.order {
+            if entry == id {
+                *entry = new_id.clone();
+            }
+        }
+        for winner in metadata.conflict_winners.values_mut() {
+            if winner == id {
+                *winner = new_id.clone();
+            }
+        }
+        if let Err(error) = metadata::save_metadata(&self.paths, &metadata) {
+            *metadata = previous_metadata;
+            drop(metadata);
+            let rollback = rename_local_entry(&new_path, &old_path);
+            return match rollback {
+                Ok(()) => Err(error.context("保存模组元数据失败，已恢复原文件名")),
+                Err(rollback_error) => Err(error.context(format!(
+                    "保存模组元数据失败，且无法恢复原文件名：{rollback_error:#}"
+                ))),
+            };
+        }
+        drop(metadata);
+
+        let snapshot = match self.refresh_files() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.log(
+                    "warn",
+                    "library",
+                    &format!("改名已写入磁盘，但刷新模组库失败：{error:#}"),
+                );
+                self.snapshot()
+            }
+        };
+        let result_id = if snapshot.mods.iter().any(|mod_entry| mod_entry.id == new_id) {
+            new_id
+        } else {
+            id.to_string()
+        };
+        let display_name = Path::new(&new_file_name)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        self.log(
+            "info",
+            "library",
+            &format!("已将模组 {} 重命名为 {}", item.name, display_name),
+        );
+        Ok(RenameModResult {
+            snapshot,
+            previous_id: id.to_string(),
+            id: result_id,
+            name: display_name,
+        })
+    }
+
     pub fn reorder_mods(&self, ids: &[String]) -> Result<LibrarySnapshot> {
         // 在克隆上排序，落盘成功后才替换线上列表：落盘失败时不能把内存里的模组清空。
         let current = self.mods.read().unwrap().clone();
-        let mut by_id: HashMap<String, ModEntry> =
-            current.into_iter().map(|item| (item.id.clone(), item)).collect();
+        let mut by_id: HashMap<String, ModEntry> = current
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect();
         let mut ordered = Vec::new();
         for id in ids {
             if let Some(item) = by_id.remove(id) {
@@ -715,7 +930,11 @@ impl AppState {
             let _ = crate::launcher::stop_with_notice(self, notify);
         } else {
             if let Err(error) = self.reclaim_deployments_after_exit_notified(notify) {
-                self.log("warn", "deploy", &format!("退出回收部署文件失败：{error:#}"));
+                self.log(
+                    "warn",
+                    "deploy",
+                    &format!("退出回收部署文件失败：{error:#}"),
+                );
             }
         }
     }
@@ -759,6 +978,89 @@ fn normalize_path(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+const MAX_MOD_RENAME_CHARS: usize = 80;
+const WINDOWS_RESERVED_MOD_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+fn normalized_mod_file_name(raw: &str, extension: Option<&str>) -> Result<String> {
+    let trimmed = raw.trim();
+    let suffix = extension.map(|value| format!(".{value}"));
+    let lower = trimmed.to_ascii_lowercase();
+    let name = match suffix.as_deref() {
+        Some(suffix) if lower.ends_with(suffix) => {
+            &trimmed[..trimmed.len().saturating_sub(suffix.len())]
+        }
+        _ => trimmed,
+    };
+    if name.is_empty() {
+        anyhow::bail!("模组名称不能为空");
+    }
+    if name.chars().count() > MAX_MOD_RENAME_CHARS {
+        anyhow::bail!("模组名称不能超过 {MAX_MOD_RENAME_CHARS} 个字符");
+    }
+    if name == "." || name == ".." || name.starts_with('.') {
+        anyhow::bail!("模组名称不能以点开头");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        anyhow::bail!("模组名称不能以点或空格结尾");
+    }
+    if name.chars().any(|ch| {
+        ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        anyhow::bail!("模组名称不能包含 \\ / : * ? \" < > | 或控制字符");
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+    if WINDOWS_RESERVED_MOD_NAMES.contains(&stem.as_str()) {
+        anyhow::bail!("“{stem}”是 Windows 保留名称，请换一个名称");
+    }
+    Ok(match extension {
+        Some("pak") => format!("{name}.pak"),
+        Some(other) => format!("{name}.{other}"),
+        None => name.to_string(),
+    })
+}
+
+fn rename_local_entry(source: &Path, destination: &Path) -> Result<()> {
+    if source == destination {
+        return Ok(());
+    }
+    let same_path_ignoring_case =
+        path_string(source).eq_ignore_ascii_case(&path_string(destination));
+    if !same_path_ignoring_case {
+        return std::fs::rename(source, destination).with_context(|| {
+            format!(
+                "无法将 {} 重命名为 {}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
+    // Windows 只改大小写时，直接 rename 可能被当成同一个路径；用临时名中转一次。
+    let temporary = source.with_file_name(format!(".scum-rename-{}", Uuid::new_v4()));
+    std::fs::rename(source, &temporary)
+        .with_context(|| format!("无法重命名 {}", source.display()))?;
+    match std::fs::rename(&temporary, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::rename(&temporary, source);
+            Err(error).with_context(|| {
+                format!(
+                    "无法将 {} 重命名为 {}",
+                    source.display(),
+                    destination.display()
+                )
+            })
+        }
+    }
+}
+
 fn move_entry(source: &Path, destination: &Path) -> Result<()> {
     std::fs::rename(source, destination).with_context(|| {
         format!(
@@ -778,7 +1080,7 @@ fn ensure_deletion_allowed(running: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_deletion_allowed, is_direct_child, AppState};
+    use super::{ensure_deletion_allowed, is_direct_child, normalized_mod_file_name, AppState};
     use crate::models::ModEntry;
     use crate::paths::{path_string, AppPaths};
     use crate::test_support::TempRoot;
@@ -1018,6 +1320,142 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn batch_toggle_updates_all_requested_mods_and_persists() {
+        let temp = TempRoot::new("state-batch-toggle");
+        let paths = temp.paths();
+        for name in ["Alpha.pak", "Beta.pak", "Gamma.pak"] {
+            fs::write(paths.local_mods.join(name), name.as_bytes()).unwrap();
+        }
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        let initial = state.scan(false).unwrap();
+        let ids = initial
+            .mods
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+
+        let snapshot = state
+            .set_mods_enabled(&ids[..2], false)
+            .expect("批量停用应成功");
+
+        assert_eq!(snapshot.mods.iter().filter(|item| item.enabled).count(), 1);
+        let reloaded = AppState::from_paths(paths).unwrap();
+        assert_eq!(
+            reloaded
+                .mods
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|item| item.enabled)
+                .count(),
+            1,
+            "批量启停必须写入 mods_meta.json"
+        );
+    }
+
+    #[test]
+    fn renames_a_pak_mod_and_migrates_its_metadata() {
+        let temp = TempRoot::new("state-rename-pak");
+        let paths = temp.paths();
+        fs::write(paths.local_mods.join("Alpha.pak"), b"alpha").unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        let initial = state.scan(false).unwrap();
+        let id = initial.mods[0].id.clone();
+        state
+            .update_mod_metadata(&id, vec!["server".to_string()], "保留备注".to_string())
+            .unwrap();
+        state.set_mod_enabled(&id, false).unwrap();
+
+        let result = state.rename_mod(&id, "Renamed Weapon").unwrap();
+
+        assert!(!paths.local_mods.join("Alpha.pak").exists());
+        assert!(paths.local_mods.join("Renamed Weapon.pak").is_file());
+        assert_ne!(result.id, id);
+        let renamed = result
+            .snapshot
+            .mods
+            .iter()
+            .find(|item| item.id == result.id)
+            .expect("改名后应能在快照里找到新模组");
+        assert_eq!(renamed.name, "Renamed Weapon");
+        assert!(!renamed.enabled);
+        assert_eq!(renamed.tags, vec!["server"]);
+        assert_eq!(renamed.notes, "保留备注");
+
+        let reloaded = AppState::from_paths(paths).unwrap();
+        let renamed = reloaded
+            .mods
+            .read()
+            .unwrap()
+            .iter()
+            .find(|item| item.file_name == "Renamed Weapon.pak")
+            .cloned()
+            .expect("重新加载后仍应保留新文件名");
+        assert!(!renamed.enabled);
+        assert_eq!(renamed.tags, vec!["server"]);
+        assert_eq!(renamed.notes, "保留备注");
+    }
+
+    #[test]
+    fn renames_a_ue4ss_directory() {
+        let temp = TempRoot::new("state-rename-ue4ss");
+        let paths = temp.paths();
+        let module = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(module.join("Scripts")).unwrap();
+        fs::write(module.join("Scripts").join("main.lua"), b"print('ok')").unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        let initial = state.scan(false).unwrap();
+        let id = initial.mods[0].id.clone();
+
+        let result = state.rename_mod(&id, "Better AI").unwrap();
+
+        assert!(!module.exists());
+        assert!(paths
+            .ue4ss_mods
+            .join("Better AI")
+            .join("Scripts")
+            .join("main.lua")
+            .is_file());
+        assert_eq!(result.name, "Better AI");
+    }
+
+    #[test]
+    fn rename_rejects_an_existing_target_and_invalid_names() {
+        let temp = TempRoot::new("state-rename-conflict");
+        let paths = temp.paths();
+        fs::write(paths.local_mods.join("Alpha.pak"), b"alpha").unwrap();
+        fs::write(paths.local_mods.join("Beta.pak"), b"beta").unwrap();
+        let state = AppState::from_paths(paths).unwrap();
+        let initial = state.scan(false).unwrap();
+        let alpha = initial
+            .mods
+            .iter()
+            .find(|item| item.file_name == "Alpha.pak")
+            .unwrap()
+            .id
+            .clone();
+
+        assert!(state.rename_mod(&alpha, "Beta").is_err());
+        assert!(state.rename_mod(&alpha, "../Escape").is_err());
+        assert!(state.rename_mod(&alpha, "CON").is_err());
+    }
+
+    #[test]
+    fn normalizes_rename_extensions_without_allowing_traversal() {
+        assert_eq!(
+            normalized_mod_file_name("  My Mod.PAK  ", Some("pak")).unwrap(),
+            "My Mod.pak"
+        );
+        assert_eq!(
+            normalized_mod_file_name("Better AI", None).unwrap(),
+            "Better AI"
+        );
+        assert!(normalized_mod_file_name("", Some("pak")).is_err());
+        assert!(normalized_mod_file_name("bad/name", Some("pak")).is_err());
+        assert!(normalized_mod_file_name(".hidden", None).is_err());
     }
 
     #[test]

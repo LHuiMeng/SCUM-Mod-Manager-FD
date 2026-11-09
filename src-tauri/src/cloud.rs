@@ -912,9 +912,11 @@ pub fn apply_catalog_names(
 
     let mut updated = 0;
     for entry in mods.iter_mut() {
-        let known = metadata
-            .entries
-            .get(&entry.id)
+        let metadata_entry = metadata.entries.get(&entry.id);
+        if metadata_entry.is_some_and(|meta| meta.name_from_file_name) {
+            continue;
+        }
+        let known = metadata_entry
             .and_then(|meta| meta.name.clone())
             .filter(|value| !value.trim().is_empty());
         if let Some(name) = known {
@@ -2334,6 +2336,37 @@ mod tests {
         metadata.entries.get_mut("legacy").unwrap().name = Some("用户自己改的名".to_string());
         assert_eq!(apply_catalog_names(&paths, &mut metadata, &mut mods), 0);
         assert_eq!(mods[0].name, "用户自己改的名");
+    }
+
+    #[test]
+    fn never_overrides_a_name_that_follows_the_file_name() {
+        let temp = TempRoot::new("cloud-name-rename");
+        let paths = temp.paths();
+        let catalog = json!({
+            "mods": [{
+                "id": "demo",
+                "name": "云端旧名字",
+                "sha256": "abcdef0123456789",
+                "type": "clientPak"
+            }]
+        });
+        save_catalog_cache(&paths, "https://mods.example.test", &catalog);
+        let mut metadata = crate::metadata::MetadataFile::default();
+        let entry = metadata.entry_mut("renamed");
+        entry.name_from_file_name = true;
+        entry.sha256 = "abcdef0123456789".to_string();
+        let mut mods = vec![ModEntry {
+            id: "renamed".to_string(),
+            name: "本地新名字".to_string(),
+            sha256: "abcdef0123456789".to_string(),
+            mod_type: "clientPak".to_string(),
+            enabled: true,
+            ..ModEntry::default()
+        }];
+
+        assert_eq!(apply_catalog_names(&paths, &mut metadata, &mut mods), 0);
+        assert_eq!(mods[0].name, "本地新名字");
+        assert_eq!(metadata.entries["renamed"].name, None);
     }
 
     #[test]

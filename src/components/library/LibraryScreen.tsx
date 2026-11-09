@@ -11,6 +11,11 @@ import type {
 import type { ServerLibraryState } from "../../lib/serverLibrary";
 import type { OperationEntry } from "../../lib/operations";
 import { operationDetail, operationKindKey, operationPercent } from "../../lib/operations";
+import {
+  pruneModSelection,
+  updateModSelection,
+  type ModSelectionMode,
+} from "../../lib/modSelection";
 import { useI18n } from "../../i18n";
 import { Button } from "../ui/Button";
 import { Icon } from "../ui/Icon";
@@ -21,6 +26,7 @@ import { ConflictResolutionPanel } from "./ConflictResolutionPanel";
 import { ModEditPanel } from "./ModEditPanel";
 import { ModInspector } from "./ModInspector";
 import { ModTable, type ModFilter } from "./ModTable";
+import { RenameModDialog } from "./RenameModDialog";
 
 export interface ServerLibraryView {
   snapshot: LibrarySnapshot;
@@ -35,6 +41,7 @@ export interface ServerLibraryView {
   onRefresh: () => void;
   onPrepare: () => void;
   onToggle: (id: string, enabled: boolean) => void;
+  onToggleMany: (ids: string[], enabled: boolean) => void;
   onReorder: (ids: string[]) => void;
   onSaveConflictWinners: (winners: Record<string, string>) => Promise<boolean>;
   onEdit: (id: string, tags: string[], notes: string) => Promise<boolean>;
@@ -54,6 +61,8 @@ interface LibraryScreenProps {
   onScan: () => void;
   onImport: () => void;
   onToggle: (id: string, enabled: boolean) => void;
+  onToggleMany: (ids: string[], enabled: boolean) => void | Promise<void>;
+  onRename: (id: string, newName: string) => Promise<string | null>;
   onReorder: (ids: string[]) => void;
   onEdit: (id: string, tags: string[], notes: string) => void;
   onDelete: (id: string) => Promise<boolean>;
@@ -83,6 +92,8 @@ export function LibraryScreen({
   onScan,
   onImport,
   onToggle,
+  onToggleMany,
+  onRename,
   onReorder,
   onEdit,
   onDelete,
@@ -103,11 +114,17 @@ export function LibraryScreen({
 }: LibraryScreenProps) {
   const { t } = useI18n();
   const [editing, setEditing] = useState<ModEntry | null>(null);
+  const [renaming, setRenaming] = useState<ModEntry | null>(null);
   const [deleting, setDeleting] = useState<ModEntry | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [conflictsOpen, setConflictsOpen] = useState(false);
   const [visibleIds, setVisibleIds] = useState<string[] | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>(() =>
+    selectedId ? [selectedId] : [],
+  );
+  const [selectionAnchor, setSelectionAnchor] = useState<string | null>(selectedId);
+  const [bulkBusy, setBulkBusy] = useState(false);
   const [modFilter, setModFilter] = useState<ModFilter>("all");
   const serverMode = mode === "server" && server !== null;
   const activeSnapshot = serverMode ? server.snapshot : snapshot;
@@ -115,6 +132,7 @@ export function LibraryScreen({
   const mods = activeSnapshot.mods;
   const conflictGroups = activeSnapshot.conflicts ?? [];
   const activeToggle = serverMode ? server.onToggle : onToggle;
+  const activeToggleMany = serverMode ? server.onToggleMany : onToggleMany;
   const activeReorder = serverMode ? server.onReorder : onReorder;
   const activeSaveConflictWinners = serverMode
     ? server.onSaveConflictWinners
@@ -128,10 +146,74 @@ export function LibraryScreen({
     }
   }, [mods, onSelect, selectedId]);
 
+  useEffect(() => {
+    if (!selectedId) {
+      setSelectedIds([]);
+      setSelectionAnchor(null);
+      return;
+    }
+    setSelectedIds((current) =>
+      current.includes(selectedId) ? current : [selectedId],
+    );
+    setSelectionAnchor((current) => current ?? selectedId);
+  }, [selectedId]);
+
   const selected = mods.find((mod) => mod.id === selectedId) ?? null;
   // 列表被搜索或筛选清空时，右侧不该继续展示一个已经不在结果里的模组。
   const visibleSelected =
     selected && (!visibleIds || visibleIds.includes(selected.id)) ? selected : null;
+
+  function handleVisibleChange(ids: string[]) {
+    setVisibleIds(ids);
+    setSelectedIds((current) => {
+      const pruned = pruneModSelection(current, ids);
+      const next =
+        selectedId && ids.includes(selectedId) && !pruned.includes(selectedId)
+          ? [...pruned, selectedId]
+          : pruned;
+      const unchanged =
+        next.length === current.length &&
+        next.every((id, index) => id === current[index]);
+      return unchanged ? current : next;
+    });
+  }
+
+  function handleRowSelect(
+    id: string,
+    modifiers: { ctrlKey: boolean; shiftKey: boolean },
+  ) {
+    const order = visibleIds ?? sortedMods(mods).map((mod) => mod.id);
+    const mode: ModSelectionMode = modifiers.shiftKey
+      ? "range"
+      : modifiers.ctrlKey
+        ? "toggle"
+        : "replace";
+    const next = updateModSelection(
+      {
+        selected: pruneModSelection(selectedIds, order),
+        anchor: selectionAnchor,
+        primary: selectedId,
+      },
+      id,
+      order,
+      mode,
+    );
+    setSelectedIds(next.selected);
+    setSelectionAnchor(next.anchor);
+    if (next.primary !== selectedId) {
+      onSelect(next.primary);
+    }
+  }
+
+  async function handleToggleMany(ids: string[], enabled: boolean) {
+    if (bulkBusy || ids.length === 0 || activeGameStatus.running) return;
+    setBulkBusy(true);
+    try {
+      await activeToggleMany(ids, enabled);
+    } finally {
+      setBulkBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!visibleSelected || visibleSelected.conflictCount === 0) {
@@ -380,6 +462,7 @@ export function LibraryScreen({
         <ModTable
           mods={sortedMods(mods)}
           selectedId={selectedId}
+          selectedIds={selectedIds}
           search={search}
           locked={
             activeGameStatus.running ||
@@ -395,10 +478,12 @@ export function LibraryScreen({
           removingId={serverMode ? null : removingId}
           filter={modFilter}
           onFilterChange={setModFilter}
-          onSelect={onSelect}
+          onSelect={handleRowSelect}
           onToggle={(id, enabled) => activeToggle(id, enabled)}
+          onToggleMany={(ids, enabled) => void handleToggleMany(ids, enabled)}
+          bulkBusy={bulkBusy}
           onReorder={activeReorder}
-          onVisibleChange={setVisibleIds}
+          onVisibleChange={handleVisibleChange}
         />
       </section>
 
@@ -413,6 +498,11 @@ export function LibraryScreen({
         onOpenConflicts={() => visibleSelected && setConflictsOpen(true)}
         onOpenConfig={
           onOpenConfig ? () => visibleSelected && onOpenConfig(visibleSelected.id) : undefined
+        }
+        onRename={
+          !serverMode && !activeGameStatus.running && visibleSelected
+            ? () => setRenaming(visibleSelected)
+            : undefined
         }
       />
 
@@ -440,6 +530,18 @@ export function LibraryScreen({
             return true;
           }}
           onClose={() => setEditing(null)}
+        />
+      ) : null}
+
+      {renaming ? (
+        <RenameModDialog
+          mod={renaming}
+          onRename={async (newName) => {
+            const error = await onRename(renaming.id, newName);
+            if (!error) setRenaming(null);
+            return error;
+          }}
+          onClose={() => setRenaming(null)}
         />
       ) : null}
 

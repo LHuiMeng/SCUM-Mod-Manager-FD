@@ -464,17 +464,22 @@ async function connect(url, appUrl) {
     await waitFor("document.querySelectorAll('.mod-row').length === 1");
     await setInput("搜索模组、标签或备注", "");
     await waitFor(`document.querySelectorAll('.mod-row').length === ${before}`);
-    const reflowing = await evaluate(`(() => {
+    await evaluate(`(() => {
       const button = [...document.querySelectorAll(".filter-chip")]
         .find(item => item.innerText.includes("客户端 PAK"));
       button?.click();
-      return [...document.querySelectorAll(".mod-row")].some(row =>
+      return true;
+    })()`);
+    await waitFor(
+      `[...document.querySelectorAll(".mod-row")].some(row =>
         row.getAnimations().some(animation => {
           const timing = animation.effect?.getTiming();
           return timing?.duration === 260;
         }),
-      );
-    })()`);
+      )`,
+      3000,
+    );
+    const reflowing = true;
     await waitFor(
       "document.querySelector('.filter-chip.is-active')?.innerText.includes('客户端 PAK')",
     );
@@ -528,7 +533,8 @@ async function connect(url, appUrl) {
   });
 
   await test("三种排序循环", async () => {
-    const label = () => evaluate("document.querySelector('.table-toolbar-right span')?.innerText");
+    const label = () =>
+      evaluate("document.querySelector('.sort-mode-label')?.innerText");
     const seen = [await label()];
     for (let index = 0; index < 3; index += 1) {
       await clickAria("切换排序方式");
@@ -585,6 +591,124 @@ async function connect(url, appUrl) {
       )}`,
     );
     return { before, after, toggleMotion };
+  });
+
+  await test("Ctrl/Shift 多选与批量启停", async () => {
+    const clickRow = async (index, modifiers = "") => {
+      await evaluate(`(() => {
+        const row = [...document.querySelectorAll(".mod-row")][${index}];
+        return Boolean(row && row.dispatchEvent(new MouseEvent("click", {
+          bubbles: true,
+          cancelable: true,
+          ${modifiers}
+        })));
+      })()`);
+      await wait(80);
+    };
+    const selectedCount = () =>
+      evaluate("document.querySelectorAll('.mod-row.is-selected').length");
+
+    await clickRow(0);
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 1");
+    await clickRow(2, "ctrlKey: true,");
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 2");
+    const ctrlCount = await selectedCount();
+    if (ctrlCount !== 2) throw new Error(`Ctrl 多选数量异常：${ctrlCount}`);
+
+    await clickRow(3, "shiftKey: true,");
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 2");
+    const rangeIds = await evaluate(
+      "[...document.querySelectorAll('.mod-row.is-selected')].map(row => row.dataset.modId)",
+    );
+    if (rangeIds.length !== 2 || rangeIds[0] === rangeIds[1]) {
+      throw new Error(`Shift 连续选择异常：${JSON.stringify(rangeIds)}`);
+    }
+    const bulkVisible = await evaluate(
+      "document.querySelectorAll('.bulk-selection-actions .bulk-action').length",
+    );
+    if (bulkVisible !== 2) throw new Error("多选批量操作按钮未出现");
+    screenshots.push(await screenshot("1440-light-multi-select"));
+
+    await clickAria("取消多选");
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 1");
+    await clickRow(0);
+    await clickRow(1, "ctrlKey: true,");
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 2");
+    await clickText("禁用所选", ".bulk-selection-actions .bulk-action");
+    await waitFor(
+      `[...document.querySelectorAll('.toast-stack b')].some(item => item.innerText.includes('已停用 2 个模组'))`,
+    );
+    const disabledSelected = await evaluate(`(() => {
+      const rows = [...document.querySelectorAll(".mod-row.is-selected")];
+      return rows.map(row => row.querySelector('button[role="switch"]')?.getAttribute("aria-checked"));
+    })()`);
+    if (disabledSelected.some(value => value !== "false")) {
+      throw new Error(`所选模组未全部停用：${JSON.stringify(disabledSelected)}`);
+    }
+
+    await clickAria("取消多选");
+    await waitFor("document.querySelector('.bulk-all-actions') !== null");
+    const modCount = await evaluate("document.querySelectorAll('.mod-row').length");
+    await clickText("全部启用", ".bulk-all-actions .bulk-action");
+    await waitFor(
+      `[...document.querySelectorAll('.toast-stack b')].some(item => item.innerText.includes('已启用 ${modCount} 个模组'))`,
+    );
+    await waitFor(
+      `[...document.querySelectorAll('.mod-row button[role="switch"]')].every(button => button.getAttribute("aria-checked") === "true")`,
+    );
+    return { ctrlCount, rangeIds, bulkVisible, disabledSelected };
+  });
+
+  await test("检查器重命名对话框与文件名更新", async () => {
+    const selected = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-row-main > b")?.innerText === "HD_Character_Textures");
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+    if (!selected) throw new Error("找不到用于重命名验收的模组行");
+    await waitFor(
+      `document.querySelector(".mod-row.is-selected .mod-row-main > b")?.innerText === "HD_Character_Textures"`,
+    );
+
+    await clickText("重命名", ".inspector-action-row button");
+    await waitFor(
+      "document.querySelector('#modal-title')?.innerText === '重命名模组'",
+    );
+    const inputValue = await evaluate(
+      "document.querySelector('#rename-mod-input')?.value",
+    );
+    if (inputValue !== "HD_Character_Textures") {
+      throw new Error(`重命名输入框未回填文件名：${inputValue}`);
+    }
+    screenshots.push(await screenshot("1440-light-rename-dialog"));
+    const renamedInput = await evaluate(`(() => {
+      const input = document.querySelector("#rename-mod-input");
+      if (!input) return false;
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
+        .set.call(input, "HD Character Textures Renamed");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+    if (!renamedInput) throw new Error("无法填写新模组名称");
+    await clickText("确认改名", ".modal-foot button");
+    await waitFor("document.querySelector('.modal-card') === null", 10000);
+    await waitFor(
+      `[...document.querySelectorAll(".mod-row-main > b")].some(item => item.innerText === "HD Character Textures Renamed")`,
+    );
+    await waitFor("document.body.innerText.includes('模组已重命名')");
+    const renamed = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-row-main > b")?.innerText === "HD Character Textures Renamed");
+      return {
+        selected: row?.classList.contains("is-selected") ?? false,
+        text: row?.innerText ?? "",
+      };
+    })()`);
+    if (!renamed.selected) throw new Error("改名后被选中项丢失");
+    return { inputValue, renamed: renamed.text.slice(0, 120) };
   });
 
   await test("冲突覆盖链、胜者保存与响应式弹层", async () => {
@@ -1391,11 +1515,29 @@ async function connect(url, appUrl) {
       throw new Error(`删除确认未说明备份或重复副本：${copy.slice(0, 220)}`);
     }
     screenshots.push(await screenshot("1440-light-delete-confirm"));
+    const observerReady = await evaluate(`(() => {
+      window.__deleteMotion = null;
+      window.__deleteMotionObserver?.disconnect?.();
+      const list = document.querySelector(".mod-rows");
+      if (!list) return false;
+      const observer = new MutationObserver(() => {
+        const row = document.querySelector(".mod-row.is-removing");
+        if (row && window.__deleteMotion === null) {
+          window.__deleteMotion = getComputedStyle(row).animationName;
+        }
+      });
+      observer.observe(list, {
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["class"],
+      });
+      window.__deleteMotionObserver = observer;
+      return true;
+    })()`);
+    if (!observerReady) throw new Error("无法监听删除动画");
     await clickText("移入备份", ".modal-foot button");
-    await waitFor("document.querySelector('.mod-row.is-removing') !== null");
-    const deleteMotion = await evaluate(
-      "getComputedStyle(document.querySelector('.mod-row.is-removing')).animationName",
-    );
+    await waitFor("window.__deleteMotion !== null", 3000);
+    const deleteMotion = await evaluate("window.__deleteMotion ?? ''");
     if (!deleteMotion.includes("motion-row-out")) {
       throw new Error(`删除收起动画未生效：${deleteMotion}`);
     }
@@ -1406,6 +1548,7 @@ async function connect(url, appUrl) {
       `![...document.querySelectorAll(".mod-row-main > b")].some(item => item.innerText === "SCUM_WeaponPack_Elite")`,
     );
     if (!removed) throw new Error("删除后模组仍留在列表中");
+    await evaluate("window.__deleteMotionObserver?.disconnect?.(); true");
     return { copy: copy.slice(0, 220), rowCountAfter: rowCount - 1, deleteMotion };
   });
 

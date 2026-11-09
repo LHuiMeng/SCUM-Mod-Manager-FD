@@ -502,6 +502,34 @@ function LocalizedApp() {
 
   useEffect(() => {
     if (!isTauri()) return;
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<LibrarySnapshot>("library-changed", (event) => {
+          const next = event.payload;
+          setSnapshot(next);
+          setSelectedId((current) =>
+            next.mods.some((mod) => mod.id === current)
+              ? current
+              : [...next.mods].sort((a, b) => a.loadOrder - b.loadOrder)[0]?.id ??
+                null,
+          );
+        }),
+      )
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
     void api
       .getPendingLinks()
       .then((links) => setPendingLinks(links))
@@ -992,6 +1020,35 @@ function LocalizedApp() {
     }
   }
 
+  async function handleToggleMany(ids: string[], enabled: boolean) {
+    if (!snapshot || ids.length === 0) return;
+    const requested = new Set(ids);
+    const previous = snapshot;
+    setSnapshot({
+      ...snapshot,
+      mods: snapshot.mods.map((mod) =>
+        requested.has(mod.id) ? { ...mod, enabled } : mod,
+      ),
+    });
+    try {
+      const next = await api.setModsEnabled(ids, enabled);
+      setSnapshot(next);
+      notify(
+        t(
+          enabled
+            ? "toast.bulkEnabled.title"
+            : "toast.bulkDisabled.title",
+          { count: ids.length },
+        ),
+        undefined,
+        "success",
+      );
+    } catch (error) {
+      setSnapshot(previous);
+      notify(t("toast.bulkToggleFailed.title"), String(error), "error");
+    }
+  }
+
   async function handleReorder(ids: string[]) {
     if (!snapshot) return;
     const byId = new Map(snapshot.mods.map((mod) => [mod.id, mod]));
@@ -1044,6 +1101,22 @@ function LocalizedApp() {
     } catch (error) {
       notify(t("inspector.deleteErrorTitle"), String(error), "error");
       return false;
+    }
+  }
+
+  async function handleRename(id: string, newName: string): Promise<string | null> {
+    try {
+      const result = await api.renameMod(id, newName);
+      setSnapshot(result.snapshot);
+      setSelectedId(result.id);
+      notify(
+        t("toast.modRenamed.title"),
+        t("toast.modRenamed.detail", { name: result.name }),
+        "success",
+      );
+      return null;
+    } catch (error) {
+      return String(error);
     }
   }
 
@@ -1693,6 +1766,16 @@ function LocalizedApp() {
     });
   }
 
+  function handleServerLibraryToggleMany(ids: string[], enabled: boolean) {
+    const state = serverLibraryView?.state;
+    if (!state || serverLibraryView?.manifest) return;
+    const nextEnabled = { ...state.enabled };
+    for (const id of ids) {
+      nextEnabled[id] = enabled;
+    }
+    commitServerLibraryState({ ...state, enabled: nextEnabled });
+  }
+
   function handleServerLibraryReorder(ids: string[]) {
     const state = serverLibraryView?.state;
     if (!state || serverLibraryView?.manifest) return;
@@ -2059,6 +2142,7 @@ function LocalizedApp() {
                         void runServerPrepare(view, serverLayoutRevision.current);
                       },
                       onToggle: handleServerLibraryToggle,
+                      onToggleMany: handleServerLibraryToggleMany,
                       onReorder: handleServerLibraryReorder,
                       onSaveConflictWinners: handleServerLibrarySaveWinners,
                       onEdit: handleServerLibraryEdit,
@@ -2074,6 +2158,8 @@ function LocalizedApp() {
               onScan={handleScan}
               onImport={handleImport}
               onToggle={handleToggle}
+              onToggleMany={handleToggleMany}
+              onRename={handleRename}
               onReorder={handleReorder}
               onEdit={handleEdit}
               onDelete={handleDelete}

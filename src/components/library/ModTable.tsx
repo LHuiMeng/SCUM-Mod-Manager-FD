@@ -15,6 +15,7 @@ import { useI18n } from "../../i18n";
 import { formatTimestamp } from "../../lib/format";
 import { reorderVisibleIds } from "../../lib/modOrder";
 import { EmptyState } from "../ui/EmptyState";
+import { Icon } from "../ui/Icon";
 import { ModRow } from "./ModRow";
 
 export type ModFilter = "all" | "client" | "ue4ss" | "updates" | "conflicts";
@@ -23,6 +24,7 @@ type SortMode = "load" | "name" | "size";
 interface ModTableProps {
   mods: ModEntry[];
   selectedId: string | null;
+  selectedIds: string[];
   search: string;
   locked: boolean;
   lockedMessage?: string;
@@ -31,8 +33,13 @@ interface ModTableProps {
   removingId: string | null;
   filter: ModFilter;
   onFilterChange: (filter: ModFilter) => void;
-  onSelect: (id: string) => void;
+  onSelect: (
+    id: string,
+    modifiers: { ctrlKey: boolean; shiftKey: boolean },
+  ) => void;
   onToggle: (id: string, enabled: boolean) => void;
+  onToggleMany?: (ids: string[], enabled: boolean) => void;
+  bulkBusy?: boolean;
   onReorder: (ids: string[]) => void;
   onVisibleChange: (ids: string[]) => void;
 }
@@ -71,6 +78,7 @@ interface PendingDrag {
 export function ModTable({
   mods,
   selectedId,
+  selectedIds,
   search,
   locked,
   lockedMessage,
@@ -81,6 +89,8 @@ export function ModTable({
   onFilterChange,
   onSelect,
   onToggle,
+  onToggleMany,
+  bulkBusy = false,
   onReorder,
   onVisibleChange,
 }: ModTableProps) {
@@ -234,6 +244,14 @@ export function ModTable({
     }),
     [mods],
   );
+  const selectedMods = useMemo(
+    () => mods.filter((mod) => selectedIds.includes(mod.id)),
+    [mods, selectedIds],
+  );
+  const multiSelecting = selectedMods.length > 1 && Boolean(onToggleMany);
+  const allEnabled = mods.length > 0 && mods.every((mod) => mod.enabled);
+  const allDisabled = mods.length > 0 && mods.every((mod) => !mod.enabled);
+  const bulkDisabled = locked || bulkBusy || mods.length === 0;
 
   const canDrag =
     sortMode === "load" &&
@@ -554,7 +572,101 @@ export function ModTable({
           </button>
         ))}
         <div className="table-toolbar-right">
-          <span>{sortLabel}</span>
+          {onToggleMany ? (
+            multiSelecting ? (
+              <span className="bulk-selection-actions">
+                <span className="bulk-selection-copy">
+                  {t("library.bulk.selected", { count: selectedMods.length })}
+                </span>
+                <button
+                  type="button"
+                  className="bulk-action"
+                  title={t("library.bulk.enableSelected")}
+                  disabled={
+                    bulkDisabled || selectedMods.every((mod) => mod.enabled)
+                  }
+                  onClick={() =>
+                    onToggleMany(
+                      selectedMods.map((mod) => mod.id),
+                      true,
+                    )
+                  }
+                >
+                  <Icon name="check" size={13} />
+                  <span>{t("library.bulk.enableSelected")}</span>
+                </button>
+                <button
+                  type="button"
+                  className="bulk-action"
+                  title={t("library.bulk.disableSelected")}
+                  disabled={
+                    bulkDisabled || selectedMods.every((mod) => !mod.enabled)
+                  }
+                  onClick={() =>
+                    onToggleMany(
+                      selectedMods.map((mod) => mod.id),
+                      false,
+                    )
+                  }
+                >
+                  <Icon name="close" size={13} />
+                  <span>{t("library.bulk.disableSelected")}</span>
+                </button>
+                <button
+                  type="button"
+                  className="tiny-tool"
+                  aria-label={t("library.bulk.clear")}
+                  title={t("library.bulk.clear")}
+                  onClick={() =>
+                    onSelect(selectedMods[selectedMods.length - 1].id, {
+                      ctrlKey: false,
+                      shiftKey: false,
+                    })
+                  }
+                >
+                  <Icon name="close" size={13} />
+                </button>
+              </span>
+            ) : (
+              <span className="bulk-all-actions">
+                <button
+                  type="button"
+                  className="bulk-action"
+                  title={t("library.bulk.enableAll")}
+                  disabled={bulkDisabled || allEnabled}
+                  onClick={() =>
+                    onToggleMany(
+                      mods.map((mod) => mod.id),
+                      true,
+                    )
+                  }
+                >
+                  <Icon name="check" size={13} />
+                  <span className="bulk-action-label">
+                    {t("library.bulk.enableAll")}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="bulk-action"
+                  title={t("library.bulk.disableAll")}
+                  disabled={bulkDisabled || allDisabled}
+                  onClick={() =>
+                    onToggleMany(
+                      mods.map((mod) => mod.id),
+                      false,
+                    )
+                  }
+                >
+                  <Icon name="close" size={13} />
+                  <span className="bulk-action-label">
+                    {t("library.bulk.disableAll")}
+                  </span>
+                </button>
+              </span>
+            )
+          ) : null}
+          <span className="sort-mode-label">{sortLabel}</span>
           <button
             type="button"
             className="tiny-tool"
@@ -609,7 +721,8 @@ export function ModTable({
               <ModRow
                 key={mod.id}
                 mod={mod}
-                selected={selectedId === mod.id}
+                selected={selectedIds.includes(mod.id)}
+                primary={selectedId === mod.id}
                 sortable={canDrag}
                 showLoadOrder={sortMode === "load"}
                 locked={locked}
@@ -623,9 +736,9 @@ export function ModTable({
                   toggleFeedback?.id === mod.id ? toggleFeedback.tone : null
                 }
                 dropSettled={dropSettledId === mod.id}
-                onSelect={() => {
+                onSelect={(modifiers) => {
                   if (suppressClickRef.current) return;
-                  onSelect(mod.id);
+                  onSelect(mod.id, modifiers);
                 }}
                 onToggle={(enabled) => handleToggle(mod.id, enabled)}
                 onMove={(delta) => moveBy(mod.id, delta)}

@@ -6,6 +6,7 @@ mod config;
 mod crash;
 mod edition;
 mod launcher;
+mod library_watch;
 mod locales;
 mod metadata;
 mod models;
@@ -34,12 +35,15 @@ pub fn run() {
                 ))) as Box<dyn std::error::Error>
             })?;
             app.manage(state);
+            library_watch::spawn(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_library_snapshot,
             commands::scan_library,
             commands::set_mod_enabled,
+            commands::set_mods_enabled,
+            commands::rename_mod,
             commands::reorder_mods,
             commands::update_mod_metadata,
             commands::save_conflict_winners,

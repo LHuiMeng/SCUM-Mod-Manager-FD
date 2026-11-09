@@ -11,6 +11,7 @@ import type {
   LocaleBundle,
   ModConfigFile,
   ModEntry,
+  RenameModResult,
   RemoteFile,
   RemoteMod,
   RuntimeLog,
@@ -506,6 +507,51 @@ export async function mockInvoke<T>(command: string, args?: Record<string, unkno
       mods = mods.map((mod) => (mod.id === id ? { ...mod, enabled } : mod));
       recomputeMockConflicts();
       return mockSnapshot() as T;
+    }
+    case "set_mods_enabled": {
+      const ids = new Set((args?.ids as string[] | undefined) ?? []);
+      const enabled = Boolean(args?.enabled);
+      mods = mods.map((mod) => (ids.has(mod.id) ? { ...mod, enabled } : mod));
+      recomputeMockConflicts();
+      return mockSnapshot() as T;
+    }
+    case "rename_mod": {
+      if (gameStatus.running) {
+        throw new Error("游戏运行期间不能重命名模组");
+      }
+      const previousId = String(args?.id ?? "");
+      const target = mods.find((mod) => mod.id === previousId);
+      if (!target) throw new Error("找不到指定模组");
+      const rawName = String(args?.newName ?? "").trim();
+      if (!rawName) throw new Error("模组名称不能为空");
+      const baseName = rawName.replace(/\.pak$/i, "");
+      if (/[\\/:*?"<>|]/.test(baseName)) {
+        throw new Error("模组名称不能包含 \\ / : * ? \" < > |");
+      }
+      const fileName =
+        target.type === "clientPak" ? `${baseName}.pak` : baseName;
+      if (mods.some((mod) => mod.id !== previousId && mod.fileName === fileName)) {
+        throw new Error(`模组库里已经存在同名文件：${fileName}`);
+      }
+      const nextId = `renamed_${Date.now()}`;
+      mods = mods.map((mod) =>
+        mod.id === previousId
+          ? {
+              ...mod,
+              id: nextId,
+              name: baseName,
+              fileName,
+              filePath: `~mods/${fileName}`,
+            }
+          : mod,
+      );
+      recomputeMockConflicts();
+      return {
+        snapshot: mockSnapshot(),
+        previousId,
+        id: nextId,
+        name: baseName,
+      } as RenameModResult as T;
     }
     case "reorder_mods": {
       const ids = (args?.ids as string[] | undefined) ?? [];

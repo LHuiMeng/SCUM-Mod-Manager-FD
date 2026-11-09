@@ -12,6 +12,7 @@ import { Toggle } from "../ui/Toggle";
 interface ModRowProps {
   mod: ModEntry;
   selected: boolean;
+  primary: boolean;
   sortable: boolean;
   showLoadOrder: boolean;
   locked: boolean;
@@ -23,7 +24,7 @@ interface ModRowProps {
   entering: boolean;
   toggleFeedback: "on" | "off" | null;
   dropSettled: boolean;
-  onSelect: () => void;
+  onSelect: (modifiers: { ctrlKey: boolean; shiftKey: boolean }) => void;
   onToggle: (enabled: boolean) => void;
   onMove: (delta: number) => void;
   onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
@@ -32,6 +33,7 @@ interface ModRowProps {
 export function ModRow({
   mod,
   selected,
+  primary,
   sortable,
   showLoadOrder,
   locked,
@@ -70,6 +72,7 @@ export function ModRow({
   const className = [
     "mod-row",
     selected ? "is-selected" : "",
+    primary ? "is-primary" : "",
     mod.fullyOverridden ? "is-fully-overridden" : "",
     dragShift ? `is-drag-shift-${dragShift}` : "",
     dragging ? "is-dragging" : "",
@@ -86,6 +89,7 @@ export function ModRow({
   return (
     <div
       className={className}
+      title={t("library.row.selectionHint")}
       role="option"
       aria-selected={selected}
       tabIndex={0}
@@ -98,11 +102,16 @@ export function ModRow({
           ? undefined
           : ({ "--drag-offset-y": `${dragOffsetY}px` } as CSSProperties)
       }
-      onClick={onSelect}
+      onClick={(event) =>
+        onSelect({
+          ctrlKey: event.ctrlKey || event.metaKey,
+          shiftKey: event.shiftKey,
+        })
+      }
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
-          onSelect();
+          onSelect({ ctrlKey: false, shiftKey: false });
           return;
         }
         if (!sortable || !event.altKey) return;

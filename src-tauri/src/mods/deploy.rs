@@ -323,6 +323,10 @@ pub fn rescue_mods_from_game(paths: &AppPaths, settings: &AppSettings) -> Result
                 {
                     continue;
                 }
+                // Merge artifacts are launcher-owned derivatives, never library mods.
+                if is_managed_merged_file_name(&entry.file_name().to_string_lossy()) {
+                    continue;
+                }
                 let destination = paths.local_mods.join(entry.file_name());
                 std::fs::create_dir_all(&paths.local_mods)?;
                 if destination.exists() {
@@ -382,6 +386,11 @@ pub fn deploy_local_mods(
     let enabled: Vec<&ModEntry> = canonical_mods.iter().filter(|item| item.enabled).collect();
     let conflict_analysis = pak_scan::analyze_conflicts(&metadata, &canonical_mods);
     let merge_plan = merge_cache::create_plan(&canonical_mods, &conflict_analysis, &metadata)?;
+    if merge_plan.is_none() {
+        // A killed deployment can leave the fixed merge artifact behind without a manifest.
+        // Without this sweep the game keeps loading a merge that no enabled mod requires.
+        remove_orphaned_merged_paks(&[pak_dir.as_path(), deploy_root.as_path()])?;
+    }
     let deployment_fingerprint = deployment_fingerprint(
         install,
         is_server,
@@ -559,6 +568,46 @@ pub fn deploy_local_mods(
 
 const DEPLOYMENT_FINGERPRINT_VERSION: u32 = 2;
 const CONFLICT_MERGED_FILE: &str = "999_SCUM_Mod_Desk_Merged.pak";
+
+fn is_managed_merged_file_name(file_name: &str) -> bool {
+    let Some((prefix, rest)) = file_name.split_once('_') else {
+        return false;
+    };
+    prefix.len() >= 3
+        && prefix.bytes().all(|byte| byte == b'9')
+        && rest.eq_ignore_ascii_case("SCUM_Mod_Desk_Merged.pak")
+}
+
+fn remove_orphaned_merged_paks(directories: &[&Path]) -> Result<usize> {
+    let mut removed = 0;
+    let mut seen = HashSet::new();
+    for directory in directories {
+        if !directory.is_dir() {
+            continue;
+        }
+        let key = std::fs::canonicalize(directory)
+            .unwrap_or_else(|_| directory.to_path_buf())
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            if !path.is_file() || !is_managed_merged_file_name(&file_name.to_string_lossy()) {
+                continue;
+            }
+            std::fs::remove_file(&path)
+                .with_context(|| format!("无法清理残留融合包 {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
 
 fn deployment_fingerprint(
     install: &Path,
@@ -1623,6 +1672,106 @@ mod tests {
     }
 
     #[test]
+    fn removes_orphaned_merged_pak_when_deploying_without_conflicts() {
+        let temp = TempRoot::new("deploy-orphan-merged");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let stale_merged = pak_dir.join(super::CONFLICT_MERGED_FILE);
+        fs::write(&stale_merged, b"stale-merge").unwrap();
+        let source = paths.local_mods.join("OnlyMod.pak");
+        fs::write(&source, b"only-mod").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+
+        assert!(!stale_merged.exists(), "无冲突时不得保留残留融合包");
+        assert_eq!(
+            fs::read(pak_dir.join("000_OnlyMod.pak")).unwrap(),
+            b"only-mod"
+        );
+        let manifest = read_manifest(&paths).expect("manifest should exist");
+        assert_eq!(manifest.files.len(), 1);
+        assert!(manifest.files[0].ends_with("000_OnlyMod.pak"));
+    }
+
+    #[test]
+    fn removes_orphaned_merged_pak_even_when_reusing_a_deployment() {
+        let temp = TempRoot::new("deploy-orphan-merged-reuse");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let source = paths.local_mods.join("OnlyMod.pak");
+        fs::write(&source, b"only-mod").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+        let first = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .unwrap();
+        let stale_merged = pak_dir.join(super::CONFLICT_MERGED_FILE);
+        fs::write(&stale_merged, b"stale-merge").unwrap();
+
+        let second = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, second, "未变化部署应继续复用");
+        assert!(!stale_merged.exists(), "复用部署前也必须清掉残留融合包");
+    }
+
+    #[test]
+    fn removes_orphaned_merged_pak_from_the_link_deploy_root() {
+        let temp = TempRoot::new("deploy-orphan-merged-links");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let deploy_root = paths.root.join("deployed").join("client");
+        fs::create_dir_all(&deploy_root).unwrap();
+        let stale_merged = deploy_root.join(super::CONFLICT_MERGED_FILE);
+        fs::write(&stale_merged, b"stale-merge").unwrap();
+        let source = paths.local_mods.join("OnlyMod.pak");
+        fs::write(&source, b"only-mod").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+
+        assert!(
+            !stale_merged.exists(),
+            "链接部署目录里的残留融合包也必须清掉"
+        );
+        assert!(crate::mods::links::is_junction(&pak_dir));
+        assert_eq!(
+            fs::read(deploy_root.join("000_OnlyMod.pak")).unwrap(),
+            b"only-mod"
+        );
+    }
+
+    #[test]
     fn manual_merge_enables_launch_when_auto_merge_is_disabled() {
         let temp = TempRoot::new("deploy-manual-merge");
         let paths = temp.paths();
@@ -2262,6 +2411,31 @@ mod tests {
         assert_eq!(result.rescued, 0);
         assert_eq!(result.skipped, 0);
         assert!(!paths.local_mods.join("000_Managed.pak").exists());
+    }
+
+    #[test]
+    fn rescue_does_not_import_managed_merged_paks() {
+        let temp = TempRoot::new("rescue-managed-merged");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::write(pak_dir.join(super::CONFLICT_MERGED_FILE), b"merged").unwrap();
+        fs::write(pak_dir.join("Normal.pak"), b"normal").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        let result = rescue_mods_from_game(&paths, &settings).unwrap();
+
+        assert_eq!(result.rescued, 1);
+        assert!(paths.local_mods.join("Normal.pak").is_file());
+        assert!(!paths.local_mods.join(super::CONFLICT_MERGED_FILE).exists());
     }
 
     #[test]

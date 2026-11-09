@@ -18,6 +18,7 @@ import type {
   PendingLink,
   RemoteFile,
   RemoteMod,
+  RenameModResult,
   RuntimeLog,
   SftpApplyResult,
   SftpConflictReport,
@@ -42,6 +43,10 @@ export const api = {
   scanLibrary: () => call<LibrarySnapshot>("scan_library"),
   setModEnabled: (id: string, enabled: boolean) =>
     call<LibrarySnapshot>("set_mod_enabled", { id, enabled }),
+  setModsEnabled: (ids: string[], enabled: boolean) =>
+    call<LibrarySnapshot>("set_mods_enabled", { ids, enabled }),
+  renameMod: (id: string, newName: string) =>
+    call<RenameModResult>("rename_mod", { id, newName }),
   reorderMods: (ids: string[]) => call<LibrarySnapshot>("reorder_mods", { ids }),
   updateModMetadata: (id: string, tags: string[], notes: string) =>
     call<LibrarySnapshot>("update_mod_metadata", { id, tags, notes }),

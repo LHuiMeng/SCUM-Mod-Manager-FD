@@ -11,6 +11,7 @@ interface ModInspectorProps {
   serverMode?: boolean;
   readOnly?: boolean;
   onEdit: () => void;
+  onRename?: () => void;
   onDelete: () => void;
   onOpenFolder: () => void;
   onOpenConflicts: () => void;
@@ -22,6 +23,7 @@ export function ModInspector({
   serverMode = false,
   readOnly = false,
   onEdit,
+  onRename,
   onDelete,
   onOpenFolder,
   onOpenConflicts,
@@ -103,9 +105,20 @@ export function ModInspector({
           )}
         </div>
         {!readOnly ? (
-          <Button className="detail-action" trailingIcon="edit" onClick={onEdit}>
-            {t("inspector.edit")}
-          </Button>
+          <div className="inspector-action-row">
+            <Button className="detail-action" trailingIcon="edit" onClick={onEdit}>
+              {t("inspector.edit")}
+            </Button>
+            {onRename ? (
+              <Button
+                className="detail-action"
+                icon="edit"
+                onClick={onRename}
+              >
+                {t("inspector.rename")}
+              </Button>
+            ) : null}
+          </div>
         ) : null}
         {!readOnly && mod.type === "ue4ssMod" && onOpenConfig ? (
           <Button className="detail-action" trailingIcon="edit" onClick={onOpenConfig}>

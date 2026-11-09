@@ -1,4 +1,4 @@
-use crate::models::DetectPathsResult;
+use crate::models::{AppSettings, DetectPathsResult};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +35,28 @@ pub fn detect_game_paths() -> DetectPathsResult {
         scum_install_path: client,
         server_install_path: server,
     }
+}
+
+/// 首次启动或配置里缺少路径时，把检测结果写入空白字段。
+///
+/// 用户已经手动填写的路径优先级更高，自动检测不会覆盖。
+pub fn fill_missing_settings_paths(
+    settings: &mut AppSettings,
+    detected: DetectPathsResult,
+) -> bool {
+    let mut changed = false;
+    if settings.scum_install_path.trim().is_empty() && !detected.scum_install_path.trim().is_empty()
+    {
+        settings.scum_install_path = detected.scum_install_path;
+        changed = true;
+    }
+    if settings.server_install_path.trim().is_empty()
+        && !detected.server_install_path.trim().is_empty()
+    {
+        settings.server_install_path = detected.server_install_path;
+        changed = true;
+    }
+    changed
 }
 
 fn steam_libraries() -> Vec<PathBuf> {
@@ -129,7 +151,8 @@ fn steam_install_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::quoted_strings;
+    use super::{fill_missing_settings_paths, quoted_strings};
+    use crate::models::{AppSettings, DetectPathsResult};
 
     #[test]
     fn parses_quoted_values_with_escaped_backslashes() {
@@ -153,5 +176,39 @@ mod tests {
                 r"D:\\SteamLibrary"
             ]
         );
+    }
+
+    #[test]
+    fn fills_only_missing_install_paths() {
+        let mut settings = AppSettings {
+            scum_install_path: String::new(),
+            server_install_path: r"D:\My SCUM Server".to_string(),
+            ..AppSettings::default()
+        };
+        let detected = DetectPathsResult {
+            scum_install_path: r"X:\Steam\steamapps\common\SCUM".to_string(),
+            server_install_path: r"X:\Steam\steamapps\common\SCUM Server".to_string(),
+        };
+
+        assert!(fill_missing_settings_paths(&mut settings, detected));
+        assert_eq!(
+            settings.scum_install_path,
+            r"X:\Steam\steamapps\common\SCUM"
+        );
+        assert_eq!(
+            settings.server_install_path, r"D:\My SCUM Server",
+            "用户已填写的路径不能被自动检测覆盖"
+        );
+    }
+
+    #[test]
+    fn reports_no_change_when_nothing_can_be_filled() {
+        let mut settings = AppSettings::default();
+        let detected = DetectPathsResult {
+            scum_install_path: String::new(),
+            server_install_path: String::new(),
+        };
+
+        assert!(!fill_missing_settings_paths(&mut settings, detected));
     }
 }

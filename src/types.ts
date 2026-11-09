@@ -110,6 +110,13 @@ export interface LibrarySnapshot {
   clientModsPath: string;
 }
 
+export interface RenameModResult {
+  snapshot: LibrarySnapshot;
+  previousId: string;
+  id: string;
+  name: string;
+}
+
 export interface RuntimeLog {
   id: number;
   timestamp: string;

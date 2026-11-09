@@ -288,6 +288,15 @@ pub struct LibrarySnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RenameModResult {
+    pub snapshot: LibrarySnapshot,
+    pub previous_id: String,
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeLog {
     pub id: u64,
     pub timestamp: String,

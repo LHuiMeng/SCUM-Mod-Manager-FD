@@ -21,6 +21,9 @@ pub struct ModMetadata {
     pub conflicts: HashMap<String, Vec<String>>,
     /// 云端目录给出的显示名。磁盘名可能被清洗过，显示名不能跟着变。
     pub name: Option<String>,
+    /// 用户重命名过磁盘条目：显示名必须继续跟随文件名，云端目录也不能覆盖。
+    #[serde(alias = "nameFromFileName")]
+    pub name_from_file_name: bool,
     #[serde(alias = "file_size")]
     pub file_size: Option<u64>,
     #[serde(alias = "modified_at")]
