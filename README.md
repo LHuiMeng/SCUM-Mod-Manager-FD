@@ -107,7 +107,7 @@ npm run package:portable -- -Edition public
 
 ### 公开发行版与服务器版
 
-发布构建前先复制 `secrets/example.toml` 为 `secrets/runtime.toml`，并在
+常规发行构建前先复制 `secrets/example.toml` 为 `secrets/runtime.toml`，并在
 `[cloud].base_urls` 填写公开云目录线路。公开版只会把线路编入程序，不打包该
 文件；服务器版还需要填写 `[cloud].auth_token`，然后构建：
 
@@ -116,6 +116,17 @@ npm run build:editions -- -Edition public
 npm run build:editions -- -Edition server
 npm run build:editions -- -Edition both
 ```
+
+不需要内置云端目录的公共版使用 `-NoCloudSources`，此时无需配置
+`secrets/runtime.toml`：
+
+```powershell
+npm run build:editions -- -Edition public -NoCloudSources
+```
+
+该开关只适用于公共版；公共安装包不会包含云端目录地址，server 版会拒绝该
+参数。安装包仍输出到项目内的 `src-tauri/target/release/bundle/nsis/` 和
+`release-output/public/`。
 
 安装器输出到 `release-output/public/` 与 `release-output/server/`。公开版不包含
 `runtime.toml`，Rust 也会强制忽略共享密钥；服务器版另外把 `runtime.toml` 打入

@@ -11,13 +11,31 @@ fn main() {
     println!("cargo:rustc-env=SCUM_EDITION={edition}");
     println!("cargo:rerun-if-env-changed=SCUM_EDITION");
 
+    let disable_packaged_cloud_sources = std::env::var("SCUM_DISABLE_PACKAGED_CLOUD_SOURCES")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false);
+    if disable_packaged_cloud_sources && edition != "public" {
+        panic!("SCUM_DISABLE_PACKAGED_CLOUD_SOURCES is only supported for the public edition");
+    }
+    println!("cargo:rerun-if-env-changed=SCUM_DISABLE_PACKAGED_CLOUD_SOURCES");
+
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is required");
     let runtime_secrets = Path::new(&manifest_dir)
         .join("..")
         .join("secrets")
         .join("runtime.toml");
     println!("cargo:rerun-if-changed={}", runtime_secrets.display());
-    let cloud_base_urls = read_cloud_base_urls(&runtime_secrets);
+    let cloud_base_urls = if disable_packaged_cloud_sources {
+        Vec::new()
+    } else {
+        read_cloud_base_urls(&runtime_secrets)
+    };
     println!(
         "cargo:rustc-env=SCUM_PACKAGED_CLOUD_BASE_URLS_JSON={}",
         serde_json::to_string(&cloud_base_urls).expect("cloud source list should serialize")

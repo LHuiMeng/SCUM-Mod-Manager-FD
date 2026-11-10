@@ -1,12 +1,18 @@
 param(
   [ValidateSet("public", "server", "both")]
-  [string]$Edition = "both"
+  [string]$Edition = "both",
+
+  [switch]$NoCloudSources
 )
 
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $runtimeSecret = Join-Path $root "secrets\runtime.toml"
 $outputRoot = Join-Path $root "release-output"
+
+if ($NoCloudSources -and $Edition -ne "public") {
+  throw "-NoCloudSources is only supported with -Edition public."
+}
 
 function Assert-CloudSources {
   if (-not (Test-Path -LiteralPath $runtimeSecret -PathType Leaf)) {
@@ -22,7 +28,9 @@ function Assert-CloudSources {
 }
 
 function Build-Edition([string]$Name) {
-  Assert-CloudSources
+  if (-not $NoCloudSources) {
+    Assert-CloudSources
+  }
   if ($Name -eq "server" -and -not (Test-Path -LiteralPath $runtimeSecret -PathType Leaf)) {
     throw "Server build requires secrets/runtime.toml with [cloud].auth_token."
   }
@@ -39,6 +47,9 @@ function Build-Edition([string]$Name) {
   }
 
   $env:SCUM_EDITION = $Name
+  if ($NoCloudSources) {
+    $env:SCUM_DISABLE_PACKAGED_CLOUD_SOURCES = "1"
+  }
   try {
     npm run tauri build -- --config $config
     if ($LASTEXITCODE -ne 0) {
@@ -46,6 +57,7 @@ function Build-Edition([string]$Name) {
     }
   } finally {
     Remove-Item Env:SCUM_EDITION -ErrorAction SilentlyContinue
+    Remove-Item Env:SCUM_DISABLE_PACKAGED_CLOUD_SOURCES -ErrorAction SilentlyContinue
   }
 
   $bundleRoot = Join-Path $root "src-tauri\target\release\bundle\nsis"

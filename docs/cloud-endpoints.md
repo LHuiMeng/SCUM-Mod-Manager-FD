@@ -6,6 +6,10 @@
 优先。服务器版共享密钥只由 Rust 后端从 `secrets/runtime.toml` 或安装包内的
 `runtime-secrets/runtime.toml` 读取。
 
+公共发行版可使用 `npm run build:editions -- -Edition public -NoCloudSources`
+构建不内置任何目录线路的安装包。该模式会编译为空线路列表，且不允许用于
+服务器版；用户仍可在程序内自行配置云源。
+
 ## 本机配置
 
 配置保存在 `{程序目录}/app-data/config.json`：
