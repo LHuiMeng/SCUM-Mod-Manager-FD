@@ -93,6 +93,8 @@
   "library.filter.conflicts": "冲突模组",
   "library.bulk.enableAll": "全部启用",
   "library.bulk.disableAll": "全部禁用",
+  "library.bulk.enableAllHint": "启用当前搜索结果与筛选列表中的所有模组",
+  "library.bulk.disableAllHint": "停用当前搜索结果与筛选列表中的所有模组",
   "library.bulk.selected": "已选 {count} 个",
   "library.bulk.enableSelected": "启用所选",
   "library.bulk.disableSelected": "禁用所选",

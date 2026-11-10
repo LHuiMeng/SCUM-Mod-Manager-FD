@@ -648,15 +648,118 @@ async function connect(url, appUrl) {
 
     await clickAria("取消多选");
     await waitFor("document.querySelector('.bulk-all-actions') !== null");
-    const modCount = await evaluate("document.querySelectorAll('.mod-row').length");
+    const disabledBeforeEnableAll = await evaluate(
+      `[...document.querySelectorAll('.mod-row button[role="switch"]')].filter(button => button.getAttribute("aria-checked") === "false").length`,
+    );
     await clickText("全部启用", ".bulk-all-actions .bulk-action");
     await waitFor(
-      `[...document.querySelectorAll('.toast-stack b')].some(item => item.innerText.includes('已启用 ${modCount} 个模组'))`,
+      `[...document.querySelectorAll('.toast-stack b')].some(item => item.innerText.includes('已启用 ${disabledBeforeEnableAll} 个模组'))`,
     );
     await waitFor(
       `[...document.querySelectorAll('.mod-row button[role="switch"]')].every(button => button.getAttribute("aria-checked") === "true")`,
     );
-    return { ctrlCount, rangeIds, bulkVisible, disabledSelected };
+    return { ctrlCount, rangeIds, bulkVisible, disabledSelected, disabledBeforeEnableAll };
+  });
+
+  await test("全部启停只作用于当前搜索与筛选结果", async () => {
+    const visibleSwitches = () =>
+      evaluate(
+        `[...document.querySelectorAll('.mod-row button[role="switch"]')].map(button => button.getAttribute("aria-checked"))`,
+      );
+    const waitAllVisible = (checked) =>
+      waitFor(
+        `[...document.querySelectorAll('.mod-row button[role="switch"]')].every(button => button.getAttribute("aria-checked") === "${checked}")`,
+      );
+    const waitToast = (text) =>
+      waitFor(
+        `[...document.querySelectorAll('.toast-stack b')].some(item => item.innerText.includes(${JSON.stringify(text)}))`,
+      );
+
+    await clickText("全部", ".filter-chip");
+    await setInput("搜索模组、标签或备注", "");
+    await waitFor("document.querySelectorAll('.mod-row').length > 1");
+    const allCount = await evaluate("document.querySelectorAll('.mod-row').length");
+
+    await clickText("全部禁用", ".bulk-all-actions .bulk-action");
+    await waitToast(`已停用 ${allCount} 个模组`);
+    await waitAllVisible("false");
+
+    await clickText("客户端 PAK", ".filter-chip");
+    await waitFor(
+      "document.querySelector('.filter-chip.is-active')?.innerText.includes('客户端 PAK')",
+    );
+    await waitFor("document.querySelectorAll('.mod-row').length > 0");
+    const clientCount = await evaluate("document.querySelectorAll('.mod-row').length");
+    await clickText("全部启用", ".bulk-all-actions .bulk-action");
+    await waitToast(`已启用 ${clientCount} 个模组`);
+    await waitAllVisible("true");
+
+    await clickText("UE4SS", ".filter-chip");
+    await waitFor(
+      "document.querySelector('.filter-chip.is-active')?.innerText.includes('UE4SS')",
+    );
+    await waitFor("document.querySelectorAll('.mod-row').length > 0");
+    const ue4ssStates = await visibleSwitches();
+    if (ue4ssStates.some((value) => value !== "false")) {
+      throw new Error(`客户端筛选启用不应影响 UE4SS：${JSON.stringify(ue4ssStates)}`);
+    }
+
+    await clickText("全部", ".filter-chip");
+    await waitFor("document.querySelectorAll('.mod-row').length > 1");
+    await setInput("搜索模组、标签或备注", "BetterAI");
+    await waitFor("document.querySelectorAll('.mod-row').length === 1");
+    await clickText("全部启用", ".bulk-all-actions .bulk-action");
+    await waitToast("已启用 1 个模组");
+    await setInput("搜索模组、标签或备注", "");
+    await waitFor("document.querySelectorAll('.mod-row').length > 1");
+    const afterSearchEnable = await evaluate(`(() => {
+      const rows = [...document.querySelectorAll(".mod-row")];
+      return rows.map(row => ({
+        name: row.querySelector(".mod-row-main > b")?.innerText ?? "",
+        checked: row.querySelector('button[role="switch"]')?.getAttribute("aria-checked"),
+      }));
+    })()`);
+    const betterAiAfterEnable = afterSearchEnable.find((item) => item.name === "BetterAI_Core");
+    if (betterAiAfterEnable?.checked !== "true") {
+      throw new Error(`搜索范围启用未命中 BetterAI：${JSON.stringify(afterSearchEnable)}`);
+    }
+    if (afterSearchEnable.some((item) => item.checked !== "true")) {
+      throw new Error(`搜索范围启用误改了其他结果：${JSON.stringify(afterSearchEnable)}`);
+    }
+
+    await setInput("搜索模组、标签或备注", "BetterAI");
+    await waitFor("document.querySelectorAll('.mod-row').length === 1");
+    await clickText("全部禁用", ".bulk-all-actions .bulk-action");
+    await waitToast("已停用 1 个模组");
+    await setInput("搜索模组、标签或备注", "");
+    await waitFor("document.querySelectorAll('.mod-row').length > 1");
+    const afterSearchDisable = await evaluate(`(() => {
+      const rows = [...document.querySelectorAll(".mod-row")];
+      return rows.map(row => ({
+        name: row.querySelector(".mod-row-main > b")?.innerText ?? "",
+        checked: row.querySelector('button[role="switch"]')?.getAttribute("aria-checked"),
+      }));
+    })()`);
+    const betterAiAfterDisable = afterSearchDisable.find((item) => item.name === "BetterAI_Core");
+    if (betterAiAfterDisable?.checked !== "false") {
+      throw new Error(`搜索范围禁用未命中 BetterAI：${JSON.stringify(afterSearchDisable)}`);
+    }
+    if (afterSearchDisable.filter((item) => item.checked === "true").length !== allCount - 1) {
+      throw new Error(`搜索范围禁用误改了其他结果：${JSON.stringify(afterSearchDisable)}`);
+    }
+
+    await clickText("UE4SS", ".filter-chip");
+    await waitFor("document.querySelectorAll('.mod-row').length > 0");
+    const ue4ssCount = await evaluate("document.querySelectorAll('.mod-row').length");
+    await clickText("全部启用", ".bulk-all-actions .bulk-action");
+    await waitToast(`已启用 ${ue4ssCount} 个模组`);
+    await waitAllVisible("true");
+    await clickText("客户端 PAK", ".filter-chip");
+    await waitAllVisible("true");
+    await clickText("全部", ".filter-chip");
+    await waitAllVisible("true");
+    screenshots.push(await screenshot("1440-light-filtered-bulk-toggle"));
+    return { allCount, clientCount, ue4ssCount, ue4ssStates };
   });
 
   await test("检查器重命名对话框与文件名更新", async () => {

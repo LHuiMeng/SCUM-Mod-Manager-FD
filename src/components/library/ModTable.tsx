@@ -249,9 +249,21 @@ export function ModTable({
     [mods, selectedIds],
   );
   const multiSelecting = selectedMods.length > 1 && Boolean(onToggleMany);
-  const allEnabled = mods.length > 0 && mods.every((mod) => mod.enabled);
-  const allDisabled = mods.length > 0 && mods.every((mod) => !mod.enabled);
-  const bulkDisabled = locked || bulkBusy || mods.length === 0;
+  const visibleAllEnabled =
+    filtered.length > 0 && filtered.every((mod) => mod.enabled);
+  const visibleAllDisabled =
+    filtered.length > 0 && filtered.every((mod) => !mod.enabled);
+  const bulkDisabled = locked || bulkBusy || filtered.length === 0;
+
+  function applyVisibleToggle(targets: ModEntry[], enabled: boolean) {
+    if (!onToggleMany) return;
+    const ids = targets
+      .filter((mod) => mod.enabled !== enabled)
+      .map((mod) => mod.id);
+    if (ids.length > 0) {
+      onToggleMany(ids, enabled);
+    }
+  }
 
   const canDrag =
     sortMode === "load" &&
@@ -585,12 +597,7 @@ export function ModTable({
                   disabled={
                     bulkDisabled || selectedMods.every((mod) => mod.enabled)
                   }
-                  onClick={() =>
-                    onToggleMany(
-                      selectedMods.map((mod) => mod.id),
-                      true,
-                    )
-                  }
+                  onClick={() => applyVisibleToggle(selectedMods, true)}
                 >
                   <Icon name="check" size={13} />
                   <span>{t("library.bulk.enableSelected")}</span>
@@ -602,12 +609,7 @@ export function ModTable({
                   disabled={
                     bulkDisabled || selectedMods.every((mod) => !mod.enabled)
                   }
-                  onClick={() =>
-                    onToggleMany(
-                      selectedMods.map((mod) => mod.id),
-                      false,
-                    )
-                  }
+                  onClick={() => applyVisibleToggle(selectedMods, false)}
                 >
                   <Icon name="close" size={13} />
                   <span>{t("library.bulk.disableSelected")}</span>
@@ -632,14 +634,9 @@ export function ModTable({
                 <button
                   type="button"
                   className="bulk-action"
-                  title={t("library.bulk.enableAll")}
-                  disabled={bulkDisabled || allEnabled}
-                  onClick={() =>
-                    onToggleMany(
-                      mods.map((mod) => mod.id),
-                      true,
-                    )
-                  }
+                  title={t("library.bulk.enableAllHint")}
+                  disabled={bulkDisabled || visibleAllEnabled}
+                  onClick={() => applyVisibleToggle(filtered, true)}
                 >
                   <Icon name="check" size={13} />
                   <span className="bulk-action-label">
@@ -649,14 +646,9 @@ export function ModTable({
                 <button
                   type="button"
                   className="bulk-action"
-                  title={t("library.bulk.disableAll")}
-                  disabled={bulkDisabled || allDisabled}
-                  onClick={() =>
-                    onToggleMany(
-                      mods.map((mod) => mod.id),
-                      false,
-                    )
-                  }
+                  title={t("library.bulk.disableAllHint")}
+                  disabled={bulkDisabled || visibleAllDisabled}
+                  onClick={() => applyVisibleToggle(filtered, false)}
                 >
                   <Icon name="close" size={13} />
                   <span className="bulk-action-label">

@@ -93,6 +93,8 @@
   "library.filter.conflicts": "Conflicts",
   "library.bulk.enableAll": "Enable all",
   "library.bulk.disableAll": "Disable all",
+  "library.bulk.enableAllHint": "Enable every mod in the current search and filter results",
+  "library.bulk.disableAllHint": "Disable every mod in the current search and filter results",
   "library.bulk.selected": "{count} selected",
   "library.bulk.enableSelected": "Enable selected",
   "library.bulk.disableSelected": "Disable selected",
