@@ -1,0 +1,2738 @@
+use super::extract_zip_file;
+use crate::models::{AppSettings, ModEntry};
+use crate::mods::merge_cache;
+use crate::mods::pak_scan;
+use crate::paths::{is_within, is_within_resolved, path_string, safe_file_component, AppPaths};
+use anyhow::{bail, Context, Result};
+use base64::Engine;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployedManifest {
+    pub deployed_at: String,
+    pub roots: Vec<String>,
+    pub files: Vec<String>,
+    pub directories: Vec<String>,
+    #[serde(default)]
+    pub created_directories: Vec<String>,
+    #[serde(default)]
+    pub backups: Vec<DeployedBackup>,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub file_sizes: BTreeMap<String, u64>,
+    /// 本次部署是否通过 junction + 硬链接完成（false = 直接复制进游戏目录）。
+    #[serde(default)]
+    pub use_links: bool,
+    /// 链接模式下由本管理器建立的 junction（回收时只删链接，不动库和目标目录）。
+    #[serde(default)]
+    pub links: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployedBackup {
+    pub target: String,
+    pub backup: String,
+}
+
+pub fn read_manifest(paths: &AppPaths) -> Option<DeployedManifest> {
+    if let Some(manifest) = read_manifest_at(&paths.deployment_manifest) {
+        return Some(manifest);
+    }
+    let backup = crate::paths::backup_path_of(&paths.deployment_manifest);
+    let manifest = read_manifest_at(&backup)?;
+    eprintln!(
+        "deployment_manifest.json 解析失败，已回退到 {}",
+        backup.display()
+    );
+    Some(manifest)
+}
+
+fn read_manifest_at(path: &Path) -> Option<DeployedManifest> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn deployed_file_names(paths: &AppPaths) -> HashSet<String> {
+    let Some(manifest) = read_manifest(paths) else {
+        return HashSet::new();
+    };
+    let mut names = HashSet::new();
+    for path in manifest.files.iter().chain(manifest.directories.iter()) {
+        let path = Path::new(path);
+        names.insert(path.to_string_lossy().to_ascii_lowercase());
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        let file_name = file_name.to_string_lossy().to_ascii_lowercase();
+        // Deployment adds game-order prefixes without renaming the local library.
+        if let Some(original) = strip_deployed_pak_prefix(&file_name) {
+            names.insert(original.to_string());
+        }
+        names.insert(file_name);
+    }
+    names
+}
+
+fn strip_deployed_pak_prefix(file_name: &str) -> Option<&str> {
+    let (prefix, original) = file_name.split_once('_')?;
+    if prefix.len() < 3 || !prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let (_, extension) = original.rsplit_once('.')?;
+    extension.eq_ignore_ascii_case("pak").then_some(original)
+}
+
+/// 回收时遇到的占用等待信息。前端用它提示“正在回收，请稍候”。
+#[derive(Debug, Clone)]
+pub struct ReclaimWait {
+    pub path: String,
+    pub waited_ms: u64,
+}
+
+/// 文件被游戏/杀软占用时的最长等待时间。dwmapi.dll 常在进程刚退出时还被短暂持有。
+const RECLAIM_WAIT_MS: u64 = 30_000;
+const RECLAIM_POLL_MS: u64 = 500;
+
+fn is_retryable_lock(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
+fn remove_file_waiting(file: &Path, on_wait: &mut impl FnMut(&ReclaimWait)) -> std::io::Result<()> {
+    let mut waited = 0u64;
+    loop {
+        match std::fs::remove_file(file) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_lock(&error) && waited < RECLAIM_WAIT_MS => {
+                on_wait(&ReclaimWait {
+                    path: path_string(file),
+                    waited_ms: waited,
+                });
+                std::thread::sleep(std::time::Duration::from_millis(RECLAIM_POLL_MS));
+                waited += RECLAIM_POLL_MS;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub fn reclaim_mods(paths: &AppPaths) -> Result<usize> {
+    reclaim_mods_with_wait(paths, |_| {})
+}
+
+/// 回收部署文件；文件被占用时最多等待 [`RECLAIM_WAIT_MS`]，期间通过 `on_wait` 上报。
+pub fn reclaim_mods_with_wait(
+    paths: &AppPaths,
+    mut on_wait: impl FnMut(&ReclaimWait),
+) -> Result<usize> {
+    let Some(manifest) = read_manifest(paths) else {
+        return Ok(0);
+    };
+    let roots: Vec<PathBuf> = manifest.roots.iter().map(PathBuf::from).collect();
+    let created_directories = manifest
+        .created_directories
+        .iter()
+        .map(|path| path_key(Path::new(path)))
+        .collect::<HashSet<_>>();
+    let mut removed = 0;
+    let mut failures = Vec::new();
+    let mut remaining_files = Vec::new();
+    let mut remaining_links = Vec::new();
+    for file in manifest.files.iter().rev() {
+        let file = PathBuf::from(file);
+        if !roots.iter().any(|root| is_within(&file, root)) {
+            continue;
+        }
+        // 文件可能是指向根外的 junction / 符号链接：解析真实路径后再确认一次，
+        // 避免 remove_file 作用到链接目标。
+        if file.exists() && !roots.iter().any(|root| is_within_resolved(&file, root)) {
+            failures.push(format!(
+                "跳过越界的部署文件（疑似符号链接）：{}",
+                file.display()
+            ));
+            remaining_files.push(path_string(&file));
+            continue;
+        }
+        if file.exists() {
+            match remove_file_waiting(&file, &mut on_wait) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    failures.push(format!("无法删除 {}：{error}", file.display()));
+                    remaining_files.push(path_string(&file));
+                }
+            }
+        }
+    }
+
+    let mut remaining_backups = Vec::new();
+    for backup in manifest.backups {
+        let target = PathBuf::from(&backup.target);
+        let backup_path = PathBuf::from(&backup.backup);
+        if !roots.iter().any(|root| is_within(&target, root))
+            || !is_within(&backup_path, &paths.backups_dir)
+        {
+            continue;
+        }
+        if target.exists() {
+            // A failed deployment-file removal must not overwrite the live game file.
+            remaining_backups.push(backup);
+            continue;
+        }
+        if !backup_path.is_file() {
+            failures.push(format!("备份文件不存在：{}", backup_path.display()));
+            remaining_backups.push(backup);
+            continue;
+        }
+        let restore = (|| -> Result<()> {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&backup_path, &target).with_context(|| {
+                format!(
+                    "无法恢复备份 {} 到 {}",
+                    backup_path.display(),
+                    target.display()
+                )
+            })?;
+            Ok(())
+        })();
+        match restore {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&backup_path);
+            }
+            Err(error) => {
+                failures.push(error.to_string());
+                remaining_backups.push(backup);
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        let mut directories = manifest.directories.clone();
+        directories.sort_by_key(|path| std::cmp::Reverse(path.len()));
+        for directory in directories {
+            let directory = PathBuf::from(directory);
+            if !roots.iter().any(|root| is_within(&directory, root)) {
+                continue;
+            }
+            if roots.iter().any(|root| same_path(&directory, root)) {
+                continue;
+            }
+            if !directory.exists() {
+                continue;
+            }
+            if !directory.is_dir() {
+                failures.push(format!("部署目录位置已被文件占用：{}", directory.display()));
+                continue;
+            }
+            if directory
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("ue4ss"))
+            {
+                if let Err(error) = remove_ue4ss_runtime_artifacts(&directory) {
+                    failures.push(error.to_string());
+                    continue;
+                }
+            }
+            if created_directories.contains(&path_key(&directory)) {
+                if let Err(error) = std::fs::remove_dir_all(&directory) {
+                    failures.push(format!("无法删除部署目录 {}：{error}", directory.display()));
+                }
+            } else if let Err(error) = remove_empty_directory(&directory) {
+                failures.push(error);
+            }
+        }
+    }
+
+    for link in manifest.links.iter() {
+        let link = PathBuf::from(link);
+        if !crate::mods::links::is_junction(&link) {
+            continue;
+        }
+        match crate::mods::links::remove_junction(&link) {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                failures.push(format!("无法断开链接 {}：{error}", link.display()));
+                remaining_links.push(path_string(&link));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        let _ = std::fs::remove_file(&paths.deployment_manifest);
+        return Ok(removed);
+    }
+
+    let remaining = DeployedManifest {
+        deployed_at: manifest.deployed_at,
+        roots: manifest.roots,
+        files: remaining_files,
+        directories: manifest.directories,
+        created_directories: manifest.created_directories,
+        backups: remaining_backups,
+        fingerprint: manifest.fingerprint,
+        mode: manifest.mode,
+        file_sizes: manifest.file_sizes,
+        use_links: manifest.use_links,
+        links: remaining_links,
+    };
+    write_manifest(paths, &remaining)?;
+    bail!(
+        "部署文件回收未完成：{}。剩余清单已保留，可修复权限或关闭占用后重试。",
+        failures.join("；")
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RescueSummary {
+    pub rescued: usize,
+    pub skipped: usize,
+}
+
+pub fn rescue_mods_from_game(paths: &AppPaths, settings: &AppSettings) -> Result<RescueSummary> {
+    let mut summary = RescueSummary::default();
+    let managed_targets = read_manifest(paths)
+        .map(|manifest| manifest.files)
+        .unwrap_or_default();
+    for install in [&settings.scum_install_path, &settings.server_install_path] {
+        if install.trim().is_empty() {
+            continue;
+        }
+        let Some(pak_dir) = find_pak_dir(Path::new(install)) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(pak_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let source = entry.path();
+            if source.is_file() && super::is_pak(&source) {
+                // Managed prefixed targets are reclaimed, not imported back as new local mods.
+                if managed_targets
+                    .iter()
+                    .any(|target| same_path(Path::new(target), &source))
+                {
+                    continue;
+                }
+                // Merge artifacts are launcher-owned derivatives, never library mods.
+                if is_managed_merged_file_name(&entry.file_name().to_string_lossy()) {
+                    continue;
+                }
+                let destination = paths.local_mods.join(entry.file_name());
+                std::fs::create_dir_all(&paths.local_mods)?;
+                if destination.exists() {
+                    summary.skipped += 1;
+                    continue;
+                }
+                std::fs::copy(&source, destination)?;
+                summary.rescued += 1;
+            }
+        }
+    }
+    Ok(summary)
+}
+
+pub fn deploy_local_mods(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    mods: &[ModEntry],
+    is_server: bool,
+) -> Result<Option<String>> {
+    let metadata = crate::metadata::load_metadata(paths)?;
+    let install = if is_server {
+        settings.server_install_path.trim()
+    } else {
+        settings.scum_install_path.trim()
+    };
+    if install.is_empty() {
+        bail!(
+            "尚未设置 SCUM {}安装路径",
+            if is_server { "服务端" } else { "客户端" }
+        );
+    }
+    let install = Path::new(install);
+    let pak_dir = find_pak_dir(install).unwrap_or_else(|| {
+        install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods")
+    });
+    // 链接模式：把 ~mods 变成指向启动器部署目录的 junction，部署只写硬链接（同卷 0 拷贝），
+    // 游戏直接读链接后的文件，退出也不用回收。复制模式保持原行为。
+    let use_links = settings.use_deploy_links;
+    let deploy_root = if use_links {
+        paths
+            .root
+            .join("deployed")
+            .join(if is_server { "server" } else { "client" })
+    } else {
+        pak_dir.clone()
+    };
+
+    let canonical_mods = super::duplicates::collapse_identical_mods(
+        mods.to_vec(),
+        &crate::metadata::MetadataFile::default(),
+    );
+    let enabled: Vec<&ModEntry> = canonical_mods.iter().filter(|item| item.enabled).collect();
+    let conflict_analysis = pak_scan::analyze_conflicts(&metadata, &canonical_mods);
+    let merge_plan = merge_cache::create_plan(&canonical_mods, &conflict_analysis, &metadata)?;
+    if merge_plan.is_none() {
+        // A killed deployment can leave the fixed merge artifact behind without a manifest.
+        // Without this sweep the game keeps loading a merge that no enabled mod requires.
+        remove_orphaned_merged_paks(&[pak_dir.as_path(), deploy_root.as_path()])?;
+    }
+    let deployment_fingerprint = deployment_fingerprint(
+        install,
+        is_server,
+        &canonical_mods,
+        merge_plan
+            .as_ref()
+            .map(merge_cache::ConflictMergePlan::fingerprint),
+    );
+    if let Some(deployed_at) = reusable_deployment(
+        paths,
+        install,
+        is_server,
+        &deployment_fingerprint,
+        use_links,
+    ) {
+        return Ok(Some(deployed_at));
+    }
+
+    let merge_artifact = if let Some(plan) = merge_plan.as_ref() {
+        if settings.auto_merge_conflicts {
+            Some(merge_cache::ensure_artifact(paths, plan)?)
+        } else if let Some(cached) = merge_cache::cached_artifact(paths, plan) {
+            let bytes = std::fs::metadata(&cached)?.len();
+            Some(merge_cache::MergeArtifact {
+                path: cached,
+                cache_hit: true,
+                source_mods: plan.source_mods(),
+                entries: plan.entry_count(),
+                bytes,
+            })
+        } else {
+            bail!(
+                "自动融合已关闭，冲突模组或胜者已变化。请先在“冲突模组”标签中手动融合，再启动游戏"
+            );
+        }
+    } else {
+        None
+    };
+
+    reclaim_mods(paths)?;
+    if enabled.is_empty() {
+        return Ok(None);
+    }
+    if use_links {
+        prepare_link_layout(paths, &pak_dir, &deploy_root)?;
+    } else {
+        if crate::mods::links::is_junction(&pak_dir) {
+            // 从链接模式切回来：先把 junction 换回真实目录，再按复制模式部署。
+            crate::mods::links::remove_junction(&pak_dir)?;
+        }
+        std::fs::create_dir_all(&pak_dir)
+            .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
+    }
+
+    let mut manifest = DeployedManifest {
+        deployed_at: Utc::now().to_rfc3339(),
+        roots: vec![path_string(install), path_string(&deploy_root)],
+        use_links,
+        links: if use_links {
+            vec![path_string(&pak_dir)]
+        } else {
+            Vec::new()
+        },
+        fingerprint: deployment_fingerprint,
+        mode: if is_server { "server" } else { "client" }.to_string(),
+        ..DeployedManifest::default()
+    };
+    let backup_root = paths
+        .backups_dir
+        .join("deploy")
+        .join(uuid::Uuid::new_v4().to_string());
+
+    let deploy_result = (|| -> Result<()> {
+        let mut client_paks = enabled
+            .iter()
+            .copied()
+            .filter(|item| item.mod_type == "clientPak")
+            .collect::<Vec<_>>();
+        client_paks.sort_by(|left, right| {
+            left.load_order
+                .cmp(&right.load_order)
+                .then_with(|| {
+                    left.file_name
+                        .to_ascii_lowercase()
+                        .cmp(&right.file_name.to_ascii_lowercase())
+                })
+                .then_with(|| left.file_name.cmp(&right.file_name))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let conflicting_ids = conflict_analysis
+            .groups
+            .iter()
+            .flat_map(|group| group.owners.iter().map(|owner| owner.id.as_str()))
+            .collect::<HashSet<_>>();
+        let pak_prefix_width = deployment_prefix_width(client_paks.len());
+        for (index, item) in client_paks.iter().enumerate() {
+            if conflicting_ids.contains(item.id.as_str()) {
+                continue;
+            }
+            let source = PathBuf::from(&item.file_path);
+            if !source.is_file() {
+                continue;
+            }
+            let target = deploy_root.join(numbered_pak_file_name(
+                index,
+                &item.file_name,
+                pak_prefix_width,
+            ));
+            place_file_record(&source, &target, &backup_root, &mut manifest, use_links)?;
+        }
+        if let Some(artifact) = &merge_artifact {
+            let merged_file_name = conflict_merged_file_name(client_paks.len());
+            place_file_record(
+                &artifact.path,
+                &deploy_root.join(merged_file_name),
+                &backup_root,
+                &mut manifest,
+                use_links,
+            )?;
+        }
+
+        let ue4ss_enabled: Vec<&&ModEntry> = enabled
+            .iter()
+            .filter(|item| item.mod_type == "ue4ssMod")
+            .collect();
+        if !ue4ss_enabled.is_empty() {
+            if let Some(binaries) = find_binaries_dir(install) {
+                ensure_runtime_framework(paths)?;
+                let _synced = sync_ue4ss_mods_txt(paths, &canonical_mods)?;
+                if use_links {
+                    // 只有 dwmapi.dll 必须落在 exe 同目录（Windows 的 DLL 搜索规则），
+                    // 其余整棵 ue4ss 目录（UE4SS.dll / settings / Mods）用 junction 指到启动器。
+                    deploy_loader_dll(paths, &binaries, &backup_root, &mut manifest)?;
+                    let link = binaries.join("ue4ss");
+                    link_ue4ss_framework(
+                        &mut manifest,
+                        &link,
+                        &paths.ue4ss_runtime.join("ue4ss"),
+                        &backup_root,
+                    )?;
+                } else {
+                    deploy_framework(paths, &binaries, &backup_root, &mut manifest)?;
+                    for item in ue4ss_enabled {
+                        deploy_ue4ss_mod(item, &binaries, &backup_root, &mut manifest)?;
+                    }
+                }
+            }
+        }
+
+        if manifest.files.is_empty() {
+            bail!("没有可部署的模组文件，请检查本地 ~mods 目录");
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = deploy_result {
+        if !manifest.files.is_empty() || !manifest.backups.is_empty() {
+            if let Err(manifest_error) = write_manifest(paths, &manifest) {
+                return Err(anyhow::anyhow!(
+                    "{error:#}；同时无法保存回滚清单：{manifest_error:#}"
+                ));
+            }
+            if let Err(cleanup_error) = reclaim_mods(paths) {
+                return Err(anyhow::anyhow!(
+                    "{error:#}；部署失败后的自动回收也未完成：{cleanup_error:#}"
+                ));
+            }
+        }
+        return Err(error);
+    }
+
+    write_manifest(paths, &manifest)?;
+    Ok(Some(manifest.deployed_at))
+}
+
+const DEPLOYMENT_FINGERPRINT_VERSION: u32 = 2;
+const CONFLICT_MERGED_FILE: &str = "999_SCUM_Mod_Desk_Merged.pak";
+
+fn is_managed_merged_file_name(file_name: &str) -> bool {
+    let Some((prefix, rest)) = file_name.split_once('_') else {
+        return false;
+    };
+    prefix.len() >= 3
+        && prefix.bytes().all(|byte| byte == b'9')
+        && rest.eq_ignore_ascii_case("SCUM_Mod_Desk_Merged.pak")
+}
+
+fn remove_orphaned_merged_paks(directories: &[&Path]) -> Result<usize> {
+    let mut removed = 0;
+    let mut seen = HashSet::new();
+    for directory in directories {
+        if !directory.is_dir() {
+            continue;
+        }
+        let key = std::fs::canonicalize(directory)
+            .unwrap_or_else(|_| directory.to_path_buf())
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            if !path.is_file() || !is_managed_merged_file_name(&file_name.to_string_lossy()) {
+                continue;
+            }
+            std::fs::remove_file(&path)
+                .with_context(|| format!("无法清理残留融合包 {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn deployment_fingerprint(
+    install: &Path,
+    is_server: bool,
+    mods: &[ModEntry],
+    merge_fingerprint: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_deployment_field(&mut hasher, "scum-mod-desk-deployment");
+    hash_deployment_field(&mut hasher, env!("CARGO_PKG_VERSION"));
+    hash_deployment_field(&mut hasher, &DEPLOYMENT_FINGERPRINT_VERSION.to_string());
+    hash_deployment_field(&mut hasher, if is_server { "server" } else { "client" });
+    hash_deployment_field(&mut hasher, &path_key(install));
+    hash_deployment_field(
+        &mut hasher,
+        merge_fingerprint.unwrap_or("no-conflict-merge"),
+    );
+
+    let mut enabled = mods.iter().filter(|item| item.enabled).collect::<Vec<_>>();
+    enabled.sort_by(|left, right| {
+        left.load_order
+            .cmp(&right.load_order)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for item in enabled {
+        hash_deployment_field(&mut hasher, &item.mod_type);
+        hash_deployment_field(&mut hasher, &item.id);
+        hash_deployment_field(&mut hasher, &item.file_name);
+        hash_deployment_field(&mut hasher, &path_key(Path::new(&item.file_path)));
+        hash_deployment_field(&mut hasher, &item.file_size.to_string());
+        // 内容哈希稳定：同内容重导入只会抬 mtime，不应让部署指纹失效。
+        // 仅在条目没有 sha256（如 UE4SS 目录类）时退回 mtime。
+        if item.sha256.trim().is_empty() {
+            hash_deployment_field(&mut hasher, &item.last_modified);
+        }
+        hash_deployment_field(&mut hasher, &item.sha256);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn hash_deployment_field(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn reusable_deployment(
+    paths: &AppPaths,
+    install: &Path,
+    is_server: bool,
+    fingerprint: &str,
+    use_links: bool,
+) -> Option<String> {
+    let manifest = read_manifest(paths)?;
+    let expected_mode = if is_server { "server" } else { "client" };
+    if manifest.fingerprint != fingerprint
+        || manifest.mode != expected_mode
+        || manifest.use_links != use_links
+        || manifest
+            .links
+            .iter()
+            .any(|link| !crate::mods::links::is_junction(Path::new(link)))
+        || !manifest
+            .roots
+            .iter()
+            .any(|root| same_path(Path::new(root), install))
+        || manifest.files.is_empty()
+    {
+        return None;
+    }
+    for file in &manifest.files {
+        let target = Path::new(file);
+        if !target.is_file() {
+            return None;
+        }
+        let Some(expected_size) = manifest.file_sizes.get(&path_string(target)) else {
+            return None;
+        };
+        if std::fs::metadata(target).ok()?.len() != *expected_size {
+            return None;
+        }
+    }
+    Some(manifest.deployed_at)
+}
+
+fn deployment_prefix_width(client_pak_count: usize) -> usize {
+    client_pak_count.to_string().len().max(3)
+}
+
+fn numbered_pak_file_name(index: usize, original: &str, width: usize) -> String {
+    format!("{index:0width$}_{original}")
+}
+
+fn conflict_merged_file_name(client_pak_count: usize) -> String {
+    let width = deployment_prefix_width(client_pak_count);
+    if width == 3 {
+        return CONFLICT_MERGED_FILE.to_string();
+    }
+    format!("{}_SCUM_Mod_Desk_Merged.pak", "9".repeat(width))
+}
+
+pub fn find_pak_dir(install: &Path) -> Option<PathBuf> {
+    candidate_paths(install, ["SCUM/Content/Paks/~mods", "Content/Paks/~mods"])
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+pub fn find_binaries_dir(install: &Path) -> Option<PathBuf> {
+    candidate_paths(install, ["SCUM/Binaries/Win64", "Binaries/Win64"])
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+pub fn find_executable(install: &Path, executable: &str) -> Option<PathBuf> {
+    let nested = format!("SCUM/Binaries/Win64/{executable}");
+    let flat = format!("Binaries/Win64/{executable}");
+    candidate_paths(install, [nested.as_str(), executable, flat.as_str()])
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn candidate_paths<const N: usize>(install: &Path, relatives: [&str; N]) -> Vec<PathBuf> {
+    relatives
+        .into_iter()
+        .filter(|relative| !relative.is_empty())
+        .map(|relative| install.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)))
+        .collect()
+}
+
+fn ensure_runtime_framework(paths: &AppPaths) -> Result<()> {
+    let framework = paths.ue4ss_runtime.join("ue4ss");
+    if framework.join("UE4SS.dll").exists() && paths.ue4ss_runtime.join("dwmapi.dll").exists() {
+        return Ok(());
+    }
+    let archive = paths.resource("ue4ss_framework.zip");
+    if !archive.exists() {
+        bail!("内置 UE4SS 框架资源不存在");
+    }
+    extract_zip_file(&archive, &paths.ue4ss_runtime)?;
+    Ok(())
+}
+
+fn deploy_framework(
+    paths: &AppPaths,
+    binaries: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+) -> Result<()> {
+    let dll = paths.ue4ss_runtime.join("dwmapi.dll");
+    if dll.is_file() {
+        copy_file_record(&dll, &binaries.join("dwmapi.dll"), backup_root, manifest)?;
+    }
+    let source_root = paths.ue4ss_runtime.join("ue4ss");
+    let target_root = binaries.join("ue4ss");
+    for entry in WalkDir::new(&source_root).follow_links(false) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(&source_root)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        if relative.starts_with("Mods") {
+            continue;
+        }
+        let target = target_root.join(relative);
+        if entry.file_type().is_dir() {
+            create_directory_recorded(&target, manifest)?;
+        } else if entry.file_type().is_file() {
+            copy_file_record(entry.path(), &target, backup_root, manifest)?;
+        }
+    }
+    for file_name in ["mods.json", "mods.txt"] {
+        let source = source_root.join("Mods").join(file_name);
+        if source.is_file() {
+            copy_file_record(
+                &source,
+                &target_root.join("Mods").join(file_name),
+                backup_root,
+                manifest,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn deploy_ue4ss_mod(
+    item: &ModEntry,
+    binaries: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+) -> Result<()> {
+    let source = PathBuf::from(&item.file_path);
+    let target = binaries.join("ue4ss").join("Mods").join(&item.name);
+    create_directory_recorded(&target, manifest)?;
+    for entry in WalkDir::new(&source).follow_links(false) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(&source)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let destination = target.join(relative);
+        if entry.file_type().is_dir() {
+            create_directory_recorded(&destination, manifest)?;
+        } else if entry.file_type().is_file() {
+            copy_file_record(entry.path(), &destination, backup_root, manifest)?;
+        }
+    }
+    Ok(())
+}
+
+/// 让游戏 `~mods` 指向启动器的部署目录。
+///
+/// 真实目录里如果还留着上一个版本复制的文件，先按清单回收；回收后仍有非管理器文件
+/// 就报错，绝不把用户自己的文件丢掉。
+fn prepare_link_layout(paths: &AppPaths, pak_dir: &Path, deployed_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(deployed_root)
+        .with_context(|| format!("无法创建部署目录 {}", deployed_root.display()))?;
+
+    if crate::mods::links::is_junction(pak_dir) {
+        crate::mods::links::ensure_junction(pak_dir, deployed_root).with_context(|| {
+            format!(
+                "无法把 {} 指向 {}",
+                pak_dir.display(),
+                deployed_root.display()
+            )
+        })?;
+        return Ok(());
+    }
+    if !pak_dir.exists() {
+        crate::mods::links::ensure_junction(pak_dir, deployed_root).with_context(|| {
+            format!(
+                "无法把 {} 指向 {}",
+                pak_dir.display(),
+                deployed_root.display()
+            )
+        })?;
+        return Ok(());
+    }
+    if !pak_dir.is_dir() {
+        bail!("游戏模组目录不是文件夹：{}", pak_dir.display());
+    }
+
+    reclaim_mods(paths)?;
+    let leftovers = std::fs::read_dir(pak_dir)?.filter_map(Result::ok).count();
+    if leftovers > 0 {
+        bail!(
+            "{} 里还有 {} 个非本管理器部署的文件，请先移走或清空后再切换链接模式",
+            pak_dir.display(),
+            leftovers
+        );
+    }
+    std::fs::remove_dir(pak_dir)
+        .with_context(|| format!("无法移除空目录 {}", pak_dir.display()))?;
+    crate::mods::links::ensure_junction(pak_dir, deployed_root).with_context(|| {
+        format!(
+            "无法把 {} 指向 {}",
+            pak_dir.display(),
+            deployed_root.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// 只复制加载器 `dwmapi.dll`：Windows 只从 exe 同目录加载代理 DLL，这一个躲不开。
+fn deploy_loader_dll(
+    paths: &AppPaths,
+    binaries: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+) -> Result<()> {
+    let dll = paths.ue4ss_runtime.join("dwmapi.dll");
+    if dll.is_file() {
+        copy_file_record(&dll, &binaries.join("dwmapi.dll"), backup_root, manifest)?;
+    }
+    Ok(())
+}
+
+/// 把游戏 `Binaries\Win64\ue4ss` 整棵目录指向启动器框架目录：
+/// `UE4SS.dll`、`UE4SS-settings.ini`、`Mods` 全部零复制，启用/停用由库里的 `mods.txt` 决定。
+fn link_ue4ss_framework(
+    manifest: &mut DeployedManifest,
+    link: &Path,
+    library: &Path,
+    backup_root: &Path,
+) -> Result<()> {
+    if crate::mods::links::is_junction(link) {
+        crate::mods::links::ensure_junction(link, library)
+            .with_context(|| format!("无法把 {} 指向 {}", link.display(), library.display()))?;
+    } else if link.exists() {
+        if !link.is_dir() {
+            bail!("UE4SS 运行时目录不是文件夹：{}", link.display());
+        }
+        // 旧版本的逐文件部署会在游戏目录留下一份框架副本；先把其中可能存在的 Mods 链接摘掉，
+        // 再把整棵目录挪进备份（不跨卷时 rename，跨卷时退回复制），最后建 junction。
+        let mods = link.join("Mods");
+        if crate::mods::links::is_junction(&mods) {
+            crate::mods::links::remove_junction(&mods)?;
+        }
+        std::fs::create_dir_all(backup_root)?;
+        let retired = backup_root.join(format!("ue4ss-{}.bak", Utc::now().format("%Y%m%d%H%M%S")));
+        if std::fs::rename(link, &retired).is_err() {
+            super::copy_tree(link, &retired).with_context(|| {
+                format!(
+                    "无法把旧的 UE4SS 目录 {} 备份到 {}",
+                    link.display(),
+                    retired.display()
+                )
+            })?;
+            std::fs::remove_dir_all(link)
+                .with_context(|| format!("无法移除旧 UE4SS 目录 {}", link.display()))?;
+        }
+        crate::mods::links::ensure_junction(link, library)
+            .with_context(|| format!("无法把 {} 指向 {}", link.display(), library.display()))?;
+    } else {
+        crate::mods::links::ensure_junction(link, library)
+            .with_context(|| format!("无法把 {} 指向 {}", link.display(), library.display()))?;
+    }
+    if !manifest
+        .links
+        .iter()
+        .any(|item| same_path(Path::new(item), link))
+    {
+        manifest.links.push(path_string(link));
+    }
+    Ok(())
+}
+
+fn copy_file_record(
+    source: &Path,
+    target: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+) -> Result<()> {
+    place_file_record(source, target, backup_root, manifest, false)
+}
+
+/// 同卷用硬链接落盘（0 字节写入），跨卷自动退回复制。
+fn place_file_record(
+    source: &Path,
+    target: &Path,
+    backup_root: &Path,
+    manifest: &mut DeployedManifest,
+    use_links: bool,
+) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        create_directory_recorded(parent, manifest)?;
+    }
+    if target.exists()
+        && !manifest
+            .backups
+            .iter()
+            .any(|backup| same_path(Path::new(&backup.target), target))
+    {
+        if !target.is_file() {
+            bail!("部署目标已存在且不是文件：{}", target.display());
+        }
+        std::fs::create_dir_all(backup_root)?;
+        let file_name = target
+            .file_name()
+            .map(|name| safe_file_component(&name.to_string_lossy()))
+            .unwrap_or_else(|| "file".to_string());
+        let backup = backup_root.join(format!("{:04}-{file_name}", manifest.backups.len()));
+        std::fs::copy(target, &backup)
+            .with_context(|| format!("无法备份原文件 {}", target.display()))?;
+        manifest.backups.push(DeployedBackup {
+            target: path_string(target),
+            backup: path_string(&backup),
+        });
+    }
+    if !manifest
+        .files
+        .iter()
+        .any(|path| same_path(Path::new(path), target))
+    {
+        manifest.files.push(path_string(target));
+    }
+    if use_links {
+        crate::mods::links::link_or_copy(source, target)
+            .with_context(|| format!("无法链接 {} 到 {}", source.display(), target.display()))?;
+    } else {
+        std::fs::copy(source, target)
+            .with_context(|| format!("无法复制 {} 到 {}", source.display(), target.display()))?;
+    }
+    let size = std::fs::metadata(target)
+        .with_context(|| format!("无法读取部署文件 {}", target.display()))?
+        .len();
+    manifest.file_sizes.insert(path_string(target), size);
+    Ok(())
+}
+
+fn write_manifest(paths: &AppPaths, manifest: &DeployedManifest) -> Result<()> {
+    let json = serde_json::to_string_pretty(manifest)?;
+    crate::paths::write_state_file(&paths.deployment_manifest, format!("{json}\n").as_bytes())
+        .with_context(|| format!("无法写入 {}", paths.deployment_manifest.display()))
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    path_key(left) == path_key(right)
+}
+
+fn path_key(path: &Path) -> String {
+    path_string(path)
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn create_directory_recorded(path: &Path, manifest: &mut DeployedManifest) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut current = Some(path);
+    while let Some(directory) = current {
+        if directory.exists() {
+            break;
+        }
+        missing.push(directory.to_path_buf());
+        current = directory.parent();
+    }
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("无法创建部署目录 {}", path.display()))?;
+    for directory in missing.into_iter().rev() {
+        if !manifest
+            .created_directories
+            .iter()
+            .any(|item| same_path(Path::new(item), &directory))
+        {
+            manifest.created_directories.push(path_string(&directory));
+        }
+    }
+    if !manifest
+        .directories
+        .iter()
+        .any(|item| same_path(Path::new(item), path))
+    {
+        manifest.directories.push(path_string(path));
+    }
+    Ok(())
+}
+
+fn remove_ue4ss_runtime_artifacts(root: &Path) -> Result<()> {
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        let generated_log = name.eq_ignore_ascii_case("UE4SS.log")
+            || name
+                .get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UE4SS.log"))
+                && name.get(9..).is_some_and(|suffix| suffix.starts_with('.'));
+        if generated_log {
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("无法删除 UE4SS 运行时日志 {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_empty_directory(directory: &Path) -> std::result::Result<(), String> {
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("无法读取部署目录 {}：{error}", directory.display()))?;
+    if entries.next().is_some() {
+        return Ok(());
+    }
+    std::fs::remove_dir(directory)
+        .map_err(|error| format!("无法删除空目录 {}：{error}", directory.display()))
+}
+
+/// UE4SS 的启用标记文件名。
+///
+/// UE4SS 3.x（v3.0.1 `UE4SSProgram::start_mods`）有两条互相独立的启动通道：
+/// ① `Mods/mods.txt` 里的 `<目录名> : 1`，按行顺序带加载顺序；
+/// ② 模组目录内存在 `enabled.txt` —— 第二趟扫描里无条件启动，只跳过「已经启动过」的。
+/// 所以 `: 0` 关不掉一个带 `enabled.txt` 的模组（C++ mod 包通常自带这个标记），
+/// 停用必须把标记文件一起删掉；启用时补上，避免 mods.txt 行名对不上时静默不加载。
+const UE4SS_ENABLED_MARKER: &str = "enabled.txt";
+
+/// UE4SS 用目录名匹配 mods.txt，而 `ModEntry.name` 可能是云端显示名（甚至含空格，
+/// 而 UE4SS 解析时会删掉行内所有空格），两者不能混用。
+fn ue4ss_folder_name(item: &ModEntry) -> String {
+    if !item.file_name.trim().is_empty() {
+        return item.file_name.clone();
+    }
+    Path::new(&item.file_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| item.name.clone())
+}
+
+fn decode_managed_name(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(line)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .or_else(|| Some(line.to_string()))
+}
+
+/// 把启用状态同步成 UE4SS 真正认的两处：`mods.txt` 的行 + 模组目录里的 `enabled.txt`。
+/// 返回实际改动处数（内容没变就不落盘，避免 library_watch 反复触发自己）。
+fn sync_ue4ss_mods_txt(paths: &AppPaths, mods: &[ModEntry]) -> Result<usize> {
+    let mods_txt = paths.ue4ss_mods.join("mods.txt");
+    let managed_path = paths.ue4ss_mods.join(".scum_mm_managed.txt");
+    let previously_managed: HashSet<String> = std::fs::read_to_string(&managed_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(decode_managed_name)
+        .collect();
+    let existing = std::fs::read_to_string(&mods_txt).unwrap_or_default();
+    let ue4ss_mods: Vec<(&ModEntry, String)> = mods
+        .iter()
+        .filter(|item| item.mod_type == "ue4ssMod")
+        .map(|item| (item, ue4ss_folder_name(item)))
+        .collect();
+    // 旧版本按显示名写过行，重写时一并清掉；否则同一个模组会留下两条互相矛盾的记录。
+    let our_names: HashSet<String> = ue4ss_mods
+        .iter()
+        .flat_map(|(item, folder)| [item.name.clone(), folder.clone()])
+        .collect();
+    let mut kept: Vec<String> = existing
+        .lines()
+        .filter(|line| {
+            let name = line.split(':').next().unwrap_or_default().trim();
+            !previously_managed.contains(name) && !our_names.contains(name)
+        })
+        .map(ToString::to_string)
+        .collect();
+
+    let mut changed = 0usize;
+    for (item, folder) in &ue4ss_mods {
+        let directory = paths.ue4ss_mods.join(folder);
+        if !directory.is_dir() {
+            continue;
+        }
+        let marker = directory.join(UE4SS_ENABLED_MARKER);
+        match (item.enabled, marker.exists()) {
+            (true, false) => {
+                std::fs::write(&marker, b"enabled")
+                    .with_context(|| format!("无法写入 UE4SS 启用标记 {}", marker.display()))?;
+                changed += 1;
+            }
+            (false, true) => {
+                std::fs::remove_file(&marker)
+                    .with_context(|| format!("无法移除 UE4SS 启用标记 {}", marker.display()))?;
+                changed += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let our_lines: Vec<String> = ue4ss_mods
+        .iter()
+        .map(|(item, folder)| format!("{folder} : {}", usize::from(item.enabled)))
+        .collect();
+    let insert_at = kept
+        .iter()
+        .position(|line| line.to_ascii_lowercase().starts_with("keybinds"))
+        .unwrap_or(kept.len());
+    let tail = kept.split_off(insert_at);
+    kept.extend(our_lines);
+    kept.extend(tail);
+    let content = format!("{}\n", kept.join("\n"));
+    if content != existing {
+        std::fs::write(&mods_txt, &content)?;
+        changed += 1;
+    }
+    let encoded = ue4ss_mods
+        .iter()
+        .map(|(_, folder)| base64::engine::general_purpose::STANDARD.encode(folder.as_bytes()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if std::fs::read_to_string(&managed_path).unwrap_or_default() != encoded {
+        std::fs::write(&managed_path, encoded)?;
+    }
+    Ok(changed)
+}
+
+pub fn sync_ue4ss_state(paths: &AppPaths, mods: &[ModEntry]) -> Result<usize> {
+    sync_ue4ss_mods_txt(paths, mods)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        deploy_local_mods, deployment_fingerprint, read_manifest, reclaim_mods,
+        rescue_mods_from_game, sync_ue4ss_state, DeployedManifest,
+    };
+    use crate::metadata::{save_metadata, MetadataFile};
+    use crate::models::{AppSettings, ModEntry};
+    use crate::paths::path_string;
+    use crate::test_support::TempRoot;
+    use base64::Engine;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    fn mod_entry(path: &Path, enabled: bool, mod_type: &str) -> ModEntry {
+        let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let file_name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        ModEntry {
+            id: name.to_ascii_lowercase(),
+            name,
+            author: String::new(),
+            file_name,
+            file_path: path_string(path),
+            file_size: path.metadata().map(|item| item.len()).unwrap_or(0),
+            last_modified: "2026-01-01T00:00:00Z".to_string(),
+            enabled,
+            mod_type: mod_type.to_string(),
+            load_order: 0,
+            tags: Vec::new(),
+            notes: String::new(),
+            sha256: String::new(),
+            origin_source: "local".to_string(),
+            deployed: false,
+            description: String::new(),
+            conflict_count: 0,
+            file_count: 0,
+            overridden_file_count: 0,
+            overriding_file_count: 0,
+            fully_overridden: false,
+            update_version: None,
+            cover_url: None,
+            duplicate_count: 0,
+            duplicate_aliases: Vec::new(),
+        }
+    }
+
+    fn write_framework_archive(paths: &crate::paths::AppPaths) {
+        fs::create_dir_all(paths.root.join("resources")).unwrap();
+        let archive_path = paths.root.join("resources").join("ue4ss_framework.zip");
+        assert!(
+            archive_path.starts_with(&paths.root),
+            "tests must never write into the bundled resource directory: {}",
+            archive_path.display()
+        );
+        let file = File::create(archive_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, contents) in [
+            ("ue4ss/UE4SS.dll", b"loader".as_slice()),
+            ("ue4ss/UE4SS-settings.ini", b"[General]\n".as_slice()),
+            ("ue4ss/Mods/mods.json", b"[]".as_slice()),
+            ("ue4ss/Mods/mods.txt", b"".as_slice()),
+            ("dwmapi.dll", b"proxy".as_slice()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn deploys_and_reclaims_one_pak_in_an_isolated_install() {
+        let temp = TempRoot::new("deploy-reclaim");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let source = paths.local_mods.join("TestWeapon.pak");
+        fs::write(&source, b"pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        let deployed_at = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .expect("PAK should be deployed");
+
+        let target = pak_dir.join("000_TestWeapon.pak");
+        assert_eq!(fs::read(&target).unwrap(), b"pak-content");
+        let manifest = read_manifest(&paths).expect("deployment manifest should exist");
+        assert_eq!(manifest.deployed_at, deployed_at);
+        assert!(manifest.files.contains(&path_string(&target)));
+        let deployed_names = super::deployed_file_names(&paths);
+        assert!(deployed_names.contains("testweapon.pak"));
+        assert!(deployed_names.contains("000_testweapon.pak"));
+
+        assert_eq!(reclaim_mods(&paths).unwrap(), 1);
+        assert!(!target.exists());
+        assert!(!paths.deployment_manifest.exists());
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn deploys_through_a_junction_and_switches_back_to_copy() {
+        let temp = TempRoot::new("deploy-links");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let source = paths.local_mods.join("TestWeapon.pak");
+        fs::write(&source, b"pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .expect("PAK should be deployed");
+
+        assert!(
+            crate::mods::links::is_junction(&pak_dir),
+            "链接模式下 ~mods 必须是 junction"
+        );
+        let deployed_root = paths.root.join("deployed").join("client");
+        assert_eq!(
+            crate::mods::links::junction_target(&pak_dir).unwrap(),
+            deployed_root
+        );
+        let target = deployed_root.join("000_TestWeapon.pak");
+        assert_eq!(fs::read(&target).unwrap(), b"pak-content");
+        assert!(source.is_file(), "库文件不能被搬走或删掉");
+        let manifest = read_manifest(&paths).expect("manifest should exist");
+        assert!(manifest.use_links);
+        assert_eq!(manifest.files, vec![path_string(&target)]);
+
+        // 切回复制模式：junction 换回真实目录，文件复制进游戏目录。
+        let copy_settings = AppSettings {
+            use_deploy_links: false,
+            ..settings.clone()
+        };
+        deploy_local_mods(&paths, &copy_settings, &mods, false).unwrap();
+        assert!(!crate::mods::links::is_junction(&pak_dir));
+        assert_eq!(
+            fs::read(pak_dir.join("000_TestWeapon.pak")).unwrap(),
+            b"pak-content"
+        );
+        assert!(source.is_file());
+    }
+
+    #[test]
+    fn tears_down_links_on_reclaim_and_keeps_the_library() {
+        let temp = TempRoot::new("deploy-links-teardown");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let source = paths.local_mods.join("TestWeapon.pak");
+        fs::write(&source, b"pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+        assert!(crate::mods::links::is_junction(&pak_dir));
+
+        let removed = reclaim_mods(&paths).unwrap();
+
+        assert!(removed >= 1, "回收应至少断开一个链接");
+        assert!(!pak_dir.exists(), "退出后 ~mods 链接必须断开");
+        assert!(source.is_file(), "库文件必须保留");
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn links_ue4ss_mods_and_detaches_on_reclaim() {
+        let temp = TempRoot::new("deploy-links-ue4ss");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let module = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(module.join("Scripts")).unwrap();
+        fs::write(module.join("Scripts").join("main.lua"), b"print('x')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&module, true, "ue4ssMod")];
+
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+
+        let framework = paths.ue4ss_runtime.join("ue4ss");
+        let link = binaries.join("ue4ss");
+        assert!(
+            crate::mods::links::is_junction(&link),
+            "整棵 ue4ss 目录都应该是 junction"
+        );
+        assert_eq!(
+            crate::mods::links::junction_target(&link).unwrap(),
+            framework
+        );
+        assert!(
+            link.join("UE4SS.dll").is_file(),
+            "框架 DLL 必须走链接，不是复制"
+        );
+        assert!(link.join("UE4SS-settings.ini").is_file());
+        assert!(
+            binaries.join("dwmapi.dll").is_file(),
+            "只有加载器 DLL 需要落在 exe 同目录"
+        );
+        assert!(link
+            .join("Mods")
+            .join("BetterAI")
+            .join("Scripts")
+            .join("main.lua")
+            .is_file());
+
+        reclaim_mods(&paths).unwrap();
+
+        assert!(
+            !crate::mods::links::is_junction(&link),
+            "回收要断开 UE4SS 链接"
+        );
+        assert!(!link.exists());
+        assert!(!binaries.join("dwmapi.dll").exists(), "加载器副本也要回收");
+        assert!(
+            module.join("Scripts").join("main.lua").is_file(),
+            "库里的模组目录不能被删"
+        );
+    }
+
+    #[test]
+    fn refuses_to_take_over_a_mods_dir_with_foreign_files() {
+        let temp = TempRoot::new("deploy-links-foreign");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::write(pak_dir.join("HandInstalled.pak"), b"user-mod").unwrap();
+        let source = paths.local_mods.join("TestWeapon.pak");
+        fs::write(&source, b"pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        let error = deploy_local_mods(&paths, &settings, &mods, false).unwrap_err();
+
+        assert!(
+            error.to_string().contains("非本管理器部署"),
+            "应为明确的接管拒绝：{error}"
+        );
+        assert!(
+            pak_dir.join("HandInstalled.pak").is_file(),
+            "用户文件必须保留"
+        );
+        assert!(!crate::mods::links::is_junction(&pak_dir));
+    }
+
+    #[test]
+    fn redeploys_after_reclaiming_when_retention_is_enabled() {
+        let temp = TempRoot::new("deploy-retained-redeploy");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let first = paths.local_mods.join("First.pak");
+        let second = paths.local_mods.join("Second.pak");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            keep_deployed_mods_on_exit: true,
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&first, true, "clientPak")],
+            false,
+        )
+        .unwrap()
+        .expect("first deployment should be created");
+        let first_target = pak_dir.join("000_First.pak");
+        assert!(first_target.exists());
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&second, true, "clientPak")],
+            false,
+        )
+        .unwrap()
+        .expect("second deployment should be created");
+
+        assert!(!first_target.exists());
+        assert_eq!(fs::read(pak_dir.join("000_Second.pak")).unwrap(), b"second");
+        let manifest = read_manifest(&paths).unwrap();
+        assert!(!manifest
+            .files
+            .iter()
+            .any(|path| path.ends_with("000_First.pak")));
+    }
+
+    #[test]
+    fn deploys_only_the_canonical_entry_for_identical_pak_hashes() {
+        let temp = TempRoot::new("deploy-duplicate-paks");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = paths.local_mods.join("Alpha.pak");
+        let zeta = paths.local_mods.join("Zeta.pak");
+        fs::write(&alpha, b"same-pak-content").unwrap();
+        fs::write(&zeta, b"same-pak-content").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut alpha_entry = mod_entry(&alpha, true, "clientPak");
+        alpha_entry.sha256 = hash.to_string();
+        let mut zeta_entry = mod_entry(&zeta, true, "clientPak");
+        zeta_entry.sha256 = hash.to_string();
+
+        deploy_local_mods(&paths, &settings, &[alpha_entry, zeta_entry], false).unwrap();
+
+        assert!(pak_dir.join("000_Alpha.pak").is_file());
+        assert!(!pak_dir.join("001_Zeta.pak").exists());
+        let manifest = read_manifest(&paths).unwrap();
+        assert_eq!(manifest.files.len(), 1);
+        assert!(manifest.files[0].ends_with("000_Alpha.pak"));
+    }
+
+    #[test]
+    fn deploys_client_paks_with_load_order_prefixes() {
+        let temp = TempRoot::new("deploy-load-order-prefixes");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = paths.local_mods.join("Alpha.pak");
+        let beta = paths.local_mods.join("Beta.pak");
+        let gamma = paths.local_mods.join("Gamma.pak");
+        fs::write(&alpha, b"alpha").unwrap();
+        fs::write(&beta, b"beta").unwrap();
+        fs::write(&gamma, b"gamma").unwrap();
+        let mut alpha_mod = mod_entry(&alpha, true, "clientPak");
+        alpha_mod.load_order = 2;
+        let mut beta_mod = mod_entry(&beta, true, "clientPak");
+        beta_mod.load_order = 0;
+        let mut gamma_mod = mod_entry(&gamma, true, "clientPak");
+        gamma_mod.load_order = 1;
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(&paths, &settings, &[alpha_mod, gamma_mod, beta_mod], false).unwrap();
+
+        assert_eq!(fs::read(pak_dir.join("000_Beta.pak")).unwrap(), b"beta");
+        assert_eq!(fs::read(pak_dir.join("001_Gamma.pak")).unwrap(), b"gamma");
+        assert_eq!(fs::read(pak_dir.join("002_Alpha.pak")).unwrap(), b"alpha");
+        assert_eq!(fs::read(&alpha).unwrap(), b"alpha");
+        assert_eq!(fs::read(&beta).unwrap(), b"beta");
+        assert_eq!(fs::read(&gamma).unwrap(), b"gamma");
+        assert!(super::deployed_file_names(&paths).contains("alpha.pak"));
+        assert!(super::deployed_file_names(&paths).contains("beta.pak"));
+        assert!(super::deployed_file_names(&paths).contains("gamma.pak"));
+    }
+
+    #[test]
+    fn merges_conflicting_paks_into_one_deployed_file() {
+        let temp = TempRoot::new("deploy-conflict-merge");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = build_test_pak(
+            temp.path(),
+            &paths,
+            "Alpha",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"alpha-uasset"),
+                ("SCUM/Content/Assets/Shared.uexp", b"alpha-uexp"),
+                ("SCUM/Content/Assets/AlphaOnly.txt", b"alpha-only"),
+            ],
+        );
+        let beta = build_test_pak(
+            temp.path(),
+            &paths,
+            "Beta",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"beta-uasset"),
+                ("SCUM/Content/Assets/Shared.uexp", b"beta-uexp"),
+                ("SCUM/Content/Assets/BetaOnly.txt", b"beta-only"),
+            ],
+        );
+        let mut alpha_mod = mod_entry(&alpha, true, "clientPak");
+        alpha_mod.load_order = 0;
+        let mut beta_mod = mod_entry(&beta, true, "clientPak");
+        beta_mod.load_order = 1;
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut(&alpha_mod.id).pak_entries = vec![
+            "SCUM/Content/Assets/Shared.uasset".to_string(),
+            "SCUM/Content/Assets/Shared.uexp".to_string(),
+            "SCUM/Content/Assets/AlphaOnly.txt".to_string(),
+        ];
+        metadata.entry_mut(&beta_mod.id).pak_entries = vec![
+            "SCUM/Content/Assets/Shared.uasset".to_string(),
+            "SCUM/Content/Assets/Shared.uexp".to_string(),
+            "SCUM/Content/Assets/BetaOnly.txt".to_string(),
+        ];
+        save_metadata(&paths, &metadata).unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(&paths, &settings, &[alpha_mod, beta_mod], false).unwrap();
+
+        assert!(!pak_dir.join("000_Alpha.pak").exists());
+        assert!(!pak_dir.join("001_Beta.pak").exists());
+        let merged = pak_dir.join(super::CONFLICT_MERGED_FILE);
+        assert!(merged.is_file());
+        assert_eq!(
+            read_pak_file(&paths, &merged, "SCUM/Content/Assets/Shared.uasset"),
+            b"beta-uasset"
+        );
+        assert_eq!(
+            read_pak_file(&paths, &merged, "SCUM/Content/Assets/Shared.uexp"),
+            b"beta-uexp"
+        );
+        assert_eq!(
+            read_pak_file(&paths, &merged, "SCUM/Content/Assets/AlphaOnly.txt"),
+            b"alpha-only"
+        );
+        assert_eq!(
+            read_pak_file(&paths, &merged, "SCUM/Content/Assets/BetaOnly.txt"),
+            b"beta-only"
+        );
+        let manifest = read_manifest(&paths).expect("deployment manifest should exist");
+        assert_eq!(manifest.files, vec![path_string(&merged)]);
+    }
+
+    #[test]
+    fn reuses_an_unchanged_deployment_without_reclaiming_files() {
+        let temp = TempRoot::new("deploy-reuse-unchanged");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let source = paths.local_mods.join("Stable.pak");
+        fs::write(&source, b"stable-pak").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            keep_deployed_mods_on_exit: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        let first = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .unwrap();
+        let manifest_before = fs::read(&paths.deployment_manifest).unwrap();
+        let target = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods")
+            .join("000_Stable.pak");
+        assert!(target.is_file());
+
+        let second = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            fs::read(&paths.deployment_manifest).unwrap(),
+            manifest_before
+        );
+        assert_eq!(fs::read(target).unwrap(), b"stable-pak");
+    }
+
+    #[test]
+    fn removes_orphaned_merged_pak_when_deploying_without_conflicts() {
+        let temp = TempRoot::new("deploy-orphan-merged");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let stale_merged = pak_dir.join(super::CONFLICT_MERGED_FILE);
+        fs::write(&stale_merged, b"stale-merge").unwrap();
+        let source = paths.local_mods.join("OnlyMod.pak");
+        fs::write(&source, b"only-mod").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+
+        assert!(!stale_merged.exists(), "无冲突时不得保留残留融合包");
+        assert_eq!(
+            fs::read(pak_dir.join("000_OnlyMod.pak")).unwrap(),
+            b"only-mod"
+        );
+        let manifest = read_manifest(&paths).expect("manifest should exist");
+        assert_eq!(manifest.files.len(), 1);
+        assert!(manifest.files[0].ends_with("000_OnlyMod.pak"));
+    }
+
+    #[test]
+    fn removes_orphaned_merged_pak_even_when_reusing_a_deployment() {
+        let temp = TempRoot::new("deploy-orphan-merged-reuse");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let source = paths.local_mods.join("OnlyMod.pak");
+        fs::write(&source, b"only-mod").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+        let first = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .unwrap();
+        let stale_merged = pak_dir.join(super::CONFLICT_MERGED_FILE);
+        fs::write(&stale_merged, b"stale-merge").unwrap();
+
+        let second = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, second, "未变化部署应继续复用");
+        assert!(!stale_merged.exists(), "复用部署前也必须清掉残留融合包");
+    }
+
+    #[test]
+    fn removes_orphaned_merged_pak_from_the_link_deploy_root() {
+        let temp = TempRoot::new("deploy-orphan-merged-links");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let deploy_root = paths.root.join("deployed").join("client");
+        fs::create_dir_all(&deploy_root).unwrap();
+        let stale_merged = deploy_root.join(super::CONFLICT_MERGED_FILE);
+        fs::write(&stale_merged, b"stale-merge").unwrap();
+        let source = paths.local_mods.join("OnlyMod.pak");
+        fs::write(&source, b"only-mod").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "clientPak")];
+
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+
+        assert!(
+            !stale_merged.exists(),
+            "链接部署目录里的残留融合包也必须清掉"
+        );
+        assert!(crate::mods::links::is_junction(&pak_dir));
+        assert_eq!(
+            fs::read(deploy_root.join("000_OnlyMod.pak")).unwrap(),
+            b"only-mod"
+        );
+    }
+
+    #[test]
+    fn manual_merge_enables_launch_when_auto_merge_is_disabled() {
+        let temp = TempRoot::new("deploy-manual-merge");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = build_test_pak(
+            temp.path(),
+            &paths,
+            "Alpha",
+            &[("SCUM/Content/Assets/Shared.uasset", b"alpha")],
+        );
+        let beta = build_test_pak(
+            temp.path(),
+            &paths,
+            "Beta",
+            &[("SCUM/Content/Assets/Shared.uasset", b"beta")],
+        );
+        let mut alpha_mod = mod_entry(&alpha, true, "clientPak");
+        alpha_mod.load_order = 0;
+        let mut beta_mod = mod_entry(&beta, true, "clientPak");
+        beta_mod.load_order = 1;
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut(&alpha_mod.id).pak_entries =
+            vec!["SCUM/Content/Assets/Shared.uasset".to_string()];
+        metadata.entry_mut(&beta_mod.id).pak_entries =
+            vec!["SCUM/Content/Assets/Shared.uasset".to_string()];
+        save_metadata(&paths, &metadata).unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            auto_merge_conflicts: false,
+            ..AppSettings::default()
+        };
+
+        let error = deploy_local_mods(
+            &paths,
+            &settings,
+            &[alpha_mod.clone(), beta_mod.clone()],
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("自动融合已关闭"));
+        assert!(!paths.deployment_manifest.exists());
+
+        let prepared = crate::mods::merge_cache::prepare(
+            &paths,
+            &[alpha_mod.clone(), beta_mod.clone()],
+            &metadata,
+        )
+        .unwrap();
+        assert!(prepared.rebuilt);
+        let cache_meta = paths
+            .root
+            .join("cache")
+            .join("conflict_merge")
+            .join("meta.json");
+        let first_cache_meta = fs::read_to_string(&cache_meta).unwrap();
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[alpha_mod.clone(), beta_mod.clone()],
+            false,
+        )
+        .unwrap();
+        reclaim_mods(&paths).unwrap();
+        deploy_local_mods(&paths, &settings, &[alpha_mod, beta_mod], false).unwrap();
+
+        assert_eq!(fs::read_to_string(cache_meta).unwrap(), first_cache_meta);
+        assert!(pak_dir.join(super::CONFLICT_MERGED_FILE).is_file());
+    }
+
+    #[test]
+    fn merged_pak_prefix_stays_after_large_numeric_ranges() {
+        let width = super::deployment_prefix_width(1000);
+        let last_pak = super::numbered_pak_file_name(999, "Last.pak", width);
+        let merged_pak = super::conflict_merged_file_name(1000);
+
+        assert_eq!(width, 4);
+        assert_eq!(last_pak, "0999_Last.pak");
+        assert_eq!(merged_pak, "9999_SCUM_Mod_Desk_Merged.pak");
+        assert!(last_pak < merged_pak);
+    }
+
+    #[test]
+    fn selected_conflict_winner_is_written_to_the_merged_pak() {
+        let temp = TempRoot::new("deploy-conflict-winner");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = build_test_pak(
+            temp.path(),
+            &paths,
+            "Alpha",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"alpha-uasset"),
+                ("SCUM/Content/Assets/Shared.uexp", b"alpha-uexp"),
+            ],
+        );
+        let beta = build_test_pak(
+            temp.path(),
+            &paths,
+            "Beta",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"beta-uasset"),
+                ("SCUM/Content/Assets/Shared.uexp", b"beta-uexp"),
+            ],
+        );
+        let mut alpha_mod = mod_entry(&alpha, true, "clientPak");
+        alpha_mod.load_order = 0;
+        let mut beta_mod = mod_entry(&beta, true, "clientPak");
+        beta_mod.load_order = 1;
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut(&alpha_mod.id).pak_entries = vec![
+            "SCUM/Content/Assets/Shared.uasset".to_string(),
+            "SCUM/Content/Assets/Shared.uexp".to_string(),
+        ];
+        metadata.entry_mut(&beta_mod.id).pak_entries = vec![
+            "SCUM/Content/Assets/Shared.uasset".to_string(),
+            "SCUM/Content/Assets/Shared.uexp".to_string(),
+        ];
+        metadata.conflict_winners.insert(
+            "scum/content/assets/shared".to_string(),
+            alpha_mod.id.clone(),
+        );
+        save_metadata(&paths, &metadata).unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(&paths, &settings, &[alpha_mod, beta_mod], false).unwrap();
+
+        assert!(!pak_dir.join("000_Alpha.pak").exists());
+        assert!(!pak_dir.join("001_Beta.pak").exists());
+        let merged_pak = pak_dir.join(super::CONFLICT_MERGED_FILE);
+        assert!(merged_pak.is_file());
+        assert_eq!(
+            read_pak_file(&paths, &merged_pak, "SCUM/Content/Assets/Shared.uasset"),
+            b"alpha-uasset"
+        );
+        assert_eq!(
+            read_pak_file(&paths, &merged_pak, "SCUM/Content/Assets/Shared.uexp"),
+            b"alpha-uexp"
+        );
+        let manifest = read_manifest(&paths).unwrap();
+        assert_eq!(manifest.files, vec![path_string(&merged_pak)]);
+        assert!(!paths.root.join("~merged").exists());
+
+        reclaim_mods(&paths).unwrap();
+        assert!(!merged_pak.exists());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn invalid_custom_winner_blocks_deployment_and_cleans_staging() {
+        let temp = TempRoot::new("deploy-conflict-winner-failure");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let alpha = build_test_pak(
+            temp.path(),
+            &paths,
+            "Alpha",
+            &[("SCUM/Content/Assets/Shared.uasset", b"alpha")],
+        );
+        let beta = build_test_pak(
+            temp.path(),
+            &paths,
+            "Beta",
+            &[
+                ("SCUM/Content/Assets/Shared.uasset", b"beta"),
+                ("SCUM/Content/Assets/Shared.uexp", b"beta-sidecar"),
+            ],
+        );
+        let mut alpha_mod = mod_entry(&alpha, true, "clientPak");
+        alpha_mod.load_order = 0;
+        let mut beta_mod = mod_entry(&beta, true, "clientPak");
+        beta_mod.load_order = 1;
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut(&alpha_mod.id).pak_entries =
+            vec!["SCUM/Content/Assets/Shared.uasset".to_string()];
+        metadata.entry_mut(&beta_mod.id).pak_entries = vec![
+            "SCUM/Content/Assets/Shared.uasset".to_string(),
+            "SCUM/Content/Assets/Shared.uexp".to_string(),
+        ];
+        metadata.conflict_winners.insert(
+            "scum/content/assets/shared".to_string(),
+            alpha_mod.id.clone(),
+        );
+        save_metadata(&paths, &metadata).unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        let error =
+            deploy_local_mods(&paths, &settings, &[alpha_mod, beta_mod], false).unwrap_err();
+
+        assert!(error.to_string().contains("缺少资源"));
+        assert!(!pak_dir.join("000_Alpha.pak").exists());
+        assert!(!pak_dir.join("001_Beta.pak").exists());
+        assert!(!pak_dir.join(super::CONFLICT_MERGED_FILE).exists());
+        assert!(!paths.deployment_manifest.exists());
+        assert!(!paths.root.join("~merged").exists());
+    }
+
+    #[test]
+    fn deploys_ue4ss_framework_and_mod_then_reclaims_game_copy() {
+        let temp = TempRoot::new("deploy-ue4ss");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&binaries).unwrap();
+        let source = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(source.join("Scripts")).unwrap();
+        fs::write(source.join("Scripts").join("main.lua"), b"print('ok')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&source, true, "ue4ssMod")];
+
+        let deployed_at = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .expect("UE4SS mod should be deployed");
+
+        let ue4ss_target = binaries.join("ue4ss");
+        let mods_txt = ue4ss_target.join("Mods").join("mods.txt");
+        let deployed_mod = ue4ss_target
+            .join("Mods")
+            .join("BetterAI")
+            .join("Scripts")
+            .join("main.lua");
+        assert_eq!(fs::read(binaries.join("dwmapi.dll")).unwrap(), b"proxy");
+        assert_eq!(fs::read(ue4ss_target.join("UE4SS.dll")).unwrap(), b"loader");
+        assert_eq!(
+            fs::read(ue4ss_target.join("UE4SS-settings.ini")).unwrap(),
+            b"[General]\n"
+        );
+        assert_eq!(fs::read(&deployed_mod).unwrap(), b"print('ok')");
+        assert!(fs::read_to_string(&mods_txt)
+            .unwrap()
+            .contains("BetterAI : 1"));
+        assert!(paths
+            .ue4ss_runtime
+            .join("ue4ss")
+            .join("UE4SS.dll")
+            .is_file());
+
+        let manifest = read_manifest(&paths).expect("deployment manifest should exist");
+        assert_eq!(manifest.deployed_at, deployed_at);
+        assert!(manifest.files.contains(&path_string(&deployed_mod)));
+
+        assert!(reclaim_mods(&paths).unwrap() >= 6);
+        assert!(!binaries.join("dwmapi.dll").exists());
+        assert!(!ue4ss_target.join("UE4SS.dll").exists());
+        assert!(!deployed_mod.exists());
+        assert!(!paths.deployment_manifest.exists());
+        assert!(source.join("Scripts").join("main.lua").exists());
+        assert!(paths
+            .ue4ss_runtime
+            .join("ue4ss")
+            .join("UE4SS.dll")
+            .is_file());
+    }
+
+    #[test]
+    fn reclaim_removes_runtime_logs_and_the_deployed_ue4ss_directory() {
+        let temp = TempRoot::new("reclaim-ue4ss-runtime-log");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&binaries).unwrap();
+        let source = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(source.join("Scripts")).unwrap();
+        fs::write(source.join("Scripts").join("main.lua"), b"print('ok')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&source, true, "ue4ssMod")],
+            false,
+        )
+        .unwrap();
+
+        let ue4ss_target = binaries.join("ue4ss");
+        fs::write(ue4ss_target.join("UE4SS.log"), b"runtime log").unwrap();
+        reclaim_mods(&paths).unwrap();
+
+        assert!(!ue4ss_target.exists());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn reclaim_cleans_legacy_ue4ss_runtime_logs_from_an_old_manifest() {
+        let temp = TempRoot::new("reclaim-legacy-ue4ss-log");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let ue4ss_target = install
+            .join("SCUM")
+            .join("Binaries")
+            .join("Win64")
+            .join("ue4ss");
+        fs::create_dir_all(&ue4ss_target).unwrap();
+        fs::write(ue4ss_target.join("UE4SS.log"), b"runtime log").unwrap();
+        let manifest = DeployedManifest {
+            deployed_at: "2026-01-01T00:00:00Z".to_string(),
+            roots: vec![path_string(&install)],
+            files: Vec::new(),
+            directories: vec![path_string(&ue4ss_target)],
+            created_directories: Vec::new(),
+            backups: Vec::new(),
+            ..DeployedManifest::default()
+        };
+        fs::write(
+            &paths.deployment_manifest,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(reclaim_mods(&paths).unwrap(), 0);
+
+        assert!(!ue4ss_target.exists());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn reclaim_preserves_unmanaged_files_in_a_preexisting_ue4ss_directory() {
+        let temp = TempRoot::new("reclaim-ue4ss-unmanaged");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        let ue4ss_target = binaries.join("ue4ss");
+        fs::create_dir_all(&ue4ss_target).unwrap();
+        fs::write(ue4ss_target.join("keep.txt"), b"user data").unwrap();
+        let source = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(source.join("Scripts")).unwrap();
+        fs::write(source.join("Scripts").join("main.lua"), b"print('ok')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&source, true, "ue4ssMod")],
+            false,
+        )
+        .unwrap();
+        fs::write(ue4ss_target.join("UE4SS.log"), b"runtime log").unwrap();
+
+        reclaim_mods(&paths).unwrap();
+
+        assert_eq!(
+            fs::read(ue4ss_target.join("keep.txt")).unwrap(),
+            b"user data"
+        );
+        assert!(!ue4ss_target.join("UE4SS.log").exists());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn bundled_ue4ss_framework_contains_runtime_files() {
+        let archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("ue4ss_framework.zip");
+        let bytes = fs::metadata(&archive_path)
+            .expect("bundled UE4SS framework is missing")
+            .len();
+        assert!(
+            bytes > 1_000_000,
+            "bundled UE4SS framework looks like a test fixture: {bytes} bytes"
+        );
+
+        let archive = zip::ZipArchive::new(File::open(archive_path).unwrap()).unwrap();
+        let names = archive
+            .file_names()
+            .map(|name| name.replace('\\', "/"))
+            .collect::<std::collections::HashSet<_>>();
+        for required in [
+            "ue4ss/LICENSE",
+            "ue4ss/UE4SS.dll",
+            "ue4ss/UE4SS-settings.ini",
+            "ue4ss/UE4SS-settings-SCUM.ini",
+            "ue4ss/Mods/mods.json",
+            "ue4ss/Mods/mods.txt",
+            "dwmapi.dll",
+        ] {
+            assert!(names.contains(required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn reclaim_ignores_manifest_entries_outside_declared_roots() {
+        let temp = TempRoot::new("reclaim-outside");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        fs::create_dir_all(&install).unwrap();
+        let outside = temp.path().join("outside").join("keep.pak");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, b"keep").unwrap();
+        let manifest = DeployedManifest {
+            deployed_at: "2026-01-01T00:00:00Z".to_string(),
+            roots: vec![path_string(&install)],
+            files: vec![path_string(&outside)],
+            directories: Vec::new(),
+            created_directories: Vec::new(),
+            backups: Vec::new(),
+            ..DeployedManifest::default()
+        };
+        fs::write(
+            &paths.deployment_manifest,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(reclaim_mods(&paths).unwrap(), 0);
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn reclaim_ignores_parent_directory_escape_in_manifest() {
+        let temp = TempRoot::new("reclaim-parent-escape");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let outside = temp.path().join("outside").join("keep.pak");
+        fs::create_dir_all(&install).unwrap();
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, b"keep").unwrap();
+        let escaping = install.join("..").join("outside").join("keep.pak");
+        let manifest = DeployedManifest {
+            deployed_at: "2026-01-01T00:00:00Z".to_string(),
+            roots: vec![path_string(&install)],
+            files: vec![path_string(&escaping)],
+            directories: Vec::new(),
+            created_directories: Vec::new(),
+            backups: Vec::new(),
+            ..DeployedManifest::default()
+        };
+        fs::write(
+            &paths.deployment_manifest,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(reclaim_mods(&paths).unwrap(), 0);
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn restores_files_that_were_overwritten_by_framework_deployment() {
+        let temp = TempRoot::new("deploy-backup-restore");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&binaries).unwrap();
+        fs::write(binaries.join("dwmapi.dll"), b"original-proxy").unwrap();
+        let source = paths.ue4ss_mods.join("BetterAI");
+        fs::create_dir_all(source.join("Scripts")).unwrap();
+        fs::write(source.join("Scripts").join("main.lua"), b"print('ok')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&source, true, "ue4ssMod")],
+            false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(binaries.join("dwmapi.dll")).unwrap(), b"proxy");
+        let manifest = read_manifest(&paths).unwrap();
+        assert_eq!(manifest.backups.len(), 1);
+        assert!(Path::new(&manifest.backups[0].backup).is_file());
+
+        reclaim_mods(&paths).unwrap();
+
+        assert_eq!(
+            fs::read(binaries.join("dwmapi.dll")).unwrap(),
+            b"original-proxy"
+        );
+        assert!(!Path::new(&manifest.backups[0].backup).exists());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn rolls_back_files_copied_before_a_later_deployment_error() {
+        let temp = TempRoot::new("deploy-partial-rollback");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let first = paths.local_mods.join("First.pak");
+        let second = paths.local_mods.join("Second.pak");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::create_dir_all(pak_dir.join("001_Second.pak")).unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+        let mods = vec![
+            mod_entry(&first, true, "clientPak"),
+            mod_entry(&second, true, "clientPak"),
+        ];
+
+        let error = deploy_local_mods(&paths, &settings, &mods, false).unwrap_err();
+
+        assert!(error.to_string().contains("不是文件"));
+        assert!(!pak_dir.join("000_First.pak").exists());
+        assert!(pak_dir.join("001_Second.pak").is_dir());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn reclaim_keeps_manifest_when_a_deployed_file_cannot_be_removed() {
+        let temp = TempRoot::new("reclaim-failure");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let undeletable = install.join("locked.pak");
+        fs::create_dir_all(&undeletable).unwrap();
+        let manifest = DeployedManifest {
+            deployed_at: "2026-01-01T00:00:00Z".to_string(),
+            roots: vec![path_string(&install)],
+            files: vec![path_string(&undeletable)],
+            directories: Vec::new(),
+            created_directories: Vec::new(),
+            backups: Vec::new(),
+            ..DeployedManifest::default()
+        };
+        fs::write(
+            &paths.deployment_manifest,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = reclaim_mods(&paths).unwrap_err().to_string();
+
+        assert!(error.contains("回收未完成"));
+        let remaining = read_manifest(&paths).expect("failed manifest must remain");
+        assert_eq!(remaining.files, vec![path_string(&undeletable)]);
+    }
+
+    #[test]
+    fn rescue_never_overwrites_an_existing_local_pak() {
+        let temp = TempRoot::new("rescue-no-overwrite");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::write(pak_dir.join("Shared.pak"), b"from-game").unwrap();
+        fs::write(paths.local_mods.join("Shared.pak"), b"local-copy").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        let result = rescue_mods_from_game(&paths, &settings).unwrap();
+
+        assert_eq!(result.rescued, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(
+            fs::read(paths.local_mods.join("Shared.pak")).unwrap(),
+            b"local-copy"
+        );
+    }
+
+    #[test]
+    fn rescue_skips_files_owned_by_the_deployment_manifest() {
+        let temp = TempRoot::new("rescue-managed-deploy-prefix");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        let managed = pak_dir.join("000_Managed.pak");
+        fs::write(&managed, b"managed").unwrap();
+        let manifest = DeployedManifest {
+            deployed_at: "2026-01-01T00:00:00Z".to_string(),
+            roots: vec![path_string(&install)],
+            files: vec![path_string(&managed)],
+            directories: Vec::new(),
+            created_directories: Vec::new(),
+            backups: Vec::new(),
+            ..DeployedManifest::default()
+        };
+        fs::write(
+            &paths.deployment_manifest,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        let result = rescue_mods_from_game(&paths, &settings).unwrap();
+
+        assert_eq!(result.rescued, 0);
+        assert_eq!(result.skipped, 0);
+        assert!(!paths.local_mods.join("000_Managed.pak").exists());
+    }
+
+    #[test]
+    fn rescue_does_not_import_managed_merged_paks() {
+        let temp = TempRoot::new("rescue-managed-merged");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::write(pak_dir.join(super::CONFLICT_MERGED_FILE), b"merged").unwrap();
+        fs::write(pak_dir.join("Normal.pak"), b"normal").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            ..AppSettings::default()
+        };
+
+        let result = rescue_mods_from_game(&paths, &settings).unwrap();
+
+        assert_eq!(result.rescued, 1);
+        assert!(paths.local_mods.join("Normal.pak").is_file());
+        assert!(!paths.local_mods.join(super::CONFLICT_MERGED_FILE).exists());
+    }
+
+    /// 造一个装在 `ue4ss_mods` 下的目录模组：目录名 = 磁盘名，`marker` 决定是否预置
+    /// UE4SS 的 `enabled.txt`（C++ mod 包通常自带这个文件）。
+    fn ue4ss_dir_mod(
+        paths: &crate::paths::AppPaths,
+        folder: &str,
+        enabled: bool,
+        marker: bool,
+    ) -> ModEntry {
+        let directory = paths.ue4ss_mods.join(folder);
+        fs::create_dir_all(directory.join("dlls")).unwrap();
+        fs::write(directory.join("dlls").join("main.dll"), b"dll").unwrap();
+        if marker {
+            fs::write(directory.join(super::UE4SS_ENABLED_MARKER), b"enabled").unwrap();
+        }
+        mod_entry(&directory, enabled, "ue4ssMod")
+    }
+
+    #[test]
+    fn ue4ss_mods_txt_preserves_unmanaged_lines_and_replaces_stale_entries() {
+        let temp = TempRoot::new("ue4ss-mods-txt");
+        let paths = temp.paths();
+        let mods_txt = paths.ue4ss_mods.join("mods.txt");
+        let managed_path = paths.ue4ss_mods.join(".scum_mm_managed.txt");
+        fs::write(&mods_txt, "OtherMod : 1\nOldManaged : 0\nKeybinds : 1\n").unwrap();
+        fs::write(
+            &managed_path,
+            base64::engine::general_purpose::STANDARD.encode("OldManaged"),
+        )
+        .unwrap();
+        let mods = vec![
+            ue4ss_dir_mod(&paths, "EnabledMod", true, true),
+            ue4ss_dir_mod(&paths, "DisabledMod", false, true),
+        ];
+
+        let changed = sync_ue4ss_state(&paths, &mods).unwrap();
+
+        let lines: Vec<String> = fs::read_to_string(&mods_txt)
+            .unwrap()
+            .lines()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "OtherMod : 1",
+                "EnabledMod : 1",
+                "DisabledMod : 0",
+                "Keybinds : 1"
+            ]
+        );
+        let managed = fs::read_to_string(&managed_path).unwrap();
+        assert!(managed.contains(&base64::engine::general_purpose::STANDARD.encode("EnabledMod")));
+        assert!(managed.contains(&base64::engine::general_purpose::STANDARD.encode("DisabledMod")));
+        assert!(!managed.contains("OldManaged"));
+        assert!(changed > 0);
+        // 幂等：内容没变就不落盘，否则 library_watch 会被自己写出来的文件反复唤醒。
+        assert_eq!(sync_ue4ss_state(&paths, &mods).unwrap(), 0);
+    }
+
+    /// UE4SS 3.x 的第二趟遍历只要看到 `enabled.txt` 就启动模组，`: 0` 完全绕过它。
+    /// 停用必须把作者自带的标记文件删掉，否则「关掉了却还在跑」。
+    #[test]
+    fn ue4ss_disable_removes_enabled_marker_shipped_with_mod() {
+        let temp = TempRoot::new("ue4ss-marker");
+        let paths = temp.paths();
+        let marker = |folder: &str| {
+            paths
+                .ue4ss_mods
+                .join(folder)
+                .join(super::UE4SS_ENABLED_MARKER)
+        };
+        let mut keep = ue4ss_dir_mod(&paths, "KeepRunning", true, true);
+        let mut stop = ue4ss_dir_mod(&paths, "StopMe", true, true);
+
+        sync_ue4ss_state(&paths, &[keep.clone(), stop.clone()]).unwrap();
+        assert!(marker("KeepRunning").is_file());
+        assert!(marker("StopMe").is_file());
+
+        stop.enabled = false;
+        sync_ue4ss_state(&paths, &[keep.clone(), stop]).unwrap();
+        assert!(marker("KeepRunning").is_file());
+        assert!(
+            !marker("StopMe").exists(),
+            "停用后必须删掉 enabled.txt，否则 UE4SS 仍然会加载它"
+        );
+
+        // 再启用回来：标记要补上，不能只剩 mods.txt 一行（行名对不上时不会加载）。
+        keep.enabled = false;
+        sync_ue4ss_state(&paths, &[keep.clone()]).unwrap();
+        assert!(!marker("KeepRunning").exists());
+        keep.enabled = true;
+        sync_ue4ss_state(&paths, &[keep]).unwrap();
+        assert!(marker("KeepRunning").is_file());
+    }
+
+    /// UE4SS 用目录名匹配 mods.txt，云端显示名（可能含空格）写进去是废行。
+    #[test]
+    fn ue4ss_mods_txt_uses_folder_name_not_display_name() {
+        let temp = TempRoot::new("ue4ss-display-name");
+        let paths = temp.paths();
+        let mut item = ue4ss_dir_mod(&paths, "VehicleAutoDrive", true, false);
+        item.name = "车辆自动驾驶 增强".to_string();
+
+        sync_ue4ss_state(&paths, &[item]).unwrap();
+
+        let content = fs::read_to_string(paths.ue4ss_mods.join("mods.txt")).unwrap();
+        assert!(content.contains("VehicleAutoDrive : 1"), "{content}");
+        assert!(!content.contains("车辆自动驾驶"), "{content}");
+        assert!(paths
+            .ue4ss_mods
+            .join("VehicleAutoDrive")
+            .join(super::UE4SS_ENABLED_MARKER)
+            .is_file());
+    }
+
+    #[test]
+    fn deployment_fingerprint_ignores_mtime_when_content_hash_is_present() {
+        let mut alpha = mod_entry(std::path::Path::new("C:/mods/Alpha.pak"), true, "clientPak");
+        alpha.sha256 = "a".repeat(64);
+        alpha.last_modified = "2026-01-01T00:00:00Z".to_string();
+        let mut reimported = alpha.clone();
+        // 同内容重导入：mtime 被抬高，内容哈希不变。
+        reimported.last_modified = "2026-06-01T00:00:00Z".to_string();
+
+        assert_eq!(
+            deployment_fingerprint(
+                std::path::Path::new("C:/game"),
+                false,
+                &[alpha.clone()],
+                None
+            ),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[reimported], None),
+            "同内容重导入不应让部署指纹失效"
+        );
+
+        let mut changed = alpha.clone();
+        changed.sha256 = "b".repeat(64);
+        assert_ne!(
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[alpha], None),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[changed], None),
+            "内容变化必须让部署指纹失效"
+        );
+    }
+
+    #[test]
+    fn deployment_fingerprint_falls_back_to_mtime_without_content_hash() {
+        let mut alpha = mod_entry(std::path::Path::new("C:/mods/DllMod"), true, "ue4ssMod");
+        alpha.sha256 = String::new();
+        alpha.last_modified = "2026-01-01T00:00:00Z".to_string();
+        let mut retouched = alpha.clone();
+        retouched.last_modified = "2026-06-01T00:00:00Z".to_string();
+
+        assert_ne!(
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[alpha], None),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &[retouched], None),
+            "没有内容哈希的条目仍按 mtime 判定变化"
+        );
+    }
+
+    #[test]
+    fn deployment_fingerprint_still_changes_when_duplicate_canonical_flips() {
+        // 两个字节相同的 PAK，load_order 不同会折叠出不同 canonical（文件名不同）。
+        let mut alpha = mod_entry(std::path::Path::new("C:/mods/Alpha.pak"), true, "clientPak");
+        alpha.sha256 = "a".repeat(64);
+        alpha.load_order = 0;
+        let mut zeta = mod_entry(std::path::Path::new("C:/mods/Zeta.pak"), true, "clientPak");
+        zeta.sha256 = "a".repeat(64);
+        zeta.load_order = 1;
+
+        let canonical_a = super::super::duplicates::collapse_identical_mods(
+            vec![zeta.clone(), alpha.clone()],
+            &crate::metadata::MetadataFile::default(),
+        );
+        let mut swapped = zeta.clone();
+        swapped.load_order = 0;
+        let mut swapped_alpha = alpha.clone();
+        swapped_alpha.load_order = 1;
+        let canonical_b = super::super::duplicates::collapse_identical_mods(
+            vec![swapped, swapped_alpha],
+            &crate::metadata::MetadataFile::default(),
+        );
+
+        assert_ne!(
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &canonical_a, None),
+            deployment_fingerprint(std::path::Path::new("C:/game"), false, &canonical_b, None),
+            "canonical 不同（部署文件名不同）时指纹必须不同"
+        );
+    }
+
+    fn build_test_pak(
+        root: &Path,
+        paths: &crate::paths::AppPaths,
+        label: &str,
+        entries: &[(&str, &[u8])],
+    ) -> PathBuf {
+        let input = root.join(format!("{label}-input"));
+        for (relative, body) in entries {
+            let path = input.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        let pak = root.join(format!("{label}.pak"));
+        let output = Command::new(paths.resource("repak.exe"))
+            .arg("pack")
+            .arg("-m")
+            .arg("../../../")
+            .arg(&input)
+            .arg(&pak)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "repak pack failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        pak
+    }
+
+    fn read_pak_file(paths: &crate::paths::AppPaths, pak: &Path, resource: &str) -> Vec<u8> {
+        let output = Command::new(paths.resource("repak.exe"))
+            .arg("get")
+            .arg("--")
+            .arg(pak)
+            .arg(resource)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "repak get failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+}

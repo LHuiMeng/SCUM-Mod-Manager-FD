@@ -1,0 +1,176 @@
+use crate::paths::AppPaths;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+
+fn default_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModMetadata {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub tags: Vec<String>,
+    pub notes: String,
+    pub sha256: String,
+    #[serde(alias = "pak_entries")]
+    pub pak_entries: Vec<String>,
+    pub conflicts: HashMap<String, Vec<String>>,
+    /// 云端目录给出的显示名。磁盘名可能被清洗过，显示名不能跟着变。
+    pub name: Option<String>,
+    /// 用户重命名过磁盘条目：显示名必须继续跟随文件名，云端目录也不能覆盖。
+    #[serde(alias = "nameFromFileName")]
+    pub name_from_file_name: bool,
+    #[serde(alias = "file_size")]
+    pub file_size: Option<u64>,
+    #[serde(alias = "modified_at")]
+    pub modified_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetadataFile {
+    #[serde(rename = "__order__", default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    #[serde(
+        rename = "__conflict_winners__",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub conflict_winners: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub entries: BTreeMap<String, ModMetadata>,
+}
+
+impl MetadataFile {
+    pub fn entry_mut(&mut self, id: &str) -> &mut ModMetadata {
+        self.entries
+            .entry(id.to_string())
+            .or_insert_with(|| ModMetadata {
+                enabled: true,
+                ..ModMetadata::default()
+            })
+    }
+}
+
+pub fn load_metadata(paths: &AppPaths) -> Result<MetadataFile> {
+    if !paths.metadata_file.exists() && !crate::paths::backup_path_of(&paths.metadata_file).exists()
+    {
+        return Ok(MetadataFile::default());
+    }
+    let primary_error = match read_metadata_at(&paths.metadata_file) {
+        Ok(metadata) => return Ok(metadata),
+        Err(error) => error,
+    };
+    let backup = crate::paths::backup_path_of(&paths.metadata_file);
+    match read_metadata_at(&backup) {
+        Ok(metadata) => {
+            eprintln!(
+                "mods_meta.json 解析失败，已回退到 {}：{primary_error:#}",
+                backup.display()
+            );
+            Ok(metadata)
+        }
+        Err(_) => Err(primary_error),
+    }
+}
+
+fn read_metadata_at(path: &Path) -> Result<MetadataFile> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("无法读取 {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(MetadataFile::default());
+    }
+    serde_json::from_str(&text).with_context(|| format!("{} 格式无效", path.display()))
+}
+
+pub fn save_metadata_at(path: &Path, metadata: &MetadataFile) -> Result<()> {
+    let json = serde_json::to_string_pretty(metadata)?;
+    crate::paths::write_state_file(path, format!("{json}\n").as_bytes())
+        .with_context(|| format!("无法写入 {}", path.display()))?;
+    Ok(())
+}
+
+pub fn save_metadata(paths: &AppPaths, metadata: &MetadataFile) -> Result<()> {
+    save_metadata_at(&paths.metadata_file, metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_metadata, save_metadata, MetadataFile};
+    use crate::test_support::TempRoot;
+
+    #[test]
+    fn persists_order_enabled_tags_and_notes() {
+        let temp = TempRoot::new("metadata-persistence");
+        let paths = temp.paths();
+        let mut metadata = MetadataFile {
+            order: vec!["second".to_string(), "first".to_string()],
+            ..MetadataFile::default()
+        };
+        metadata
+            .conflict_winners
+            .insert("scum/content/shared".to_string(), "second".to_string());
+        let second = metadata.entry_mut("second");
+        second.enabled = false;
+        second.tags = vec!["server".to_string(), "balance".to_string()];
+        second.notes = "测试备注".to_string();
+        let first = metadata.entry_mut("first");
+        first.enabled = true;
+        first.tags = vec!["client".to_string()];
+        first.notes = "keep enabled".to_string();
+
+        save_metadata(&paths, &metadata).unwrap();
+        let loaded = load_metadata(&paths).unwrap();
+
+        assert_eq!(loaded.order, vec!["second", "first"]);
+        assert_eq!(
+            loaded.conflict_winners["scum/content/shared"],
+            "second".to_string()
+        );
+        assert!(!loaded.entries["second"].enabled);
+        assert_eq!(loaded.entries["second"].tags, vec!["server", "balance"]);
+        assert_eq!(loaded.entries["second"].notes, "测试备注");
+        assert!(loaded.entries["first"].enabled);
+        assert_eq!(loaded.entries["first"].tags, vec!["client"]);
+        assert_eq!(loaded.entries["first"].notes, "keep enabled");
+    }
+
+    #[test]
+    fn missing_enabled_field_defaults_to_true() {
+        let temp = TempRoot::new("metadata-default-enabled");
+        let paths = temp.paths();
+        std::fs::write(
+            &paths.metadata_file,
+            r#"{"__order__":["demo"],"demo":{"tags":[],"notes":""}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_metadata(&paths).unwrap();
+
+        assert!(loaded.entries["demo"].enabled);
+    }
+
+    #[test]
+    fn conflict_winners_use_the_reserved_metadata_key() {
+        let temp = TempRoot::new("metadata-conflict-winners");
+        let paths = temp.paths();
+        let mut metadata = MetadataFile::default();
+        metadata.entry_mut("demo");
+        metadata
+            .conflict_winners
+            .insert("scum/content/demo".to_string(), "demo".to_string());
+
+        save_metadata(&paths, &metadata).unwrap();
+        let text = std::fs::read_to_string(&paths.metadata_file).unwrap();
+        assert!(text.contains("\"__conflict_winners__\""));
+        assert!(!text.contains("\"conflictWinners\""));
+
+        let loaded = load_metadata(&paths).unwrap();
+        assert_eq!(loaded.conflict_winners["scum/content/demo"], "demo");
+        assert!(loaded.entries.contains_key("demo"));
+        assert!(!loaded.entries.contains_key("__conflict_winners__"));
+    }
+}

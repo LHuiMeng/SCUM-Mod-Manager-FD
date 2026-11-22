@@ -1,0 +1,87 @@
+param(
+  [ValidateSet("public", "server", "both")]
+  [string]$Edition = "both",
+
+  [switch]$NoCloudSources
+)
+
+$ErrorActionPreference = "Stop"
+$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$runtimeSecret = Join-Path $root "secrets\runtime.toml"
+$outputRoot = Join-Path $root "release-output"
+
+if ($NoCloudSources -and $Edition -ne "public") {
+  throw "-NoCloudSources is only supported with -Edition public."
+}
+
+function Assert-CloudSources {
+  if (-not (Test-Path -LiteralPath $runtimeSecret -PathType Leaf)) {
+    throw "Release build requires secrets/runtime.toml with [cloud].base_urls."
+  }
+  $secretText = Get-Content -LiteralPath $runtimeSecret -Raw
+  if ($secretText -notmatch '(?ms)^\s*base_urls\s*=\s*\[(?<urls>.*?)\]') {
+    throw "Release build requires [cloud].base_urls in secrets/runtime.toml."
+  }
+  if ($Matches.urls -notmatch 'https://') {
+    throw "Release build requires at least one HTTPS URL in [cloud].base_urls."
+  }
+}
+
+function Build-Edition([string]$Name) {
+  if (-not $NoCloudSources) {
+    Assert-CloudSources
+  }
+  if ($Name -eq "server" -and -not (Test-Path -LiteralPath $runtimeSecret -PathType Leaf)) {
+    throw "Server build requires secrets/runtime.toml with [cloud].auth_token."
+  }
+  if ($Name -eq "server") {
+    $secretText = Get-Content -LiteralPath $runtimeSecret -Raw
+    if ($secretText -notmatch '(?m)^\s*(?:auth_token|catalog_token|gate_token)\s*=\s*"[^"]+"\s*$') {
+      throw "Server build requires a non-empty shared key in secrets/runtime.toml."
+    }
+  }
+
+  $config = Join-Path $root "src-tauri\tauri.$Name.conf.json"
+  if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
+    throw "Missing Tauri config: $config"
+  }
+
+  $env:SCUM_EDITION = $Name
+  if ($NoCloudSources) {
+    $env:SCUM_DISABLE_PACKAGED_CLOUD_SOURCES = "1"
+  }
+  try {
+    npm run tauri build -- --config $config
+    if ($LASTEXITCODE -ne 0) {
+      throw "Tauri $Name build failed with exit code $LASTEXITCODE."
+    }
+  } finally {
+    Remove-Item Env:SCUM_EDITION -ErrorAction SilentlyContinue
+    Remove-Item Env:SCUM_DISABLE_PACKAGED_CLOUD_SOURCES -ErrorAction SilentlyContinue
+  }
+
+  $bundleRoot = Join-Path $root "src-tauri\target\release\bundle\nsis"
+  $installer = Get-ChildItem -LiteralPath $bundleRoot -Filter "*.exe" -File |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if (-not $installer) {
+    throw "No NSIS installer was produced for $Name."
+  }
+
+  $destination = Join-Path $outputRoot $Name
+  New-Item -ItemType Directory -Path $destination -Force | Out-Null
+  Copy-Item -LiteralPath $installer.FullName -Destination $destination -Force
+  Write-Host "$Name installer: $(Join-Path $destination $installer.Name)"
+}
+
+npm run build
+if ($LASTEXITCODE -ne 0) {
+  throw "Frontend build failed with exit code $LASTEXITCODE."
+}
+
+if ($Edition -eq "public" -or $Edition -eq "both") {
+  Build-Edition "public"
+}
+if ($Edition -eq "server" -or $Edition -eq "both") {
+  Build-Edition "server"
+}

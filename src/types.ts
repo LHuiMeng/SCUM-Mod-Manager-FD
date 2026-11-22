@@ -1,0 +1,424 @@
+export type ThemeMode = "light" | "dark";
+export type Language = "zh-CN" | "en-US";
+export type NavSection = "library" | "cloud" | "server" | "backups" | "logs" | "settings";
+export type AppEdition = "public" | "server";
+export type ModType =
+  | "clientPak"
+  | "serverPak"
+  | "ue4ssMod"
+  | "configFile"
+  | "script"
+  | "other";
+
+export interface ModEntry {
+  id: string;
+  name: string;
+  author?: string | null;
+  fileName: string;
+  filePath: string;
+  fileSize: number;
+  lastModified: string;
+  enabled: boolean;
+  type: ModType;
+  loadOrder: number;
+  tags: string[];
+  notes: string;
+  sha256: string;
+  originSource: "local" | "cloud";
+  deployed: boolean;
+  description: string;
+  conflictCount: number;
+  fileCount: number;
+  overriddenFileCount: number;
+  overridingFileCount: number;
+  fullyOverridden: boolean;
+  updateVersion?: string | null;
+  coverUrl?: string | null;
+  duplicateCount?: number;
+  duplicateAliases?: string[];
+}
+
+export interface ConflictOwner {
+  id: string;
+  name: string;
+  loadOrder: number;
+  type: ModType;
+}
+
+export interface ConflictGroup {
+  key: string;
+  paths: string[];
+  owners: ConflictOwner[];
+  defaultWinnerId: string;
+  winnerId: string;
+  selectedWinnerId?: string | null;
+}
+
+export interface LaunchOptions {
+  log: boolean;
+  fileOpenLog: boolean;
+  noBattlEye: boolean;
+  port: string;
+}
+
+export interface CloudSettings {
+  baseUrls: string[];
+  activeBaseUrl: string;
+  maxDownloadSegments: number;
+}
+
+export interface SftpAccount {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  modsPath: string;
+  ue4ssPath: string;
+  hasPassword: boolean;
+}
+
+export interface AppSettings {
+  scumInstallPath: string;
+  serverInstallPath: string;
+  theme: ThemeMode;
+  language: Language;
+  keepDeployedModsOnExit: boolean;
+  useDeployLinks: boolean;
+  autoMergeConflicts: boolean;
+  launchOptions: LaunchOptions;
+  cloud: CloudSettings;
+  sftpAccounts: SftpAccount[];
+  activeSftpAccountId: string | null;
+}
+
+export interface GameStatus {
+  running: boolean;
+  mode: "client" | "server" | null;
+  pid: number | null;
+  startedAt: string | null;
+}
+
+export interface LibrarySnapshot {
+  mods: ModEntry[];
+  conflicts: ConflictGroup[];
+  settings: AppSettings;
+  gameStatus: GameStatus;
+  lastDeployedAt: string | null;
+  lastScannedAt: string | null;
+  localModsPath: string;
+  clientModsPath: string;
+}
+
+export interface RenameModResult {
+  snapshot: LibrarySnapshot;
+  previousId: string;
+  id: string;
+  name: string;
+}
+
+export interface RuntimeLog {
+  id: number;
+  timestamp: string;
+  level: "info" | "warn" | "error" | "debug";
+  target: string;
+  message: string;
+}
+
+export interface RemoteMod {
+  id: string;
+  name: string;
+  author: string;
+  version: string;
+  description: string;
+  fileSize: number;
+  downloadUrl: string;
+  sha256: string;
+  tags: string[];
+  updatedAt: string;
+  type: ModType;
+  installed: boolean;
+  coverUrl?: string | null;
+}
+
+export type CloudDownloadPhase =
+  | "queued"
+  | "preparing"
+  | "downloading"
+  | "verifying"
+  | "installing"
+  | "completed"
+  | "error";
+
+export interface CloudDownloadProgress {
+  id: string;
+  phase: CloudDownloadPhase;
+  downloaded: number;
+  total: number | null;
+  segments: number;
+  message?: string | null;
+}
+
+export interface RemoteFile {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size: number;
+  modifiedAt: string | null;
+}
+
+export interface SftpConnectionResult {
+  ok: boolean;
+  message: string;
+  detectedModsPath?: string | null;
+  detectedUe4ssPath?: string | null;
+  pakMods: RemoteFile[];
+  ue4ssMods: RemoteFile[];
+  scannedDirectories: number;
+  homePath?: string | null;
+  managedManifest?: SftpManagedManifest | null;
+  hostKeyFingerprint: string | null;
+  requiresTrust: boolean;
+}
+
+export type SftpUploadKind = "pak" | "ue4ss";
+
+export interface SftpOperationResult {
+  message: string;
+  path: string;
+}
+
+export interface SftpConflictOwner {
+  name: string;
+  path: string;
+  kind: "pak" | "ue4ss";
+}
+
+export interface SftpConflictGroup {
+  resourcePath: string;
+  owners: SftpConflictOwner[];
+}
+
+export interface SftpConflictReport {
+  groups: SftpConflictGroup[];
+  analyzedMods: number;
+  skippedMods: number;
+  message: string;
+}
+
+export interface SftpConflictProgress {
+  phase: "preparing" | "downloading" | "parsing" | "completed" | "error";
+  completedFiles: number;
+  totalFiles: number;
+  completedBytes: number;
+  totalBytes: number;
+  currentFile?: string | null;
+  message: string;
+}
+
+export interface SftpUploadProgress {
+  file: string;
+  completedFiles: number;
+  totalFiles: number;
+  completedBytes: number;
+  totalBytes: number;
+  message: string;
+}
+
+export interface RemoteDirectoryUsage {
+  path: string;
+  bytes: number;
+  files: number;
+  truncated: boolean;
+}
+
+export interface ModConfigFile {
+  name: string;
+  relativePath: string;
+  size: number;
+  editable: boolean;
+  managedByApp: boolean;
+}
+
+export interface ModConfigFileContent {
+  relativePath: string;
+  content: string;
+  size: number;
+  modifiedAt?: string | null;
+  editable: boolean;
+}
+
+export interface SftpOperationProgress {
+  kind: string;
+  phase: string;
+  message: string;
+  completed: number;
+  total: number;
+  unit: string;
+  currentItem?: string | null;
+  finished: boolean;
+}
+
+export interface SftpManagedSource {
+  name: string;
+  path: string;
+}
+
+export interface SftpManagedBackup {
+  name: string;
+  originalPath: string;
+  backupPath: string;
+  reason: string;
+}
+
+export interface SftpManagedRename {
+  name: string;
+  originalPath: string;
+  deployedPath: string;
+  hasSignature: boolean;
+}
+
+export interface SftpManagedManifest {
+  version: number;
+  createdAt: string;
+  mergedPath?: string | null;
+  mergedName?: string | null;
+  sources: SftpManagedSource[];
+  backups: SftpManagedBackup[];
+  renames: SftpManagedRename[];
+  createdPaths: string[];
+  winners: Record<string, string>;
+  provenancePaths?: string[];
+}
+
+export interface SftpPrepareResult {
+  required: boolean;
+  hasConflicts: boolean;
+  analyzedMods: number;
+  mergedSources: SftpManagedSource[];
+  backupCount: number;
+  deleteCount: number;
+  renameCount: number;
+  mergedBytes: number;
+  provenancePath: string;
+  message: string;
+}
+
+export interface PendingLink {
+  path: string;
+  target: string;
+  kind: string;
+}
+
+export interface BackupEntry {
+  id: string;
+  kind: "deleted" | "import" | "replaced" | "deploy" | string;
+  name: string;
+  path: string;
+  size: number;
+  createdAt: string;
+  detail: string;
+  restorable: boolean;
+}
+
+export interface CrashSuspect {
+  modId: string;
+  name: string;
+  reason: string;
+  lines: string[];
+}
+
+export interface CrashReport {
+  abnormal: boolean;
+  cause: string;
+  summary: string;
+  logPath?: string | null;
+  ue4ssLogPath?: string | null;
+  evidence: string[];
+  suspects: CrashSuspect[];
+  suggestions: string[];
+}
+
+export interface ReclaimProgress {
+  phase: "waiting" | "still-waiting";
+  file: string;
+  waitedMs: number;
+  message: string;
+}
+
+export interface SftpApplyResult {
+  message: string;
+  manifest: SftpManagedManifest;
+}
+
+export interface ImportResult {
+  imported: number;
+  skipped: number;
+  message: string;
+}
+
+export interface ConflictMergeResult {
+  required: boolean;
+  cacheHit: boolean;
+  rebuilt: boolean;
+  sourceMods: number;
+  entries: number;
+  bytes: number;
+  message: string;
+}
+
+export interface ImportConflict {
+  sourcePath: string;
+  fileName: string;
+  targetPath: string;
+}
+
+export interface AppInfo {
+  version: string;
+  dataRoot: string;
+  secretsPath: string;
+  platform: string;
+  edition: AppEdition;
+}
+
+export interface LocaleBundle {
+  language: Language;
+  messages: Record<string, string>;
+  source: "bundled" | "user" | "mixed";
+  localeDirectory: string;
+  warnings: string[];
+}
+
+export interface AppUpdateInfo {
+  configured: boolean;
+  currentVersion: string;
+  available: boolean;
+  version: string | null;
+  publishedAt: string | null;
+  notes: string | null;
+  size: number | null;
+}
+
+export type AppUpdatePhase =
+  | "idle"
+  | "checking"
+  | "up-to-date"
+  | "available"
+  | "downloading"
+  | "verifying"
+  | "installing"
+  | "unconfigured"
+  | "error";
+
+export interface AppUpdateProgress {
+  phase: "downloading" | "verifying" | "installing";
+  downloaded: number;
+  total: number | null;
+}
+
+export interface ToastMessage {
+  id: number;
+  tone: "default" | "success" | "error";
+  title: string;
+  detail?: string;
+}

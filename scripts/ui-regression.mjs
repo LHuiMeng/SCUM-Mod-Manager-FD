@@ -1,0 +1,2011 @@
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import WebSocket from "ws";
+
+const root = path.resolve(import.meta.dirname, "..");
+const outDir = path.join(root, "test-artifacts", "ui-regression");
+const children = [];
+let activeSocket = null;
+let browserProfile = null;
+
+fs.mkdirSync(outDir, { recursive: true });
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close(error => (error ? reject(error) : resolve(port)));
+    });
+  });
+}
+
+async function waitForHttp(url, timeout = 30000) {
+  const deadline = Date.now() + timeout;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) return;
+    } catch (error) {
+      lastError = error;
+    }
+    await wait(150);
+  }
+  throw new Error(`等待 ${url} 超时：${lastError ?? "无响应"}`);
+}
+
+function browserExecutable() {
+  const candidates = [
+    process.env.EDGE_PATH,
+    process.env["ProgramFiles(x86)"]
+      ? path.join(process.env["ProgramFiles(x86)"], "Microsoft", "Edge", "Application", "msedge.exe")
+      : null,
+    process.env.ProgramFiles
+      ? path.join(process.env.ProgramFiles, "Microsoft", "Edge", "Application", "msedge.exe")
+      : null,
+    process.env.LOCALAPPDATA
+      ? path.join(process.env.LOCALAPPDATA, "Microsoft", "Edge", "Application", "msedge.exe")
+      : null,
+    process.env.ProgramFiles
+      ? path.join(process.env.ProgramFiles, "Google", "Chrome", "Application", "chrome.exe")
+      : null,
+  ].filter(Boolean);
+  const found = candidates.find(candidate => fs.existsSync(candidate));
+  if (!found) {
+    throw new Error("未找到 Microsoft Edge 或 Google Chrome，无法运行浏览器回归测试。");
+  }
+  return found;
+}
+
+function killTree(child) {
+  if (!child?.pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+  } else {
+    child.kill("SIGTERM");
+  }
+}
+
+async function connect(url, appUrl) {
+  const socket = new WebSocket(url);
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  activeSocket = socket;
+  let sequence = 0;
+  const pending = new Map();
+  const consoleErrors = [];
+  const runtimeErrors = [];
+  const pageErrors = [];
+
+  socket.on("message", raw => {
+    const message = JSON.parse(raw.toString());
+    if (message.id && pending.has(message.id)) {
+      const { resolve, reject } = pending.get(message.id);
+      pending.delete(message.id);
+      if (message.error) reject(new Error(JSON.stringify(message.error)));
+      else resolve(message.result);
+      return;
+    }
+    if (message.method === "Runtime.consoleAPICalled" && message.params.type === "error") {
+      consoleErrors.push(
+        message.params.args.map(item => item.value ?? item.description ?? "").join(" "),
+      );
+    }
+    if (message.method === "Runtime.exceptionThrown") {
+      runtimeErrors.push(
+        `${message.params.exceptionDetails.text}: ${
+          message.params.exceptionDetails.exception?.description ?? ""
+        }`,
+      );
+    }
+    if (message.method === "Log.entryAdded" && message.params.entry.level === "error") {
+      const url = message.params.entry.url ?? "";
+      if (!url.endsWith("/favicon.ico")) {
+        pageErrors.push({ text: message.params.entry.text, url });
+      }
+    }
+  });
+
+  const send = (method, params = {}) =>
+    new Promise((resolve, reject) => {
+      const id = ++sequence;
+      pending.set(id, { resolve, reject });
+      socket.send(JSON.stringify({ id, method, params }));
+    });
+
+  async function evaluate(expression) {
+    const result = await send("Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true,
+    });
+    if (result.exceptionDetails) {
+      throw new Error(
+        result.exceptionDetails.exception?.description ?? result.exceptionDetails.text,
+      );
+    }
+    return result.result?.value;
+  }
+
+  async function waitFor(expression, timeout = 7000) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (await evaluate(`Boolean(${expression})`)) return;
+      await wait(80);
+    }
+    throw new Error(`等待超时：${expression}`);
+  }
+
+  async function clickAria(label) {
+    const clicked = await evaluate(`(() => {
+      const button = document.querySelector(${JSON.stringify(`button[aria-label="${label}"]`)});
+      if (!button) return false;
+      button.click();
+      return true;
+    })()`);
+    if (!clicked) throw new Error(`找不到按钮 aria-label=${label}`);
+  }
+
+  async function clickText(text, selector = "button") {
+    const clicked = await evaluate(`(() => {
+      const element = [...document.querySelectorAll(${JSON.stringify(selector)})]
+        .find(item => item.innerText.trim().includes(${JSON.stringify(text)}));
+      if (!element) return false;
+      element.click();
+      return true;
+    })()`);
+    if (!clicked) throw new Error(`找不到文本按钮：${text}`);
+  }
+
+  async function setInput(placeholder, value, selector = "input") {
+    const changed = await evaluate(`(() => {
+      const input = document.querySelector(${JSON.stringify(`${selector}[placeholder="${placeholder}"]`)});
+      if (!input) return false;
+      const proto = input instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(input, ${JSON.stringify(value)});
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+    if (!changed) throw new Error(`找不到输入框：${placeholder}`);
+  }
+
+  async function setInputByLabel(labelText, value) {
+    const changed = await evaluate(`(() => {
+      const label = [...document.querySelectorAll("label")]
+        .find(item => item.innerText.includes(${JSON.stringify(labelText)}));
+      const input = label?.querySelector("input, textarea");
+      if (!input) return false;
+      const proto = input instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(input, ${JSON.stringify(value)});
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+    if (!changed) throw new Error(`找不到字段：${labelText}`);
+  }
+
+  async function navigate(label) {
+    await clickText(label, ".rail-button");
+    const heading = {
+      模组库: "模组库",
+      云端: "云端目录",
+      服务器: "远程服务器",
+      备份找回: "备份找回",
+      日志: "运行日志",
+      设置: "设置",
+    }[label];
+    await waitFor(`document.querySelector("h1")?.innerText === ${JSON.stringify(heading)}`);
+    await wait(150);
+  }
+
+  async function layout() {
+    return evaluate(`(() => {
+      const rect = element => {
+        const box = element?.getBoundingClientRect();
+        return box
+          ? {
+              left: box.left,
+              top: box.top,
+              right: box.right,
+              bottom: box.bottom,
+              width: box.width,
+              height: box.height,
+            }
+          : null;
+      };
+      const labels = ["最小化", "最大化", "关闭"];
+      return {
+        viewport: { width: innerWidth, height: innerHeight },
+        documentWidth: document.documentElement.scrollWidth,
+        bodyWidth: document.body.scrollWidth,
+        bodyHeight: document.body.scrollHeight,
+        title: rect(document.querySelector(".titlebar")),
+        content: rect(document.querySelector(".app-content")),
+        controls: Object.fromEntries(
+          labels.map(label => [
+            label,
+            rect(document.querySelector('button[aria-label="' + label + '"]')),
+          ]),
+        ),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        clipped: [...document.querySelectorAll("h1, button, input, textarea")]
+          .filter(element => {
+            const box = element.getBoundingClientRect();
+            return box.width > 0 && (box.right > innerWidth + 1 || box.left < -1);
+          })
+          .slice(0, 12)
+          .map(element => ({
+            tag: element.tagName,
+            text: (element.innerText || element.value || "").slice(0, 40),
+            className: element.className,
+          })),
+      };
+    })()`);
+  }
+
+  async function screenshot(name) {
+    const result = await send("Page.captureScreenshot", {
+      format: "png",
+      fromSurface: true,
+      captureBeyondViewport: false,
+    });
+    const file = path.join(outDir, `${name}.png`);
+    fs.writeFileSync(file, Buffer.from(result.data, "base64"));
+    return file;
+  }
+
+  const results = [];
+  const screenshots = [];
+  async function test(name, action) {
+    try {
+      const detail = await action();
+      results.push({ name, status: "PASS", detail: detail ?? null });
+    } catch (error) {
+      results.push({ name, status: "FAIL", detail: String(error?.stack ?? error) });
+    }
+  }
+
+  await send("Page.enable");
+  await send("Runtime.enable");
+  await send("Log.enable");
+  await send("Emulation.setDeviceMetricsOverride", {
+    width: 1440,
+    height: 900,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  await send("Page.navigate", { url: appUrl });
+  await waitFor(
+    `location.href.startsWith(${JSON.stringify(appUrl)}) &&
+      document.readyState === "complete" &&
+      document.querySelector("h1") !== null`,
+    10000,
+  );
+  await evaluate("localStorage.clear(); sessionStorage.clear(); true");
+  await send("Page.reload", { ignoreCache: true });
+  await waitFor("document.querySelector('h1') !== null", 10000);
+  await waitFor("document.querySelectorAll('.mod-row').length > 0", 10000);
+  await wait(500);
+
+  await test("1440x900 模组库布局、窗口控件与单一主操作", async () => {
+    const info = await layout();
+    const primary = await evaluate(
+      "document.querySelectorAll('.page-transition .button-primary').length",
+    );
+    const resizeHandles = await evaluate(
+      "document.querySelectorAll('.window-resize-handle').length",
+    );
+    if (info.horizontalOverflow) throw new Error("出现横向溢出");
+    if (info.clipped.length) throw new Error(`控件越界：${JSON.stringify(info.clipped)}`);
+    for (const [label, rect] of Object.entries(info.controls)) {
+      if (!rect || rect.width < 20 || rect.height < 20 || rect.right > info.viewport.width + 1) {
+        throw new Error(`${label} 不可见`);
+      }
+    }
+    if (primary !== 1) throw new Error(`主操作数量应为 1，实际 ${primary}`);
+    if (resizeHandles !== 8) throw new Error(`窗口缩放命中区数量异常：${resizeHandles}`);
+    screenshots.push(await screenshot("1440-light-library-initial"));
+    return { info, primary, resizeHandles };
+  });
+
+  await test("拖拽排序实时显示插入槽位与其他模组让位", async () => {
+    const setup = await evaluate(`(() => {
+      const rows = [...document.querySelectorAll(".mod-row")];
+      if (rows.length < 3) return null;
+      const names = rows.map(row => row.querySelector(".mod-row-main > b")?.innerText ?? "");
+      const source = rows[0];
+      const target = rows[2];
+      const sourceRect = source.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      window.__dragPoint = {
+        x: sourceRect.left + Math.min(280, sourceRect.width * 0.48),
+        startY: sourceRect.top + sourceRect.height * 0.48,
+        targetY: targetRect.top + targetRect.height * 0.35,
+      };
+      source.dispatchEvent(new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 41,
+        pointerType: "mouse",
+        isPrimary: true,
+        button: 0,
+        buttons: 1,
+        clientX: window.__dragPoint.x,
+        clientY: window.__dragPoint.startY,
+      }));
+      return { names, sourceRect: { top: sourceRect.top }, targetRect: { top: targetRect.top } };
+    })()`);
+    if (!setup) throw new Error("拖拽回归需要至少三个模组");
+
+    await evaluate(`(() => {
+      window.dispatchEvent(new PointerEvent("pointermove", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 41,
+        pointerType: "mouse",
+        isPrimary: true,
+        buttons: 1,
+        clientX: window.__dragPoint.x,
+        clientY: window.__dragPoint.targetY,
+      }));
+      // 在页面内逐帧采样，避免 CDP 往返时延把 320ms 过渡整个跳过。
+      window.__dragSamples = [];
+      const capture = () => {
+        const row = document.querySelector(".mod-row.is-drag-shift-up, .mod-row.is-drag-shift-down");
+        if (!row) return;
+        window.__dragSamples.push(getComputedStyle(row).transform);
+      };
+      requestAnimationFrame(() => {
+        capture();
+        requestAnimationFrame(capture);
+        setTimeout(capture, 80);
+        setTimeout(capture, 340);
+      });
+    })()`);
+    await waitFor("document.querySelector('.mod-row.is-dragging') !== null");
+    await waitFor("document.querySelector('.mod-drop-indicator') !== null");
+    const preview = await evaluate(`(() => {
+      const source = document.querySelector(".mod-row.is-dragging");
+      const shifted = [...document.querySelectorAll(".mod-row.is-drag-shift-up, .mod-row.is-drag-shift-down")];
+      const indicator = document.querySelector(".mod-drop-indicator");
+      const foot = document.querySelector(".table-foot b");
+      return {
+        sourceTransform: getComputedStyle(source).transform,
+        shifted: shifted.map(row => ({
+          id: row.dataset.modId,
+          transform: getComputedStyle(row).transform,
+          transitionDuration: getComputedStyle(row).transitionDuration,
+        })),
+        indicatorText: indicator?.innerText ?? "",
+        markerTop: indicator?.style.getPropertyValue("--drop-marker-top") ?? "",
+        footText: foot?.innerText ?? "",
+        live: document.querySelector(".table-foot > span")?.getAttribute("aria-live"),
+      };
+    })()`);
+    if (preview.sourceTransform === "none") throw new Error(`拖动行未跟随指针：${JSON.stringify(preview)}`);
+    if (preview.shifted.length < 2) throw new Error(`其他模组没有让位：${JSON.stringify(preview)}`);
+    if (preview.shifted.some(item => item.transform === "none")) {
+      throw new Error(`让位行缺少过渡位移：${JSON.stringify(preview)}`);
+    }
+    if (!preview.shifted.some(item => item.transitionDuration.includes("0.32s"))) {
+      throw new Error(`让位过渡时长不足：${JSON.stringify(preview.shifted)}`);
+    }
+    if (!preview.markerTop || !preview.indicatorText.includes("释放到第")) {
+      throw new Error(`插入槽位提示缺失：${JSON.stringify(preview)}`);
+    }
+    if (!preview.footText.includes("释放到第 03 位") || preview.live !== "polite") {
+      throw new Error(`拖拽状态反馈异常：${JSON.stringify(preview)}`);
+    }
+    await wait(420);
+    const transitionSamples = await evaluate("window.__dragSamples ?? []");
+    const settledTransform = await evaluate(`getComputedStyle(
+      document.querySelector(".mod-row.is-drag-shift-up, .mod-row.is-drag-shift-down")
+    ).transform`);
+    transitionSamples.push(settledTransform);
+    if (new Set(transitionSamples).size < 2) {
+      throw new Error(`让位过程没有连续过渡：${JSON.stringify(transitionSamples)}`);
+    }
+    screenshots.push(await screenshot("1440-light-drag-preview"));
+
+    await evaluate(`window.dispatchEvent(new PointerEvent("pointerup", {
+      bubbles: true,
+      pointerId: 41,
+      pointerType: "mouse",
+      isPrimary: true,
+      button: 0,
+      buttons: 0,
+      clientX: window.__dragPoint.x,
+      clientY: window.__dragPoint.targetY,
+    }))`);
+    await waitFor("document.querySelector('.mod-row.is-dragging') === null");
+    await waitFor(
+      `document.querySelector(".mod-row .mod-row-main > b")?.innerText === ${JSON.stringify(setup.names[1])}`,
+      10000,
+    );
+    const settled = await evaluate(
+      "Boolean(document.querySelector('.mod-row.is-drop-settled'))",
+    );
+    if (!settled) throw new Error("拖放结束后缺少落位反馈");
+    await wait(420);
+    return {
+      names: setup.names,
+      preview,
+      transitionSamples,
+      finalFirst: await evaluate(
+        "document.querySelector('.mod-row .mod-row-main > b')?.innerText",
+      ),
+    };
+  });
+
+  await test("搜索、清空与筛选", async () => {
+    const before = await evaluate("document.querySelectorAll('.mod-row').length");
+    await setInput("搜索模组、标签或备注", "WeaponPack");
+    await waitFor("document.querySelectorAll('.mod-row').length === 1");
+    await setInput("搜索模组、标签或备注", "");
+    await waitFor(`document.querySelectorAll('.mod-row').length === ${before}`);
+    await evaluate(`(() => {
+      const button = [...document.querySelectorAll(".filter-chip")]
+        .find(item => item.innerText.includes("客户端 PAK"));
+      button?.click();
+      return true;
+    })()`);
+    await waitFor(
+      `[...document.querySelectorAll(".mod-row")].some(row =>
+        row.getAnimations().some(animation => {
+          const timing = animation.effect?.getTiming();
+          return timing?.duration === 260;
+        }),
+      )`,
+      3000,
+    );
+    const reflowing = true;
+    await waitFor(
+      "document.querySelector('.filter-chip.is-active')?.innerText.includes('客户端 PAK')",
+    );
+    const clientRows = await evaluate("document.querySelectorAll('.mod-row').length");
+    if (!reflowing) throw new Error("筛选后的列表重排动效未生效");
+    await clickText("全部");
+    const allRows = await evaluate("document.querySelectorAll('.mod-row').length");
+    if (clientRows <= 0 || allRows !== before) throw new Error("筛选结果异常");
+    return { before, clientRows, allRows, reflowing };
+  });
+
+  await test("冲突模组筛选与手动融合入口", async () => {
+    await clickText("冲突模组");
+    await waitFor("document.querySelector('.conflict-merge-strip') !== null");
+    await wait(240);
+    const detail = await evaluate(`(() => {
+      const activeFilter = [...document.querySelectorAll(".filter-chip")]
+        .find(item => item.classList.contains("is-active"));
+      const rows = [...document.querySelectorAll(".mod-row")];
+      const conflictRows = rows.filter(row =>
+        row.querySelector(".mod-conflict-pill.has-conflict, .mod-conflict-pill.is-full"));
+      const strip = document.querySelector(".conflict-merge-strip");
+      const mergeButton = [...strip.querySelectorAll("button")]
+        .find(item => item.innerText.includes("手动融合"));
+      const rect = strip.getBoundingClientRect();
+      return {
+        activeFilter: activeFilter?.innerText ?? "",
+        rowCount: rows.length,
+        conflictRowCount: conflictRows.length,
+        primaryCount: document.querySelectorAll(".page-transition .button-primary").length,
+        stripInsideViewport: rect.left >= 0 && rect.right <= innerWidth + 1,
+        hasMergeButton: Boolean(mergeButton),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+      };
+    })()`);
+    if (!detail.activeFilter.includes("冲突模组") || detail.rowCount === 0 ||
+        detail.rowCount !== detail.conflictRowCount) {
+      throw new Error(`冲突筛选结果异常：${JSON.stringify(detail)}`);
+    }
+    if (detail.primaryCount !== 1 || !detail.stripInsideViewport ||
+        !detail.hasMergeButton || detail.horizontalOverflow) {
+      throw new Error(`冲突融合入口布局异常：${JSON.stringify(detail)}`);
+    }
+    screenshots.push(await screenshot("1440-light-conflicts"));
+
+    await clickText("手动融合");
+    await waitFor("document.body.innerText.includes('冲突融合完成')");
+    await clickText("全部");
+    await waitFor("document.querySelector('.conflict-merge-strip') === null");
+    return detail;
+  });
+
+  await test("三种排序循环", async () => {
+    const label = () =>
+      evaluate("document.querySelector('.sort-mode-label')?.innerText");
+    const seen = [await label()];
+    for (let index = 0; index < 3; index += 1) {
+      await clickAria("切换排序方式");
+      await wait(100);
+      seen.push(await label());
+    }
+    if (
+      !seen.includes("按名称") ||
+      !seen.includes("按文件大小") ||
+      seen.at(-1) !== "按加载顺序"
+    ) {
+      throw new Error(`排序循环异常：${seen}`);
+    }
+    return seen;
+  });
+
+  await test("选择行与启停状态恢复", async () => {
+    await evaluate("document.querySelector('.mod-row')?.click()");
+    await waitFor("document.querySelector('.mod-row.is-selected') !== null");
+    const selector = '.mod-row.is-selected button[role="switch"]';
+    const before = await evaluate(
+      `document.querySelector(${JSON.stringify(selector)})?.getAttribute("aria-checked")`,
+    );
+    await evaluate(`document.querySelector(${JSON.stringify(selector)})?.click()`);
+    await waitFor(
+      `document.querySelector(${JSON.stringify(selector)})?.getAttribute("aria-checked") !== ${JSON.stringify(
+        before,
+      )}`,
+    );
+    const feedbackClass = before === "true" ? "is-toggle-off" : "is-toggle-on";
+    await waitFor(
+      `document.querySelector(${JSON.stringify(selector)})?.closest(".mod-row")?.classList.contains(${JSON.stringify(
+        feedbackClass,
+      )})`,
+    );
+    const toggleMotion = await evaluate(`(() => {
+      const row = document.querySelector(${JSON.stringify(selector)})?.closest(".mod-row");
+      return {
+        rowClass: row?.className ?? "",
+        stateAnimation: getComputedStyle(row?.querySelector(".mod-state-pill")).animationName,
+      };
+    })()`);
+    if (!toggleMotion.rowClass.includes(feedbackClass) ||
+        !toggleMotion.stateAnimation.includes("motion-state-change")) {
+      throw new Error(`启停动效未生效：${JSON.stringify(toggleMotion)}`);
+    }
+    const after = await evaluate(
+      `document.querySelector(${JSON.stringify(selector)})?.getAttribute("aria-checked")`,
+    );
+    await evaluate(`document.querySelector(${JSON.stringify(selector)})?.click()`);
+    await waitFor(
+      `document.querySelector(${JSON.stringify(selector)})?.getAttribute("aria-checked") === ${JSON.stringify(
+        before,
+      )}`,
+    );
+    return { before, after, toggleMotion };
+  });
+
+  await test("Ctrl/Shift 多选与批量启停", async () => {
+    const clickRow = async (index, modifiers = "") => {
+      await evaluate(`(() => {
+        const row = [...document.querySelectorAll(".mod-row")][${index}];
+        return Boolean(row && row.dispatchEvent(new MouseEvent("click", {
+          bubbles: true,
+          cancelable: true,
+          ${modifiers}
+        })));
+      })()`);
+      await wait(80);
+    };
+    const selectedCount = () =>
+      evaluate("document.querySelectorAll('.mod-row.is-selected').length");
+
+    await clickRow(0);
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 1");
+    await clickRow(2, "ctrlKey: true,");
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 2");
+    const ctrlCount = await selectedCount();
+    if (ctrlCount !== 2) throw new Error(`Ctrl 多选数量异常：${ctrlCount}`);
+
+    await clickRow(3, "shiftKey: true,");
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 2");
+    const rangeIds = await evaluate(
+      "[...document.querySelectorAll('.mod-row.is-selected')].map(row => row.dataset.modId)",
+    );
+    if (rangeIds.length !== 2 || rangeIds[0] === rangeIds[1]) {
+      throw new Error(`Shift 连续选择异常：${JSON.stringify(rangeIds)}`);
+    }
+    const bulkVisible = await evaluate(
+      "document.querySelectorAll('.bulk-selection-actions .bulk-action').length",
+    );
+    if (bulkVisible !== 2) throw new Error("多选批量操作按钮未出现");
+    screenshots.push(await screenshot("1440-light-multi-select"));
+
+    await clickAria("取消多选");
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 1");
+    await clickRow(0);
+    await clickRow(1, "ctrlKey: true,");
+    await waitFor("document.querySelectorAll('.mod-row.is-selected').length === 2");
+    await clickText("禁用所选", ".bulk-selection-actions .bulk-action");
+    await waitFor(
+      `[...document.querySelectorAll('.toast-stack b')].some(item => item.innerText.includes('已停用 2 个模组'))`,
+    );
+    const disabledSelected = await evaluate(`(() => {
+      const rows = [...document.querySelectorAll(".mod-row.is-selected")];
+      return rows.map(row => row.querySelector('button[role="switch"]')?.getAttribute("aria-checked"));
+    })()`);
+    if (disabledSelected.some(value => value !== "false")) {
+      throw new Error(`所选模组未全部停用：${JSON.stringify(disabledSelected)}`);
+    }
+
+    await clickAria("取消多选");
+    await waitFor("document.querySelector('.bulk-all-actions') !== null");
+    const disabledBeforeEnableAll = await evaluate(
+      `[...document.querySelectorAll('.mod-row button[role="switch"]')].filter(button => button.getAttribute("aria-checked") === "false").length`,
+    );
+    await clickText("全部启用", ".bulk-all-actions .bulk-action");
+    await waitFor(
+      `[...document.querySelectorAll('.toast-stack b')].some(item => item.innerText.includes('已启用 ${disabledBeforeEnableAll} 个模组'))`,
+    );
+    await waitFor(
+      `[...document.querySelectorAll('.mod-row button[role="switch"]')].every(button => button.getAttribute("aria-checked") === "true")`,
+    );
+    return { ctrlCount, rangeIds, bulkVisible, disabledSelected, disabledBeforeEnableAll };
+  });
+
+  await test("全部启停只作用于当前搜索与筛选结果", async () => {
+    const visibleSwitches = () =>
+      evaluate(
+        `[...document.querySelectorAll('.mod-row button[role="switch"]')].map(button => button.getAttribute("aria-checked"))`,
+      );
+    const waitAllVisible = (checked) =>
+      waitFor(
+        `[...document.querySelectorAll('.mod-row button[role="switch"]')].every(button => button.getAttribute("aria-checked") === "${checked}")`,
+      );
+    const waitToast = (text) =>
+      waitFor(
+        `[...document.querySelectorAll('.toast-stack b')].some(item => item.innerText.includes(${JSON.stringify(text)}))`,
+      );
+
+    await clickText("全部", ".filter-chip");
+    await setInput("搜索模组、标签或备注", "");
+    await waitFor("document.querySelectorAll('.mod-row').length > 1");
+    const allCount = await evaluate("document.querySelectorAll('.mod-row').length");
+
+    await clickText("全部禁用", ".bulk-all-actions .bulk-action");
+    await waitToast(`已停用 ${allCount} 个模组`);
+    await waitAllVisible("false");
+
+    await clickText("客户端 PAK", ".filter-chip");
+    await waitFor(
+      "document.querySelector('.filter-chip.is-active')?.innerText.includes('客户端 PAK')",
+    );
+    await waitFor("document.querySelectorAll('.mod-row').length > 0");
+    const clientCount = await evaluate("document.querySelectorAll('.mod-row').length");
+    await clickText("全部启用", ".bulk-all-actions .bulk-action");
+    await waitToast(`已启用 ${clientCount} 个模组`);
+    await waitAllVisible("true");
+
+    await clickText("UE4SS", ".filter-chip");
+    await waitFor(
+      "document.querySelector('.filter-chip.is-active')?.innerText.includes('UE4SS')",
+    );
+    await waitFor("document.querySelectorAll('.mod-row').length > 0");
+    const ue4ssStates = await visibleSwitches();
+    if (ue4ssStates.some((value) => value !== "false")) {
+      throw new Error(`客户端筛选启用不应影响 UE4SS：${JSON.stringify(ue4ssStates)}`);
+    }
+
+    await clickText("全部", ".filter-chip");
+    await waitFor("document.querySelectorAll('.mod-row').length > 1");
+    await setInput("搜索模组、标签或备注", "BetterAI");
+    await waitFor("document.querySelectorAll('.mod-row').length === 1");
+    await clickText("全部启用", ".bulk-all-actions .bulk-action");
+    await waitToast("已启用 1 个模组");
+    await setInput("搜索模组、标签或备注", "");
+    await waitFor("document.querySelectorAll('.mod-row').length > 1");
+    const afterSearchEnable = await evaluate(`(() => {
+      const rows = [...document.querySelectorAll(".mod-row")];
+      return rows.map(row => ({
+        name: row.querySelector(".mod-row-main > b")?.innerText ?? "",
+        checked: row.querySelector('button[role="switch"]')?.getAttribute("aria-checked"),
+      }));
+    })()`);
+    const betterAiAfterEnable = afterSearchEnable.find((item) => item.name === "BetterAI_Core");
+    if (betterAiAfterEnable?.checked !== "true") {
+      throw new Error(`搜索范围启用未命中 BetterAI：${JSON.stringify(afterSearchEnable)}`);
+    }
+    if (afterSearchEnable.some((item) => item.checked !== "true")) {
+      throw new Error(`搜索范围启用误改了其他结果：${JSON.stringify(afterSearchEnable)}`);
+    }
+
+    await setInput("搜索模组、标签或备注", "BetterAI");
+    await waitFor("document.querySelectorAll('.mod-row').length === 1");
+    await clickText("全部禁用", ".bulk-all-actions .bulk-action");
+    await waitToast("已停用 1 个模组");
+    await setInput("搜索模组、标签或备注", "");
+    await waitFor("document.querySelectorAll('.mod-row').length > 1");
+    const afterSearchDisable = await evaluate(`(() => {
+      const rows = [...document.querySelectorAll(".mod-row")];
+      return rows.map(row => ({
+        name: row.querySelector(".mod-row-main > b")?.innerText ?? "",
+        checked: row.querySelector('button[role="switch"]')?.getAttribute("aria-checked"),
+      }));
+    })()`);
+    const betterAiAfterDisable = afterSearchDisable.find((item) => item.name === "BetterAI_Core");
+    if (betterAiAfterDisable?.checked !== "false") {
+      throw new Error(`搜索范围禁用未命中 BetterAI：${JSON.stringify(afterSearchDisable)}`);
+    }
+    if (afterSearchDisable.filter((item) => item.checked === "true").length !== allCount - 1) {
+      throw new Error(`搜索范围禁用误改了其他结果：${JSON.stringify(afterSearchDisable)}`);
+    }
+
+    await clickText("UE4SS", ".filter-chip");
+    await waitFor("document.querySelectorAll('.mod-row').length > 0");
+    const ue4ssCount = await evaluate("document.querySelectorAll('.mod-row').length");
+    await clickText("全部启用", ".bulk-all-actions .bulk-action");
+    await waitToast(`已启用 ${ue4ssCount} 个模组`);
+    await waitAllVisible("true");
+    await clickText("客户端 PAK", ".filter-chip");
+    await waitAllVisible("true");
+    await clickText("全部", ".filter-chip");
+    await waitAllVisible("true");
+    screenshots.push(await screenshot("1440-light-filtered-bulk-toggle"));
+    return { allCount, clientCount, ue4ssCount, ue4ssStates };
+  });
+
+  await test("检查器重命名对话框与文件名更新", async () => {
+    const selected = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-row-main > b")?.innerText === "HD_Character_Textures");
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+    if (!selected) throw new Error("找不到用于重命名验收的模组行");
+    await waitFor(
+      `document.querySelector(".mod-row.is-selected .mod-row-main > b")?.innerText === "HD_Character_Textures"`,
+    );
+
+    await clickText("重命名", ".inspector-action-row button");
+    await waitFor(
+      "document.querySelector('#modal-title')?.innerText === '重命名模组'",
+    );
+    const inputValue = await evaluate(
+      "document.querySelector('#rename-mod-input')?.value",
+    );
+    if (inputValue !== "HD_Character_Textures") {
+      throw new Error(`重命名输入框未回填文件名：${inputValue}`);
+    }
+    screenshots.push(await screenshot("1440-light-rename-dialog"));
+    const renamedInput = await evaluate(`(() => {
+      const input = document.querySelector("#rename-mod-input");
+      if (!input) return false;
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
+        .set.call(input, "HD Character Textures Renamed");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    })()`);
+    if (!renamedInput) throw new Error("无法填写新模组名称");
+    await clickText("确认改名", ".modal-foot button");
+    await waitFor("document.querySelector('.modal-card') === null", 10000);
+    await waitFor(
+      `[...document.querySelectorAll(".mod-row-main > b")].some(item => item.innerText === "HD Character Textures Renamed")`,
+    );
+    await waitFor("document.body.innerText.includes('模组已重命名')");
+    const renamed = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-row-main > b")?.innerText === "HD Character Textures Renamed");
+      return {
+        selected: row?.classList.contains("is-selected") ?? false,
+        text: row?.innerText ?? "",
+      };
+    })()`);
+    if (!renamed.selected) throw new Error("改名后被选中项丢失");
+    return { inputValue, renamed: renamed.text.slice(0, 120) };
+  });
+
+  await test("冲突覆盖链、胜者保存与响应式弹层", async () => {
+    const selected = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-row-main > b")?.innerText === "SCUM_WeaponPack_Elite");
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+    if (!selected) throw new Error("找不到用于冲突验收的模组行");
+    await waitFor(
+      `document.querySelector(".mod-row.is-selected .mod-row-main > b")?.innerText === "SCUM_WeaponPack_Elite"`,
+    );
+
+    const before = await evaluate(`(() => {
+      const row = document.querySelector(".mod-row.is-selected");
+      return {
+        conflictPill: row?.querySelector(".mod-conflict-pill")?.innerText ?? "",
+        healthTrigger: Boolean(document.querySelector(".inspector .conflict-health-trigger")),
+      };
+    })()`);
+    if (!before.conflictPill.includes("覆盖") || !before.conflictPill.includes("被覆盖")) {
+      throw new Error(`覆盖统计未显示：${JSON.stringify(before)}`);
+    }
+    if (!before.healthTrigger) throw new Error("冲突详情入口不存在");
+
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('.conflict-panel') !== null");
+    const panel = await evaluate(`(() => {
+      const dialog = document.querySelector(".modal-card");
+      const choices = [...document.querySelectorAll(".conflict-choice")];
+      const paths = [...document.querySelectorAll(".conflict-paths code")];
+      const rect = dialog?.getBoundingClientRect();
+      return {
+        title: document.querySelector("#modal-title")?.innerText ?? "",
+        groups: document.querySelectorAll(".conflict-group").length,
+        choices: choices.map(choice => choice.innerText),
+        paths: paths.map(path => path.innerText),
+        selected: choices.find(choice => choice.getAttribute("aria-checked") === "true")?.innerText ?? "",
+        dialogInsideViewport: Boolean(rect && rect.left >= 0 && rect.right <= innerWidth + 1),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+      };
+    })()`);
+    if (panel.title !== "覆盖关系") throw new Error(`冲突弹层标题异常：${JSON.stringify(panel)}`);
+    if (panel.groups < 1 || panel.choices.length < 2 || panel.paths.length < 2) {
+      throw new Error(`冲突详情内容不完整：${JSON.stringify(panel)}`);
+    }
+    if (!panel.paths.some(path => path.endsWith(".uasset")) ||
+        !panel.paths.some(path => path.endsWith(".uexp"))) {
+      throw new Error(`UE 资源组未完整展示：${JSON.stringify(panel.paths)}`);
+    }
+    if (!panel.dialogInsideViewport || panel.horizontalOverflow) {
+      throw new Error(`冲突弹层越界：${JSON.stringify(panel)}`);
+    }
+    screenshots.push(await screenshot("1440-light-conflict"));
+
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1100,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(200);
+    const narrow = await evaluate(`(() => {
+      const dialog = document.querySelector(".modal-card");
+      const rect = dialog?.getBoundingClientRect();
+      const clipped = [...document.querySelectorAll(".modal-card button, .modal-card code")]
+        .filter(element => {
+          const box = element.getBoundingClientRect();
+          return box.width > 0 && (box.right > innerWidth + 1 || box.left < -1);
+        })
+        .slice(0, 8)
+        .map(element => (element.innerText || "").slice(0, 50));
+      return {
+        dialogInsideViewport: Boolean(rect && rect.left >= 0 && rect.right <= innerWidth + 1),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        clipped,
+      };
+    })()`);
+    if (narrow.dialogInsideViewport === false || narrow.horizontalOverflow || narrow.clipped.length) {
+      throw new Error(`1100 宽冲突弹层越界：${JSON.stringify(narrow)}`);
+    }
+    screenshots.push(await screenshot("1100-light-conflict"));
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1440,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(150);
+
+    const picked = await evaluate(`(() => {
+      const choice = [...document.querySelectorAll(".conflict-choice")]
+        .find(item => item.innerText.includes("SCUM_WeaponPack_Elite"));
+      if (!choice) return false;
+      choice.click();
+      return true;
+    })()`);
+    if (!picked) throw new Error("找不到覆盖胜者选项");
+    await waitFor(
+      `[...document.querySelectorAll(".conflict-choice")]
+        .find(item => item.innerText.includes("SCUM_WeaponPack_Elite"))
+        ?.getAttribute("aria-checked") === "true"`,
+    );
+    await clickText("保存覆盖选择", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+    await waitFor("document.body.innerText.includes('覆盖选择已保存')");
+    await waitFor(
+      `document.querySelector(".mod-row.is-selected .mod-conflict-pill")?.innerText.includes("覆盖 2 / 被覆盖 0")`,
+    );
+
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('.conflict-panel') !== null");
+    const currentWinner = await evaluate(
+      "document.querySelector('.conflict-winner-summary > div:nth-child(2) dd')?.innerText ?? ''",
+    );
+    if (currentWinner !== "SCUM_WeaponPack_Elite") {
+      throw new Error(`当前胜者未更新：${currentWinner}`);
+    }
+    await clickText("取消", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+    return { before, panel, narrow, currentWinner };
+  });
+
+  await test("模组类型配色与完全覆盖淡化", async () => {
+    const appearance = await evaluate(`(() => {
+      const types = ["clientPak", "serverPak", "ue4ssMod", "configFile", "script", "other"];
+      const colors = {};
+      for (const type of types) {
+        const row = document.createElement("div");
+        row.className = "mod-row";
+        row.dataset.modType = type;
+        const label = document.createElement("span");
+        label.className = "mod-type";
+        row.appendChild(label);
+        document.body.appendChild(row);
+        colors[type] = getComputedStyle(label).color;
+        row.remove();
+      }
+      const faded = document.createElement("div");
+      faded.className = "mod-row is-fully-overridden";
+      document.body.appendChild(faded);
+      const opacity = Number(getComputedStyle(faded).opacity);
+      faded.remove();
+      return {
+        colors,
+        uniqueColors: new Set(Object.values(colors)).size,
+        opacity,
+      };
+    })()`);
+    if (appearance.uniqueColors !== 6) {
+      throw new Error(`模组类型颜色未全部区分：${JSON.stringify(appearance)}`);
+    }
+    if (!(appearance.opacity > 0 && appearance.opacity < 1)) {
+      throw new Error(`完全被覆盖行未淡化：${appearance.opacity}`);
+    }
+    return appearance;
+  });
+
+  await test("启动选项弹层与参数切换", async () => {
+    await clickText("启动选项");
+    await waitFor("document.querySelector('[role=\"dialog\"][aria-label=\"启动选项\"]') !== null");
+    const selector = 'button[role="switch"][aria-label="启用日志"]';
+    const before = await evaluate(
+      `document.querySelector(${JSON.stringify(selector)})?.getAttribute("aria-checked")`,
+    );
+    await evaluate(`document.querySelector(${JSON.stringify(selector)})?.click()`);
+    await waitFor(
+      `document.querySelector(${JSON.stringify(selector)})?.getAttribute("aria-checked") !== ${JSON.stringify(
+        before,
+      )}`,
+    );
+    await evaluate(
+      "document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); true",
+    );
+    await waitFor("document.querySelector('[role=\"dialog\"][aria-label=\"启动选项\"]') === null");
+    return { before };
+  });
+
+  await test("编辑标签与备注", async () => {
+    await clickText("编辑标签与备注");
+    await waitFor("document.querySelector('#notes-input') !== null");
+    await setInput("记录兼容性、服务器用途或测试结果...", "QA regression note", "textarea");
+    await setInput("输入后回车添加", "QA", "input");
+    await evaluate(
+      "document.querySelector('#tag-input')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); true",
+    );
+    await clickText("保存修改");
+    await waitFor("document.querySelector('#notes-input') === null");
+    await waitFor("document.body.innerText.includes('QA regression note')");
+    return null;
+  });
+
+  await test("扫描、启动与停止游戏反馈", async () => {
+    await clickText("扫描");
+    await waitFor("document.body.innerText.includes('扫描完成')");
+    await clickText("启动客户端");
+    await waitFor("document.body.innerText.includes('停止游戏')", 10000);
+    await clickText("停止游戏");
+    await waitFor("document.body.innerText.includes('启动客户端')", 10000);
+    return null;
+  });
+
+  await test("更新通知、下载安装流程与弹窗", async () => {
+    await waitFor("document.body.innerText.includes('3.0.1 可用')", 10000);
+    await clickText("3.0.1 可用");
+    await waitFor("document.body.innerText.includes('发现新版本 3.0.1')");
+    screenshots.push(await screenshot("1440-light-update-dialog"));
+    await clickText("下载并安装");
+    await waitFor(
+      "document.body.innerText.includes('正在校验') || document.body.innerText.includes('正在安装')",
+      10000,
+    );
+    screenshots.push(await screenshot("1440-light-update-progress"));
+    return null;
+  });
+
+  await send("Page.reload", { ignoreCache: true });
+  await waitFor("document.querySelector('h1') !== null", 10000);
+  await waitFor("document.querySelectorAll('.mod-row').length > 0", 10000);
+  await wait(350);
+
+  await test("亮暗主题切换、持久化与中性石墨色", async () => {
+    await clickAria("切换到暗色主题");
+    await waitFor("document.documentElement.dataset.theme === 'dark'");
+    const dark = await evaluate(`(() => {
+      const style = getComputedStyle(document.documentElement);
+      const selectedRow = getComputedStyle(document.querySelector(".mod-row.is-selected"));
+      return {
+        theme: document.documentElement.dataset.theme,
+        stored: localStorage.getItem("scum-theme"),
+        paper: style.getPropertyValue("--paper").trim(),
+        paperHi: style.getPropertyValue("--paper-hi").trim(),
+        accent: style.getPropertyValue("--accent").trim(),
+        selectedRowBackground: selectedRow.backgroundColor,
+        selectedRowTransition: selectedRow.transitionProperty,
+      };
+    })()`);
+    if (
+      dark.paper !== "#151515" ||
+      dark.paperHi !== "#1c1c1c" ||
+      dark.accent !== "#e1724b"
+    ) {
+      throw new Error(`暗色 token 异常：${JSON.stringify(dark)}`);
+    }
+    if (
+      dark.selectedRowBackground !== "rgb(35, 35, 35)" ||
+      dark.selectedRowTransition.includes("background")
+    ) {
+      throw new Error(`暗色选中行对比度过渡异常：${JSON.stringify(dark)}`);
+    }
+    screenshots.push(await screenshot("1440-dark-library"));
+    const conflictRow = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-conflict-pill.has-conflict, .mod-conflict-pill.is-full"));
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+    if (!conflictRow) throw new Error("暗色主题下找不到冲突模组");
+    await waitFor("document.querySelector('.conflict-health-trigger') !== null");
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('.conflict-panel') !== null");
+    screenshots.push(await screenshot("1440-dark-conflict"));
+    await clickText("取消", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+    await clickAria("切换到亮色主题");
+    await waitFor("document.documentElement.dataset.theme === 'light'");
+    return dark;
+  });
+
+  await test("设置页路径检测、云源保存与保存反馈", async () => {
+    await navigate("设置");
+    if (!(await evaluate("document.querySelectorAll('.settings-nav button').length === 5"))) {
+      throw new Error("设置页分类导航未渲染");
+    }
+    screenshots.push(await screenshot("1440-light-settings-paths"));
+
+    await clickText("启动与部署", ".settings-nav button");
+    await waitFor("document.body.innerText.includes('启动参数')");
+    const autoMerge = await evaluate(`(() => {
+      const toggle = document.querySelector('button[aria-label="自动融合冲突"]');
+      return {
+        visible: Boolean(toggle?.getBoundingClientRect().width),
+        checked: toggle?.getAttribute("aria-checked"),
+      };
+    })()`);
+    if (!autoMerge.visible || autoMerge.checked !== "true") {
+      throw new Error(`自动融合设置未正确显示：${JSON.stringify(autoMerge)}`);
+    }
+    screenshots.push(await screenshot("1440-light-settings-startup"));
+
+    await clickText("自动检测路径");
+    await waitFor("document.body.innerText.includes('已填入检测到的路径')");
+    await wait(400);
+
+    await clickText("云端与下载", ".settings-nav button");
+    const originalCatalog = await evaluate("document.querySelector('textarea')?.value ?? ''");
+    if (originalCatalog === null) throw new Error("云源输入框未渲染");
+    await setInput("https://your-catalog.example", "https://catalog.example.test", "textarea");
+    const cloudSourceValue = await evaluate(
+      "document.querySelector('textarea')?.value ?? ''",
+    );
+    if (!cloudSourceValue.includes("catalog.example.test")) {
+      throw new Error(`云源输入没有被写入：${cloudSourceValue}`);
+    }
+    screenshots.push(await screenshot("1440-light-settings-cloud"));
+
+    await clickText("外观与语言", ".settings-nav button");
+    await waitFor("document.querySelector('.settings-body')?.innerText.includes('外观') === true");
+    screenshots.push(await screenshot("1440-light-settings-appearance"));
+
+    await clickText("更新与关于", ".settings-nav button");
+    await waitFor("document.querySelector('.settings-body')?.innerText.includes('当前版本') === true");
+    screenshots.push(await screenshot("1440-light-settings-about"));
+
+    // 还原真实云源，避免后续云端用例因为假地址拿不到目录。
+    await clickText("云端与下载", ".settings-nav button");
+    await setInput("https://your-catalog.example", originalCatalog, "textarea");
+    await clickText("保存设置");
+    await waitFor("document.body.innerText.includes('设置已保存')");
+    const info = await layout();
+    if (info.horizontalOverflow) throw new Error("设置页横向溢出");
+    return info;
+  });
+
+  await test("云端目录加载、搜索与下载反馈", async () => {
+    await navigate("云端");
+    await waitFor("document.querySelectorAll('.remote-card').length === 3", 10000);
+    const cardLayout = await evaluate(`(() => {
+      const cards = [...document.querySelectorAll(".remote-card")];
+      const card = cards[0];
+      const name = card.querySelector(".remote-name");
+      const author = card.querySelector(".remote-byline");
+      const description = card.querySelector(".remote-description");
+      name.textContent = "Very Long Mod Name ".repeat(24);
+      author.textContent = "VeryLongAuthorName".repeat(24);
+      description.textContent = "这是一段用于验证长内容截断的超长模组描述。".repeat(120);
+      const clampOf = (el) => getComputedStyle(el).webkitLineClamp || getComputedStyle(el).lineClamp;
+      return {
+        heights: cards.map(item => Math.round(item.getBoundingClientRect().height)),
+        nameClamp: clampOf(name),
+        descriptionClamp: clampOf(description),
+        cardScroll: card.scrollHeight > card.clientHeight + 1,
+        bylineTruncated: author.scrollWidth > author.clientWidth + 1,
+      };
+    })()`);
+    if (cardLayout.nameClamp !== "2") {
+      throw new Error(`模组名未限制为两行：${JSON.stringify(cardLayout)}`);
+    }
+    if (cardLayout.descriptionClamp !== "3") {
+      throw new Error(`描述未限制为三行：${JSON.stringify(cardLayout)}`);
+    }
+    if (cardLayout.cardScroll) {
+      throw new Error(`云端卡片内出现滚动容器：${JSON.stringify(cardLayout)}`);
+    }
+    if (!cardLayout.bylineTruncated) {
+      throw new Error(`作者行未做省略：${JSON.stringify(cardLayout)}`);
+    }
+    screenshots.push(await screenshot("1440-light-cloud-long-content"));
+    const cloudCopy = await evaluate(
+      "document.querySelector('.page-cloud')?.innerText ?? ''",
+    );
+    if (!cloudCopy.includes("服务器版目录")) {
+      throw new Error(`服务器版目录说明缺失：${cloudCopy.slice(0, 160)}`);
+    }
+    if (/连接 Steam|Steam 白名单/.test(cloudCopy)) {
+      throw new Error("云端页仍包含已移除的 Steam 登录入口");
+    }
+    await setInput("搜索云端模组", "Vehicle");
+    await waitFor("document.querySelectorAll('.remote-card').length === 1");
+    await clickText("下载");
+    await waitFor("document.body.innerText.includes('下载完成')", 10000);
+    await setInput("搜索云端模组", "");
+    await waitFor("document.querySelectorAll('.remote-card').length === 3");
+    screenshots.push(await screenshot("1440-light-cloud"));
+    return null;
+  });
+
+  await test("SFTP 账户保存、连接与目录加载", async () => {
+    await navigate("服务器");
+    await setInputByLabel("服务器地址", "sftp.example.com");
+    await setInputByLabel("用户名", "modder");
+    await setInputByLabel("密码", "not-a-real-secret");
+    await setInputByLabel("远端 ~mods 路径", "/srv/scum/SCUM/Content/Paks/~mods");
+    await clickText("安全保存账户");
+    await waitFor("document.body.innerText.includes('SFTP 账户已安全保存')", 10000);
+    await clickText("测试连接");
+    await waitFor("document.querySelectorAll('.remote-file-row').length > 0", 10000);
+    await waitFor("document.querySelector('.remote-viewer-item') !== null", 10000);
+    await clickText("检查冲突");
+    await waitFor("document.body.innerText.includes('已分析 2 个远端 PAK')", 10000);
+    await setInput(
+      "记录用途、版本、测试结果或回滚说明...",
+      "QA remote note",
+      "textarea",
+    );
+    await clickText("保存备注");
+    await waitFor("document.body.innerText.includes('备注已保存')", 10000);
+    await clickText("重命名");
+    await waitFor(
+      "document.querySelector('#modal-title')?.innerText === '重命名远端模组'",
+    );
+    await clickText("取消", ".modal-foot button");
+    await clickText("删除");
+    await waitFor(
+      "document.querySelector('#modal-title')?.innerText === '删除远端模组'",
+    );
+    await clickText("取消", ".modal-foot button");
+    const viewerHeight = await evaluate(
+      "document.querySelector('.panel-viewer')?.getBoundingClientRect().height ?? 0",
+    );
+    if (viewerHeight <= 0 || viewerHeight > 760) {
+      throw new Error(`模组查看器高度异常：${viewerHeight}`);
+    }
+    screenshots.push(await screenshot("1440-light-server"));
+    return { rows: await evaluate("document.querySelectorAll('.remote-file-row').length") };
+  });
+
+  await test("服务器模组库排序、冲突托管与合并来源", async () => {
+    await navigate("模组库");
+    const localFirstId = await evaluate(
+      "document.querySelector('.mod-row')?.dataset.modId ?? ''",
+    );
+    await waitFor(
+      "document.querySelector('.library-source-switch button:not(:disabled)') !== null",
+    );
+    const serverTabDisabled = await evaluate(`(() => {
+      const button = [...document.querySelectorAll(".library-source-switch button")]
+        .find(item => item.innerText.includes("服务器模组"));
+      return button ? button.disabled : true;
+    })()`);
+    if (serverTabDisabled) {
+      throw new Error("已连接服务器，但模组库的服务器模组标签仍被禁用");
+    }
+    await clickText("服务器模组", ".library-source-switch button");
+    await waitFor("document.querySelector('h1')?.innerText === '服务器模组库'");
+    screenshots.push(await screenshot("1440-light-server-library"));
+    await waitFor("document.querySelectorAll('.mod-row').length >= 4");
+
+    const initialOrder = await evaluate(
+      "[...document.querySelectorAll('.mod-row')].map(row => row.dataset.modId)",
+    );
+    await evaluate(`(() => {
+      const row = document.querySelector(".mod-row");
+      row?.focus();
+      row?.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "ArrowDown",
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }));
+      return true;
+    })()`);
+    await waitFor(
+      `document.querySelector(".mod-row")?.dataset.modId !== ${JSON.stringify(initialOrder[0])}`,
+    );
+    const reordered = await evaluate(
+      "[...document.querySelectorAll('.mod-row')].map(row => row.dataset.modId)",
+    );
+    if (reordered[0] === initialOrder[0] || reordered[1] !== initialOrder[0]) {
+      throw new Error(`服务器模组未按 Alt+↓ 调整顺序：${JSON.stringify({ initialOrder, reordered })}`);
+    }
+
+    await clickText("本地模组", ".library-source-switch button");
+    await waitFor("document.querySelector('h1')?.innerText === '模组库'");
+    const localAfterReorder = await evaluate(
+      "document.querySelector('.mod-row')?.dataset.modId ?? ''",
+    );
+    if (localAfterReorder !== localFirstId) {
+      throw new Error(`服务器排序串改本地顺序：${localFirstId} -> ${localAfterReorder}`);
+    }
+
+    await clickText("服务器模组", ".library-source-switch button");
+    await waitFor("document.querySelectorAll('.mod-row').length >= 4");
+    await evaluate("document.querySelector('.mod-row')?.click()");
+    await waitFor("document.querySelector('.conflict-health-trigger') !== null");
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('.conflict-panel') !== null");
+    await evaluate("document.querySelector('.conflict-choice')?.click()");
+    await clickText("保存覆盖选择", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+    await waitFor("document.body.innerText.includes('覆盖选择已保存')");
+
+    // 改动排序/冲突选择后，后台会先下载分析并融合，完成后才出现上传按钮。
+    await waitFor(
+      "[...document.querySelectorAll('button')].some(button => button.innerText.includes('上传到服务器'))",
+      15000,
+    );
+    const pendingPrompt = await evaluate(
+      "document.querySelector('.server-library-provenance')?.innerText ?? ''",
+    );
+    if (!pendingPrompt.includes("未上传")) {
+      throw new Error(`融合完成后没有提示待上传：${pendingPrompt}`);
+    }
+    screenshots.push(await screenshot("1440-light-server-library-ready"));
+    await clickText("上传到服务器");
+    await waitFor("document.body.innerText.includes('上传前确认')", 10000);
+    await clickText("开始上传", ".modal-foot button");
+    await waitFor("document.body.innerText.includes('服务器布局已应用')", 15000);
+    await waitFor(
+      "document.body.innerText.includes('服务器已应用托管布局') && document.body.innerText.includes('SCUM Mod Desk 合并模组')",
+      10000,
+    );
+    const managedCopy = await evaluate(
+      "document.querySelector('.server-library-strip-copy')?.innerText ?? ''",
+    );
+    if (
+      !managedCopy.includes("SCUM_WeaponPack_Elite.pak") ||
+      !managedCopy.includes("LootBalance_Plus.pak")
+    ) {
+      throw new Error(`服务器模组库未显示合并来源：${managedCopy}`);
+    }
+    const restoreAvailable = await evaluate(
+      "[...document.querySelectorAll('button')].some(button => button.innerText.includes('恢复服务器原状'))",
+    );
+    if (!restoreAvailable) {
+      throw new Error("应用后没有出现恢复服务器原状的入口");
+    }
+    screenshots.push(await screenshot("1440-light-server-library-merged"));
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1100,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(240);
+    const serverLibraryWidth = await evaluate(`(() => {
+      const layout = document.querySelector(".library-layout");
+      const strip = document.querySelector(".server-library-strip");
+      const layoutRect = layout?.getBoundingClientRect();
+      const stripRect = strip?.getBoundingClientRect();
+      return {
+        viewport: window.innerWidth,
+        documentWidth: document.documentElement.scrollWidth,
+        layoutRight: layoutRect?.right ?? 0,
+        stripRight: stripRect?.right ?? 0,
+      };
+    })()`);
+    if (
+      serverLibraryWidth.documentWidth > serverLibraryWidth.viewport + 1 ||
+      serverLibraryWidth.layoutRight > serverLibraryWidth.viewport + 1 ||
+      serverLibraryWidth.stripRight > serverLibraryWidth.viewport + 1
+    ) {
+      throw new Error(`1100 宽服务器模组库横向溢出：${JSON.stringify(serverLibraryWidth)}`);
+    }
+    screenshots.push(await screenshot("1100-light-server-library-merged"));
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1440,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(160);
+
+    await clickText("本地模组", ".library-source-switch button");
+    await waitFor("document.querySelector('h1')?.innerText === '模组库'");
+    await navigate("服务器");
+    await waitFor(
+      "document.querySelector('.remote-viewer-inspector')?.innerText.includes('合并 PAK')",
+      10000,
+    );
+    const mergedViewer = await evaluate(
+      "document.querySelector('.remote-viewer-inspector')?.innerText ?? ''",
+    );
+    if (
+      !mergedViewer.includes("合并来源") ||
+      !mergedViewer.includes("SCUM_WeaponPack_Elite.pak") ||
+      !mergedViewer.includes("LootBalance_Plus.pak")
+    ) {
+      throw new Error(`服务器查看器缺少合并来源：${mergedViewer.slice(0, 300)}`);
+    }
+    const managedActions = await evaluate(`(() => {
+      const buttons = [...document.querySelectorAll(".remote-viewer-inspector-actions button")];
+      return {
+        disabled: buttons.map(button => Boolean(button.disabled)),
+        note: document.querySelector(".remote-viewer-managed-note")?.innerText ?? "",
+      };
+    })()`);
+    if (
+      managedActions.disabled.length !== 2 ||
+      managedActions.disabled.some(value => !value) ||
+      !managedActions.note.includes("服务器托管")
+    ) {
+      throw new Error(`托管合并包仍可重命名或删除：${JSON.stringify(managedActions)}`);
+    }
+
+    await navigate("模组库");
+    await clickText("服务器模组", ".library-source-switch button");
+    await waitFor("document.body.innerText.includes('服务器已应用托管布局')");
+    await clickText("恢复服务器原状");
+    await waitFor("document.querySelector('.modal-foot button') !== null", 5000);
+    await clickText("恢复服务器原状", ".modal-foot button");
+    await waitFor("document.body.innerText.includes('服务器原始模组已恢复')", 10000);
+    await waitFor(
+      "document.body.innerText.includes('尚未应用服务器布局') && document.body.innerText.includes('SCUM_WeaponPack_Elite.pak')",
+      10000,
+    );
+    const mergedGone = await evaluate(
+      "![...document.querySelectorAll('.mod-row-main > b')].some(item => item.innerText.includes('合并模组'))",
+    );
+    if (!mergedGone) {
+      throw new Error("恢复服务器原状后仍显示合并模组");
+    }
+    await clickText("本地模组", ".library-source-switch button");
+    await waitFor("document.querySelector('h1')?.innerText === '模组库'");
+    const localFinalId = await evaluate(
+      "document.querySelector('.mod-row')?.dataset.modId ?? ''",
+    );
+    if (localFinalId !== localFirstId) {
+      throw new Error(`服务器托管流程串改本地顺序：${localFirstId} -> ${localFinalId}`);
+    }
+
+    return {
+      initialOrder,
+      reordered,
+      managedCopy,
+      restoreAvailable,
+      localFirstId,
+    };
+  });
+
+  await test("SFTP 路径导航与远端文件操作", async () => {
+    await navigate("服务器");
+    const initial = await evaluate(`(() => ({
+      path: document.querySelector(".remote-path-controls input")?.value ?? "",
+      toolbar: [...document.querySelectorAll(".remote-toolbar button")]
+        .map(button => button.innerText),
+      files: [...document.querySelectorAll(".remote-file-row")]
+        .map(row => row.innerText)
+        .slice(0, 6),
+    }))()`);
+    if (!initial.path.includes("/~mods")) {
+      throw new Error(`初始远端路径异常：${initial.path}`);
+    }
+    if (!initial.toolbar.some(text => text.includes("刷新"))) {
+      throw new Error(`工具栏缺少刷新入口：${JSON.stringify(initial)}`);
+    }
+    if (!initial.files.some(text => text.includes("PAK"))) {
+      throw new Error(`文件树未展示 PAK 类型：${JSON.stringify(initial.files)}`);
+    }
+    const selectedRow = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".remote-file-row")]
+        .find(item => !item.classList.contains("is-browsable"));
+      if (!row) return null;
+      const result = {
+        title: row.title,
+        className: row.className,
+        text: row.innerText,
+      };
+      row.click();
+      return result;
+    })()`);
+    if (!selectedRow) {
+      throw new Error("文件树中没有可选择文件");
+    }
+    try {
+      await waitFor("document.querySelector('.remote-file-selection') !== null", 3000);
+    } catch {
+      // 偶发：文件树在 mock 刷新时重渲染，第一次点击落在旧节点上。再点一次。
+      await evaluate(`(() => {
+        const row = [...document.querySelectorAll(".remote-file-row")]
+          .find(item => !item.classList.contains("is-browsable"));
+        row?.click();
+      })()`);
+      await waitFor("document.querySelector('.remote-file-selection') !== null", 5000);
+    }
+    const selectedFile = await evaluate(`(() => ({
+      text: document.querySelector(".remote-file-selection")?.innerText ?? "",
+      download: Boolean(document.querySelector(".remote-file-selection button")),
+    }))()`);
+    if (!selectedFile.download || !selectedFile.text.toLowerCase().includes(".pak")) {
+      throw new Error(`文件详情或下载入口缺失：${JSON.stringify(selectedFile)}`);
+    }
+
+    await setInput(
+      "/srv/scum/SCUM/Content/Paks/~mods",
+      "/srv/scum/SCUM/Content/Paks",
+    );
+    await clickText("前往", ".remote-path-form button");
+    await waitFor(
+      "document.querySelector('.remote-path-controls input')?.value === '/srv/scum/SCUM/Content/Paks'",
+    );
+    await waitFor(
+      "document.querySelector('.remote-root-switches button:not(:disabled)') !== null",
+    );
+    await clickText("PAK 根目录");
+    await waitFor(
+      "document.querySelector('.remote-path-controls input')?.value === '/srv/scum/SCUM/Content/Paks/~mods'",
+    );
+    await waitFor(
+      "document.querySelector('.remote-root-switches button:not(:disabled)') !== null",
+    );
+    await evaluate(
+      `document.querySelector('.remote-path-controls button[aria-label="主目录"]').click()`,
+    );
+    await waitFor("document.body.innerText.includes('该目录位于模组根目录之外，仅可浏览')");
+    await waitFor(
+      "document.querySelector('.remote-root-switches button:not(:disabled)') !== null",
+    );
+    await clickText("PAK 根目录");
+    await waitFor(
+      "document.querySelector('.remote-path-controls input')?.value === '/srv/scum/SCUM/Content/Paks/~mods'",
+    );
+
+    // 目录重载完成前工具栏按钮处于禁用态，等它可点再操作
+    await waitFor(
+      `[...document.querySelectorAll(".remote-toolbar button")].some(button => button.innerText.includes("新建文件夹") && !button.disabled)`,
+    );
+
+    // 新建文件夹：工具栏按钮 → 内联输入 → 创建 → toast + 新行出现
+    const rowBefore = await evaluate(
+      "document.querySelectorAll('.remote-file-row').length",
+    );
+    await clickText("新建文件夹");
+    await waitFor("document.querySelector('.remote-mkdir-row input') !== null");
+    await setInput("新文件夹名称", "QA_Sub");
+    await clickText("创建");
+    await waitFor("document.body.innerText.includes('已创建远端目录')", 10000);
+    await waitFor(
+      `document.querySelectorAll('.remote-file-row').length === ${rowBefore + 1}`,
+      10000,
+    );
+
+    // 行内操作常驻 DOM（hover / 选中 / 键盘聚焦时可见）
+    const rowActions = await evaluate(
+      "document.querySelectorAll('.remote-row-actions').length",
+    );
+    if (rowActions === 0) {
+      throw new Error("行内操作缺失");
+    }
+
+    // 路径导航会清空选中态，重新选中一个文件
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".remote-file-row")]
+        .find(item => !item.classList.contains("is-browsable"));
+      row.click();
+    })()`);
+    await waitFor("document.querySelector('.remote-file-selection') !== null");
+
+    // 移动：选中条「移动」→ 弹窗确认目标路径 → 取消
+    await clickText("移动", ".remote-file-selection button");
+    await waitFor(
+      "document.querySelector('#modal-title')?.innerText === '移动远端条目'",
+    );
+    await clickText("取消", ".modal-foot button");
+
+    // 导入本地库（mock 环境：直接更新本地模组库快照）
+    await clickText("导入本地库", ".remote-file-selection button");
+    await waitFor("document.body.innerText.includes('已导入本地模组库')", 10000);
+
+    screenshots.push(await screenshot("1440-light-server-file-ops"));
+    return { initial, rowActions, rowBefore };
+  });
+
+  await test("备份找回入口、类型筛选与空态", async () => {
+    await navigate("备份找回");
+    await waitFor("document.querySelector('h1')?.innerText === '备份找回'");
+    const filters = await evaluate(
+      "[...document.querySelectorAll('.backups-filters button')].map(button => button.innerText)",
+    );
+    for (const label of ["全部", "删除的模组", "导入覆盖", "下载覆盖", "部署覆盖"]) {
+      if (!filters.includes(label)) {
+        throw new Error(`备份筛选缺少「${label}」：${JSON.stringify(filters)}`);
+      }
+    }
+    await waitFor("document.body.innerText.includes('没有可找回的备份')");
+    await clickText("刷新", ".page-header button");
+    await waitFor("document.body.innerText.includes('没有可找回的备份')");
+    screenshots.push(await screenshot("1440-light-backups"));
+    return { filters };
+  });
+
+  await test("日志刷新、筛选与清空", async () => {
+    await navigate("日志");
+    await waitFor("document.querySelectorAll('.log-line').length > 0", 10000);
+    await clickText("信息");
+    const filtered = await evaluate("document.querySelectorAll('.log-line').length");
+    await clickText("全部");
+    await clickText("清空");
+    await clickText("确认清空");
+    await waitFor("document.body.innerText.includes('没有日志')");
+    screenshots.push(await screenshot("1440-light-logs-empty"));
+    return { filtered };
+  });
+
+  await test("删除模组入口、重复副本备份与列表移除", async () => {
+    await navigate("模组库");
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-row-main > b")?.innerText === "SCUM_WeaponPack_Elite");
+      row?.click();
+      return true;
+    })()`);
+    await waitFor(
+      `document.querySelector(".mod-row.is-selected .mod-row-main > b")?.innerText === "SCUM_WeaponPack_Elite"`,
+    );
+    const rowCount = await evaluate("document.querySelectorAll('.mod-row').length");
+    await clickText("删除模组", ".inspector-footer button");
+    await waitFor("document.querySelector('.modal-card') !== null");
+    const copy = await evaluate("document.querySelector('.modal-card')?.innerText ?? ''");
+    if (!copy.includes("backups/deleted") || !copy.includes("另外 1 份相同副本")) {
+      throw new Error(`删除确认未说明备份或重复副本：${copy.slice(0, 220)}`);
+    }
+    screenshots.push(await screenshot("1440-light-delete-confirm"));
+    const observerReady = await evaluate(`(() => {
+      window.__deleteMotion = null;
+      window.__deleteMotionObserver?.disconnect?.();
+      const list = document.querySelector(".mod-rows");
+      if (!list) return false;
+      const observer = new MutationObserver(() => {
+        const row = document.querySelector(".mod-row.is-removing");
+        if (row && window.__deleteMotion === null) {
+          window.__deleteMotion = getComputedStyle(row).animationName;
+        }
+      });
+      observer.observe(list, {
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["class"],
+      });
+      window.__deleteMotionObserver = observer;
+      return true;
+    })()`);
+    if (!observerReady) throw new Error("无法监听删除动画");
+    await clickText("移入备份", ".modal-foot button");
+    await waitFor("window.__deleteMotion !== null", 3000);
+    const deleteMotion = await evaluate("window.__deleteMotion ?? ''");
+    if (!deleteMotion.includes("motion-row-out")) {
+      throw new Error(`删除收起动画未生效：${deleteMotion}`);
+    }
+    await waitFor("document.querySelector('.modal-card') === null");
+    await waitFor(`document.querySelectorAll('.mod-row').length === ${rowCount - 1}`);
+    await waitFor("document.body.innerText.includes('模组已移入备份')");
+    const removed = await evaluate(
+      `![...document.querySelectorAll(".mod-row-main > b")].some(item => item.innerText === "SCUM_WeaponPack_Elite")`,
+    );
+    if (!removed) throw new Error("删除后模组仍留在列表中");
+    await evaluate("window.__deleteMotionObserver?.disconnect?.(); true");
+    return { copy: copy.slice(0, 220), rowCountAfter: rowCount - 1, deleteMotion };
+  });
+
+  await test("中英文切换、持久化与英文窄窗布局", async () => {
+    await navigate("设置");
+    await clickText("外观与语言", ".settings-nav button");
+    await waitFor("document.querySelector('.language-options') !== null");
+    await clickText("English", ".language-options button");
+    await waitFor("document.documentElement.lang === 'en-US'");
+    await waitFor("document.querySelector('h1')?.innerText === 'Settings'");
+    const stored = await evaluate("localStorage.getItem('scum-language')");
+    if (stored !== "en-US") throw new Error(`语言未持久化：${stored}`);
+
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1100,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(200);
+    const englishSettingsLayout = await evaluate(`(() => {
+      const clipped = [...document.querySelectorAll("h1, button, input, textarea")]
+        .filter(element => {
+          const box = element.getBoundingClientRect();
+          return box.width > 0 && (box.right > innerWidth + 1 || box.left < -1);
+        })
+        .slice(0, 12)
+        .map(element => ({
+          tag: element.tagName,
+          text: (element.innerText || element.value || "").slice(0, 40),
+          className: element.className,
+        }));
+      return {
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        clipped,
+      };
+    })()`);
+    if (englishSettingsLayout.horizontalOverflow || englishSettingsLayout.clipped.length) {
+      throw new Error(`英文设置页越界：${JSON.stringify(englishSettingsLayout)}`);
+    }
+    screenshots.push(await screenshot("1100-en-settings"));
+    await clickText("Library", ".rail-button");
+    await waitFor("document.querySelector('h1')?.innerText === 'Mod Library'");
+    await wait(200);
+    const englishLayout = await evaluate(`(() => {
+      const clipped = [...document.querySelectorAll("h1, button, input, textarea")]
+        .filter(element => {
+          const box = element.getBoundingClientRect();
+          return box.width > 0 && (box.right > innerWidth + 1 || box.left < -1);
+        })
+        .slice(0, 12)
+        .map(element => ({
+          tag: element.tagName,
+          text: (element.innerText || element.value || "").slice(0, 40),
+          className: element.className,
+        }));
+      return {
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+        clipped,
+      };
+    })()`);
+    if (englishLayout.horizontalOverflow || englishLayout.clipped.length) {
+      throw new Error(`英文布局越界：${JSON.stringify(englishLayout)}`);
+    }
+    screenshots.push(await screenshot("1100-en-library"));
+    const selectedConflict = await evaluate(`(() => {
+      const row = [...document.querySelectorAll(".mod-row")]
+        .find(item => item.querySelector(".mod-conflict-pill.has-conflict, .mod-conflict-pill.is-full"));
+      if (!row) return false;
+      row.click();
+      return true;
+    })()`);
+    if (!selectedConflict) throw new Error("英文界面找不到冲突详情入口");
+    await waitFor("document.querySelector('.conflict-health-trigger') !== null");
+    await evaluate("document.querySelector('.conflict-health-trigger')?.click()");
+    await waitFor("document.querySelector('#modal-title')?.innerText === 'Override relationships'");
+    const englishConflict = await evaluate(`(() => {
+      const dialog = document.querySelector(".modal-card");
+      const rect = dialog?.getBoundingClientRect();
+      return {
+        groups: document.querySelectorAll(".conflict-group").length,
+        choices: document.querySelectorAll(".conflict-choice").length,
+        dialogInsideViewport: Boolean(rect && rect.left >= 0 && rect.right <= innerWidth + 1),
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+      };
+    })()`);
+    if (
+      englishConflict.groups < 1 ||
+      englishConflict.choices < 2 ||
+      !englishConflict.dialogInsideViewport ||
+      englishConflict.horizontalOverflow
+    ) {
+      throw new Error(`英文冲突弹层异常：${JSON.stringify(englishConflict)}`);
+    }
+    screenshots.push(await screenshot("1100-en-conflict"));
+    await clickText("Cancel", ".modal-foot button");
+    await waitFor("document.querySelector('.conflict-panel') === null");
+
+    await clickText("Settings", ".rail-button");
+    await waitFor("document.querySelector('h1')?.innerText === 'Settings'");
+    await clickText("Look & language", ".settings-nav button");
+    await waitFor("document.querySelector('.language-options') !== null");
+    await clickText("简体中文", ".language-options button");
+    await waitFor("document.documentElement.lang === 'zh-CN'");
+    await waitFor("document.querySelector('h1')?.innerText === '设置'");
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1440,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    return { stored, englishLayout };
+  });
+
+  await test("1100x720 所有页面无横向溢出", async () => {
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 1100,
+      height: 720,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await wait(250);
+    const report = {};
+    for (const [label, page] of [
+      ["模组库", "library"],
+      ["云端", "cloud"],
+      ["服务器", "server"],
+      ["备份找回", "backups"],
+      ["日志", "logs"],
+      ["设置", "settings"],
+    ]) {
+      await navigate(label);
+      if (page === "library") {
+        await clickText("冲突模组");
+        await waitFor("document.querySelector('.conflict-merge-strip') !== null");
+        await wait(240);
+      }
+      const info = await layout();
+      if (info.horizontalOverflow || info.clipped.length) {
+        throw new Error(`${page} 越界：${JSON.stringify(info)}`);
+      }
+      report[page] = info;
+      if (page === "library") {
+        screenshots.push(await screenshot("1100-light-conflicts"));
+      }
+      if (page === "backups") {
+        screenshots.push(await screenshot("1100-light-backups"));
+      }
+    }
+    screenshots.push(await screenshot("1100-light-settings"));
+    return report;
+  });
+
+  await test("窄窗 980x640 与 800x640 标题栏三控件始终可见", async () => {
+    const report = {};
+    for (const [width, height] of [
+      [980, 640],
+      [800, 640],
+    ]) {
+      await send("Emulation.setDeviceMetricsOverride", {
+        width,
+        height,
+        deviceScaleFactor: 1,
+        mobile: false,
+      });
+      await wait(250);
+      const info = await layout();
+      for (const label of ["最小化", "最大化", "关闭"]) {
+        const rect = info.controls[label];
+        if (!rect || rect.width < 20 || rect.height < 20 || rect.right > width + 1) {
+          throw new Error(`${width}x${height} ${label}：${JSON.stringify(rect)}`);
+        }
+      }
+      if (info.horizontalOverflow) throw new Error(`${width}x${height} 横向溢出`);
+      report[`${width}x${height}`] = info;
+      screenshots.push(await screenshot(`${width}-title-controls`));
+    }
+    return report;
+  });
+
+  await test("窄窗 980x640 启动条不溢出", async () => {
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: 980,
+      height: 640,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await navigate("模组库");
+    await waitFor("document.querySelector('.launch-strip') !== null");
+    const strip = await evaluate(`(() => {
+      const el = document.querySelector(".launch-strip");
+      const primary = document.querySelector(".launch-primary");
+      const state = document.querySelector(".strip-state b");
+      const rect = primary.getBoundingClientRect();
+      const stripRect = el.getBoundingClientRect();
+      return {
+        overflow: el.scrollWidth > el.clientWidth + 1,
+        primaryInside: rect.right <= stripRect.right - 8,
+        primaryText: primary.innerText.trim(),
+        stateText: state.innerText.trim(),
+      };
+    })()`);
+    if (strip.overflow) throw new Error(`启动条溢出：${JSON.stringify(strip)}`);
+    if (!strip.primaryInside) throw new Error(`主按钮越界：${JSON.stringify(strip)}`);
+    screenshots.push(await screenshot("980-library"));
+    return strip;
+  });
+
+  await test("减弱动效偏好生效", async () => {
+    await send("Emulation.setEmulatedMedia", {
+      features: [{ name: "prefers-reduced-motion", value: "reduce" }],
+    });
+    await wait(100);
+    const durations = await evaluate(`(() => {
+      const page = getComputedStyle(document.querySelector(".page-transition"));
+      const button = getComputedStyle(document.querySelector("button"));
+      return {
+        pageAnimation: page.animationDuration,
+        pageTransition: page.transitionDuration,
+        buttonTransition: button.transitionDuration,
+      };
+    })()`);
+    if (
+      ![
+        durations.pageAnimation,
+        durations.pageTransition,
+        durations.buttonTransition,
+      ].every(value => value === "0s" || parseFloat(value) <= 0.00002)
+    ) {
+      throw new Error(`减弱动效未生效：${JSON.stringify(durations)}`);
+    }
+    await send("Emulation.setEmulatedMedia", { features: [] });
+    return durations;
+  });
+
+  await send("Emulation.setDeviceMetricsOverride", {
+    width: 1440,
+    height: 900,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  await wait(150);
+  const report = {
+    generatedAt: new Date().toISOString(),
+    viewport: "1440x900 / 1100x720 / 980x640 / 800x640",
+    results,
+    runtimeErrors,
+    consoleErrors,
+    pageErrors,
+    screenshots,
+    passed: results.filter(item => item.status === "PASS").length,
+    failed: results.filter(item => item.status === "FAIL").length,
+  };
+  fs.writeFileSync(
+    path.join(outDir, "functional-report.json"),
+    JSON.stringify(report, null, 2),
+  );
+  return report;
+}
+
+let report = null;
+try {
+  const previewPort = await freePort();
+  const debugPort = await freePort();
+  const appUrl = `http://127.0.0.1:${previewPort}/`;
+  const preview = spawn(
+    process.execPath,
+    [
+      path.join(root, "node_modules", "vite", "bin", "vite.js"),
+      "preview",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(previewPort),
+      "--strictPort",
+    ],
+    {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  children.push(preview);
+  let previewError = "";
+  preview.stderr.on("data", chunk => {
+    previewError += chunk.toString();
+  });
+  await waitForHttp(appUrl);
+
+  browserProfile = fs.mkdtempSync(path.join(os.tmpdir(), "scum-ui-regression-"));
+  const browser = spawn(
+    browserExecutable(),
+    [
+      "--headless=new",
+      `--remote-debugging-port=${debugPort}`,
+      `--user-data-dir=${browserProfile}`,
+      "--no-first-run",
+      "--disable-gpu",
+      "--disable-extensions",
+      "--disable-background-networking",
+      appUrl,
+    ],
+    {
+      stdio: "ignore",
+      windowsHide: true,
+    },
+  );
+  children.push(browser);
+  await waitForHttp(`http://127.0.0.1:${debugPort}/json/version`);
+  const targets = await (
+    await fetch(`http://127.0.0.1:${debugPort}/json/list`)
+  ).json();
+  const target = targets.find(
+    item => item.type === "page" && item.url.startsWith(appUrl),
+  );
+  if (!target) throw new Error(`未找到应用页面。${previewError}`);
+  report = await connect(target.webSocketDebuggerUrl, appUrl);
+  console.log(
+    JSON.stringify(
+      {
+        outDir,
+        passed: report.passed,
+        failed: report.failed,
+        runtimeErrors: report.runtimeErrors,
+        consoleErrors: report.consoleErrors,
+        pageErrors: report.pageErrors,
+        failures: report.results.filter(item => item.status === "FAIL"),
+      },
+      null,
+      2,
+    ),
+  );
+  if (
+    report.failed > 0 ||
+    report.runtimeErrors.length ||
+    report.consoleErrors.length ||
+    report.pageErrors.length
+  ) {
+    process.exitCode = 1;
+  }
+} finally {
+  activeSocket?.close();
+  for (const child of children.reverse()) killTree(child);
+  if (browserProfile) {
+    await wait(500);
+    try {
+      fs.rmSync(browserProfile, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 200,
+      });
+    } catch (error) {
+      console.warn(`浏览器临时目录暂未释放：${error.message}`);
+    }
+  }
+}

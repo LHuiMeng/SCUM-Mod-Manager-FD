@@ -1,0 +1,19 @@
+{
+  "library": {
+    "title": "我的模组库",
+    "subtitle": "把模组放进这里，排序决定加载优先级。",
+    "scan": "重新扫描",
+    "import": "添加模组"
+  },
+  "launch": {
+    "start": "启动游戏"
+  },
+  "cloud": {
+    "title": "模组云盘"
+  },
+  "settings": {
+    "language": {
+      "overrideNote": "修改 app-data/locales/zh-CN.json 后重新切换语言即可生效。"
+    }
+  }
+}

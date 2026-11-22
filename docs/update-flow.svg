@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="880" viewBox="0 0 1400 880" role="img" aria-labelledby="title desc">
+  <title id="title">SCUM Mod Desk 在线更新流程</title>
+  <desc id="desc">发布机生成安装包、签名与更新清单，HTTPS 静态存储分发，客户端 Rust 检查、下载、验签并启动安装器。</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#171914" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 10 5 0 10Z" fill="#d9653d"/>
+    </marker>
+    <pattern id="grain" width="180" height="180" patternUnits="userSpaceOnUse">
+      <filter id="noise">
+        <feTurbulence type="fractalNoise" baseFrequency=".85" numOctaves="2" stitchTiles="stitch"/>
+      </filter>
+      <rect width="180" height="180" filter="url(#noise)" opacity=".035"/>
+    </pattern>
+  </defs>
+
+  <rect width="1400" height="880" fill="#e9e5da"/>
+  <rect width="1400" height="880" fill="url(#grain)"/>
+  <rect x="0" y="0" width="14" height="880" fill="#101310"/>
+
+  <g font-family="'Microsoft YaHei UI','Segoe UI',sans-serif">
+    <text x="56" y="64" fill="#75746c" font-size="15" letter-spacing="1.2">SCUM MOD DESK / RELEASE CHANNEL</text>
+    <text x="56" y="111" fill="#1a1d1a" font-size="34" font-weight="700">在线更新与签名校验链路</text>
+    <text x="56" y="143" fill="#75746c" font-size="16">发布物只通过 HTTPS 分发；客户端拒绝无签名、签名不符或版本回退的安装包。</text>
+
+    <g transform="translate(1092 42)">
+      <rect width="252" height="46" rx="23" fill="#f5f1e7" stroke="#d5cfc2"/>
+      <circle cx="25" cy="23" r="6" fill="#668b6c"/>
+      <text x="43" y="29" fill="#1a1d1a" font-size="15" font-weight="600">稳定通道 · 仅签名版本</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="56" y="194" width="292" height="420" rx="18" fill="#f5f1e7" stroke="#d2ccbf"/>
+      <rect x="56" y="194" width="292" height="52" rx="18" fill="#101310"/>
+      <rect x="56" y="228" width="292" height="18" fill="#101310"/>
+      <text x="78" y="227" fill="#f5f1e7" font-size="15" font-weight="700">01 / 发布机</text>
+
+      <g transform="translate(80 278)">
+        <rect width="244" height="72" rx="12" fill="#e9e5da"/>
+        <text x="18" y="28" fill="#1a1d1a" font-size="16" font-weight="700">tauri build</text>
+        <text x="18" y="52" fill="#75746c" font-size="13">生成 NSIS 安装包与 .sig</text>
+      </g>
+      <path d="M202 350v32" stroke="#d9653d" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(80 384)">
+        <rect width="244" height="72" rx="12" fill="#e9e5da"/>
+        <text x="18" y="28" fill="#1a1d1a" font-size="16" font-weight="700">生成 latest.json</text>
+        <text x="18" y="52" fill="#75746c" font-size="13">版本 / 说明 / URL / 签名 / 大小</text>
+      </g>
+      <path d="M202 456v32" stroke="#d9653d" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(80 490)">
+        <rect width="244" height="72" rx="12" fill="#fff4ed" stroke="#e8b8a4"/>
+        <text x="18" y="28" fill="#c95531" font-size="16" font-weight="700">发布物就绪</text>
+        <text x="18" y="52" fill="#8a5c48" font-size="13">安装包 + 签名 + 清单</text>
+      </g>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="404" y="194" width="252" height="420" rx="18" fill="#f5f1e7" stroke="#d2ccbf"/>
+      <text x="428" y="232" fill="#1a1d1a" font-size="15" font-weight="700">02 / HTTPS 存储</text>
+      <text x="428" y="256" fill="#75746c" font-size="13">R2 · CDN · 静态对象存储</text>
+
+      <g transform="translate(428 286)">
+        <rect width="204" height="54" rx="10" fill="#e9e5da"/>
+        <text x="15" y="23" fill="#1a1d1a" font-size="14" font-weight="600">stable/latest.json</text>
+        <text x="15" y="42" fill="#75746c" font-size="12">公开更新清单</text>
+      </g>
+      <g transform="translate(428 354)">
+        <rect width="204" height="54" rx="10" fill="#e9e5da"/>
+        <text x="15" y="23" fill="#1a1d1a" font-size="14" font-weight="600">releases/3.0.1/*.exe</text>
+        <text x="15" y="42" fill="#75746c" font-size="12">版本化安装包</text>
+      </g>
+      <g transform="translate(428 422)">
+        <rect width="204" height="54" rx="10" fill="#e9e5da"/>
+        <text x="15" y="23" fill="#1a1d1a" font-size="14" font-weight="600">*.exe.sig</text>
+        <text x="15" y="42" fill="#75746c" font-size="12">Tauri 更新签名</text>
+      </g>
+      <g transform="translate(428 507)">
+        <rect width="204" height="58" rx="10" fill="#eef3ed" stroke="#cbd7ca"/>
+        <circle cx="20" cy="29" r="6" fill="#668b6c"/>
+        <text x="36" y="34" fill="#4f7054" font-size="14" font-weight="600">HTTPS / 只读分发</text>
+      </g>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="724" y="194" width="300" height="420" rx="18" fill="#1c1c1c" stroke="#2d2d2d"/>
+      <text x="750" y="232" fill="#f1eee8" font-size="15" font-weight="700">03 / 客户端 Rust</text>
+      <text x="750" y="256" fill="#a8a8a8" font-size="13">前端不接触密钥与安装包</text>
+
+      <g transform="translate(748 286)">
+        <rect width="252" height="64" rx="11" fill="#262626"/>
+        <text x="16" y="25" fill="#f1eee8" font-size="14" font-weight="600">check_app_update</text>
+        <text x="16" y="46" fill="#a8a8a8" font-size="12">HTTPS 获取清单 + semver 比较</text>
+      </g>
+      <path d="M874 354v22" stroke="#e1724b" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(748 382)">
+        <rect width="252" height="64" rx="11" fill="#262626"/>
+        <text x="16" y="25" fill="#f1eee8" font-size="14" font-weight="600">下载到临时目录</text>
+        <text x="16" y="46" fill="#a8a8a8" font-size="12">显示进度，不落在模组目录</text>
+      </g>
+      <path d="M874 450v22" stroke="#e1724b" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(748 478)">
+        <rect width="252" height="76" rx="11" fill="#39251e" stroke="#71402f"/>
+        <text x="16" y="27" fill="#ffb18f" font-size="14" font-weight="700">minisign 验签</text>
+        <text x="16" y="49" fill="#d6aaa0" font-size="12">公钥匹配 + 签名版本一致</text>
+        <text x="16" y="67" fill="#d6aaa0" font-size="12">失败立即销毁下载文件</text>
+      </g>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="1064" y="194" width="280" height="420" rx="18" fill="#f5f1e7" stroke="#d2ccbf"/>
+      <text x="1088" y="232" fill="#1a1d1a" font-size="15" font-weight="700">04 / 安装与重启</text>
+      <text x="1088" y="256" fill="#75746c" font-size="13">Windows NSIS 安装器</text>
+
+      <g transform="translate(1088 286)">
+        <rect width="232" height="72" rx="12" fill="#e9e5da"/>
+        <text x="17" y="28" fill="#1a1d1a" font-size="16" font-weight="700">启动安装器</text>
+        <text x="17" y="52" fill="#75746c" font-size="13">应用主动退出</text>
+      </g>
+      <path d="M1204 358v32" stroke="#d9653d" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(1088 392)">
+        <rect width="232" height="72" rx="12" fill="#e9e5da"/>
+        <text x="17" y="28" fill="#1a1d1a" font-size="16" font-weight="700">覆盖安装</text>
+        <text x="17" y="52" fill="#75746c" font-size="13">保留用户数据与模组</text>
+      </g>
+      <path d="M1204 464v32" stroke="#d9653d" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(1088 498)">
+        <rect width="232" height="72" rx="12" fill="#fff4ed" stroke="#e8b8a4"/>
+        <text x="17" y="28" fill="#c95531" font-size="16" font-weight="700">自动重新打开</text>
+        <text x="17" y="52" fill="#8a5c48" font-size="13">进入更新后的版本</text>
+      </g>
+    </g>
+
+    <g stroke="#d9653d" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M348 404h48"/>
+      <path d="M656 404h60"/>
+      <path d="M1024 404h32"/>
+    </g>
+
+    <g transform="translate(56 666)">
+      <rect width="1288" height="160" rx="18" fill="#f5f1e7" stroke="#d2ccbf"/>
+      <text x="28" y="35" fill="#75746c" font-size="14" font-weight="600" letter-spacing=".8">信任边界</text>
+      <text x="28" y="66" fill="#1a1d1a" font-size="20" font-weight="700">私钥永远不离开发布机</text>
+
+      <g transform="translate(28 88)">
+        <rect width="270" height="48" rx="9" fill="#101310"/>
+        <text x="16" y="21" fill="#ffb18f" font-size="12" font-weight="600">secrets/update.key</text>
+        <text x="16" y="39" fill="#d1d1cb" font-size="12">Git 忽略 · 本机私钥</text>
+      </g>
+      <path d="M310 112h34" stroke="#d9653d" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(356 88)">
+        <rect width="270" height="48" rx="9" fill="#e9e5da"/>
+        <text x="16" y="21" fill="#1a1d1a" font-size="12" font-weight="600">构建时签名</text>
+        <text x="16" y="39" fill="#75746c" font-size="12">安装包 + .sig</text>
+      </g>
+      <path d="M638 112h34" stroke="#d9653d" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(684 88)">
+        <rect width="270" height="48" rx="9" fill="#e9e5da"/>
+        <text x="16" y="21" fill="#1a1d1a" font-size="12" font-weight="600">内置公钥</text>
+        <text x="16" y="39" fill="#75746c" font-size="12">只用于验证，不可签名</text>
+      </g>
+      <path d="M966 112h34" stroke="#d9653d" stroke-width="2" marker-end="url(#arrow)"/>
+      <g transform="translate(1012 88)">
+        <rect width="248" height="48" rx="9" fill="#eef3ed" stroke="#cbd7ca"/>
+        <text x="16" y="21" fill="#4f7054" font-size="12" font-weight="700">验签通过才安装</text>
+        <text x="16" y="39" fill="#668b6c" font-size="12">篡改与回退均拒绝</text>
+      </g>
+    </g>
+
+    <text x="56" y="858" fill="#8b8a82" font-size="12">发布清单必须使用 HTTPS；建议保留上一稳定版本与清单用于人工回滚。</text>
+  </g>
+</svg>
