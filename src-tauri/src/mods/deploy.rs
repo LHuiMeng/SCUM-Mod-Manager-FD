@@ -385,6 +385,7 @@ pub fn deploy_local_mods(
     );
     let enabled: Vec<&ModEntry> = canonical_mods.iter().filter(|item| item.enabled).collect();
     let has_enabled_paks = enabled.iter().any(|item| item.mod_type == "clientPak");
+    let has_enabled_ue4ss = enabled.iter().any(|item| item.mod_type == "ue4ssMod");
     let conflict_analysis = pak_scan::analyze_conflicts(&metadata, &canonical_mods);
     let merge_plan = merge_cache::create_plan(&canonical_mods, &conflict_analysis, &metadata)?;
     if merge_plan.is_none() {
@@ -406,6 +407,8 @@ pub fn deploy_local_mods(
         is_server,
         &deployment_fingerprint,
         use_links,
+        has_enabled_paks,
+        has_enabled_ue4ss,
     ) {
         return Ok(Some(deployed_at));
     }
@@ -668,12 +671,46 @@ fn reusable_deployment(
     is_server: bool,
     fingerprint: &str,
     use_links: bool,
+    has_enabled_paks: bool,
+    has_enabled_ue4ss: bool,
 ) -> Option<String> {
     let manifest = read_manifest(paths)?;
     let expected_mode = if is_server { "server" } else { "client" };
+    let deploy_root = paths
+        .root
+        .join("deployed")
+        .join(if is_server { "server" } else { "client" });
+    let pak_dir = find_pak_dir(install).unwrap_or_else(|| {
+        install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods")
+    });
+    let ue4ss_link = if is_server {
+        None
+    } else {
+        find_binaries_dir(install).map(|binaries| binaries.join("ue4ss"))
+    };
+    let mut expected_links = Vec::new();
+    if use_links && has_enabled_paks {
+        expected_links.push(pak_dir.clone());
+    }
+    if use_links && !is_server && has_enabled_ue4ss {
+        if let Some(binaries) = find_binaries_dir(install) {
+            expected_links.push(binaries.join("ue4ss"));
+        }
+    }
     if manifest.fingerprint != fingerprint
         || manifest.mode != expected_mode
         || manifest.use_links != use_links
+        || manifest.links.len() != expected_links.len()
+        || expected_links.iter().any(|expected| {
+            !manifest
+                .links
+                .iter()
+                .any(|link| same_path(Path::new(link), expected))
+        })
         || manifest
             .links
             .iter()
@@ -685,6 +722,45 @@ fn reusable_deployment(
         || manifest.files.is_empty()
     {
         return None;
+    }
+    // 清单可能来自旧版本或被异常中断，链接也可能已经不再登记在册。
+    // 复用前按“目标是否仍指向本程序部署目录”再看一次实际链接。
+    let managed_link = |link: &Path, target: &Path| {
+        crate::mods::links::is_junction(link)
+            && crate::mods::links::junction_target(link)
+                .is_some_and(|current| same_path(&current, target))
+    };
+    if !use_links
+        && (crate::mods::links::is_junction(&pak_dir)
+            || ue4ss_link
+                .as_deref()
+                .is_some_and(crate::mods::links::is_junction))
+    {
+        return None;
+    }
+    if use_links && !has_enabled_paks && managed_link(&pak_dir, &deploy_root) {
+        return None;
+    }
+    if use_links
+        && !is_server
+        && !has_enabled_ue4ss
+        && ue4ss_link
+            .as_deref()
+            .is_some_and(|link| managed_link(link, &paths.ue4ss_runtime.join("ue4ss")))
+    {
+        return None;
+    }
+    if !is_server && !has_enabled_ue4ss {
+        if let Some(binaries) = find_binaries_dir(install) {
+            let loader = binaries.join("dwmapi.dll");
+            if manifest
+                .files
+                .iter()
+                .any(|file| same_path(Path::new(file), &loader))
+            {
+                return None;
+            }
+        }
     }
     for file in &manifest.files {
         let target = Path::new(file);
@@ -2001,6 +2077,105 @@ mod tests {
             manifest_before
         );
         assert_eq!(fs::read(target).unwrap(), b"stable-pak");
+    }
+
+    #[test]
+    fn reused_pak_only_deployment_detaches_stale_ue4ss_link() {
+        let temp = TempRoot::new("deploy-reuse-pak-only-detach-ue4ss");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let pak = paths.local_mods.join("OnlyPak.pak");
+        fs::write(&pak, b"pak-content").unwrap();
+        let module = paths.ue4ss_mods.join("Script");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("main.lua"), b"print('script')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+
+        deploy_local_mods(
+            &paths,
+            &settings,
+            &[
+                mod_entry(&pak, true, "clientPak"),
+                mod_entry(&module, true, "ue4ssMod"),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(crate::mods::links::is_junction(&binaries.join("ue4ss")));
+
+        let reused = deploy_local_mods(
+            &paths,
+            &settings,
+            &[mod_entry(&pak, true, "clientPak")],
+            false,
+        )
+        .unwrap();
+
+        assert!(reused.is_some(), "PAK 部分未变化时应复用部署");
+        assert!(
+            !crate::mods::links::is_junction(&binaries.join("ue4ss")),
+            "复用 PAK 部署时也必须断开旧的 UE4SS 链接"
+        );
+        assert!(crate::mods::links::is_junction(&pak_dir));
+        assert!(pak_dir.join("000_OnlyPak.pak").is_file());
+    }
+
+    #[test]
+    fn fully_matching_link_deployment_is_still_reused() {
+        let temp = TempRoot::new("deploy-reuse-both-types");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let pak = paths.local_mods.join("Mixed.pak");
+        fs::write(&pak, b"pak-content").unwrap();
+        let module = paths.ue4ss_mods.join("Script");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("main.lua"), b"print('script')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![
+            mod_entry(&pak, true, "clientPak"),
+            mod_entry(&module, true, "ue4ssMod"),
+        ];
+
+        let first = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .unwrap();
+        let manifest_before = fs::read(&paths.deployment_manifest).unwrap();
+        let second = deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            fs::read(&paths.deployment_manifest).unwrap(),
+            manifest_before
+        );
+        assert!(crate::mods::links::is_junction(&pak_dir));
+        assert!(crate::mods::links::is_junction(&binaries.join("ue4ss")));
     }
 
     #[test]
