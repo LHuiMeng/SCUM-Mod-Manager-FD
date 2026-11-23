@@ -215,7 +215,11 @@ fn build_file_mod(
     let file_size = std::fs::metadata(path)?.len();
     let modified = std::fs::metadata(path)?.modified().unwrap_or(UNIX_EPOCH);
     let modified_at = epoch_millis(modified);
+    let is_new = !metadata.entries.contains_key(&id);
     let meta = metadata.entry_mut(&id);
+    if is_new {
+        meta.enabled = false;
+    }
     let identity_matches =
         meta.file_size == Some(file_size) && meta.modified_at == Some(modified_at);
     if let Some(error) = pak_scan::refresh_pak_cache(meta, file_size, modified_at, || {
@@ -336,7 +340,11 @@ fn build_directory_mod(
     let id = stable_id(&paths.ue4ss_mods, &file_name);
     let file_size = directory_size(path);
     let modified = std::fs::metadata(path)?.modified().unwrap_or(UNIX_EPOCH);
+    let is_new = !metadata.entries.contains_key(&id);
     let meta = metadata.entry_mut(&id);
+    if is_new {
+        meta.enabled = false;
+    }
     meta.file_size = Some(file_size);
     meta.modified_at = Some(epoch_millis(modified));
     let name = if meta.name_from_file_name {
@@ -1203,6 +1211,26 @@ mod tests {
     }
 
     #[test]
+    fn newly_scanned_mods_start_disabled() {
+        let temp = TempRoot::new();
+        let paths = test_paths(temp.path());
+        fs::write(paths.local_mods.join("Fresh.pak"), b"fresh").unwrap();
+        let module = paths.ue4ss_mods.join("FreshScript");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("main.lua"), b"print('fresh')").unwrap();
+        let mut metadata = crate::metadata::MetadataFile::default();
+
+        let mods = scan_local_mods(&paths, &mut metadata, &HashSet::new()).unwrap();
+
+        assert_eq!(mods.len(), 2);
+        assert!(
+            mods.iter().all(|item| !item.enabled),
+            "导入或扫描不能替用户启用模组"
+        );
+        assert!(metadata.entries.values().all(|entry| !entry.enabled));
+    }
+
+    #[test]
     fn follows_an_external_file_rename_and_keeps_metadata() {
         let temp = TempRoot::new();
         let paths = test_paths(temp.path());
@@ -1213,7 +1241,7 @@ mod tests {
         metadata.entry_mut(&old_id).name = Some("云端显示名".to_string());
         metadata.entry_mut(&old_id).tags = vec!["服务器".to_string()];
         metadata.entry_mut(&old_id).notes = "外部改名后仍要保留".to_string();
-        metadata.entry_mut(&old_id).enabled = false;
+        metadata.entry_mut(&old_id).enabled = true;
 
         fs::rename(
             paths.local_mods.join("Alpha.pak"),
@@ -1225,7 +1253,7 @@ mod tests {
         assert_eq!(mods.len(), 1);
         assert_eq!(mods[0].name, "Renamed On Disk");
         assert_eq!(mods[0].file_name, "Renamed On Disk.pak");
-        assert!(!mods[0].enabled);
+        assert!(mods[0].enabled, "外部改名必须保留启用状态");
         assert_eq!(mods[0].tags, vec!["服务器"]);
         assert_eq!(mods[0].notes, "外部改名后仍要保留");
         assert_ne!(mods[0].id, old_id);

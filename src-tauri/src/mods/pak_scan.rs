@@ -889,6 +889,11 @@ mod tests {
 
         let scan =
             scan_local_mods_with_diagnostics(&paths, &mut metadata, &HashSet::new()).unwrap();
+        for item in &scan.mods {
+            metadata.entry_mut(&item.id).enabled = true;
+        }
+        let scan =
+            scan_local_mods_with_diagnostics(&paths, &mut metadata, &HashSet::new()).unwrap();
 
         assert!(scan.diagnostics.is_empty(), "{:?}", scan.diagnostics);
         assert_eq!(scan.mods.len(), 2);

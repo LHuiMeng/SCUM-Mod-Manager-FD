@@ -90,7 +90,7 @@ impl AppState {
                 eprintln!("启动时回收上次部署失败：{error:#}");
             }
         }
-        let pending_links = if settings.keep_deployed_mods_on_exit {
+        let mut pending_links = if settings.keep_deployed_mods_on_exit {
             Vec::new()
         } else {
             find_pending_links(&paths, &installs)
@@ -106,6 +106,10 @@ impl AppState {
         // 只用于补显示名，失败时保持原有名称（返回 0）。
         let _ = cloud::apply_catalog_names(&paths, &mut metadata, &mut mods);
         let conflicts = refresh_conflicts(&mut metadata, &mut mods);
+        crate::mods::deploy::detach_stale_game_links(&paths, &settings, &mods);
+        if !settings.keep_deployed_mods_on_exit {
+            pending_links = find_pending_links(&paths, &installs);
+        }
         if let Err(error) = metadata::save_metadata(&paths, &metadata) {
             eprintln!("启动时保存模组元数据失败：{error:#}");
         }
@@ -304,6 +308,19 @@ impl AppState {
                 &format!("同步 UE4SS 启用状态（mods.txt / enabled.txt）失败：{error:#}"),
             );
         }
+        let settings = self.settings.lock().unwrap().clone();
+        if let Err(error) = crate::mods::deploy::detach_enabled_game_links(
+            &self.paths,
+            &settings,
+            &mods_snapshot,
+            false,
+        ) {
+            self.log(
+                "warn",
+                "deploy",
+                &format!("停用后断开游戏链接失败：{error:#}"),
+            );
+        }
         Ok(self.snapshot())
     }
 
@@ -360,6 +377,19 @@ impl AppState {
                 "warn",
                 "ue4ss",
                 &format!("同步 UE4SS 启用状态（mods.txt / enabled.txt）失败：{error:#}"),
+            );
+        }
+        let settings = self.settings.lock().unwrap().clone();
+        if let Err(error) = crate::mods::deploy::detach_enabled_game_links(
+            &self.paths,
+            &settings,
+            &mods_snapshot,
+            false,
+        ) {
+            self.log(
+                "warn",
+                "deploy",
+                &format!("停用后断开游戏链接失败：{error:#}"),
             );
         }
         self.log(
@@ -878,7 +908,10 @@ impl AppState {
         notify: impl FnMut(&ReclaimWait),
     ) -> Result<usize> {
         let settings = self.settings.lock().unwrap().clone();
-        let installs = vec![settings.scum_install_path, settings.server_install_path];
+        let installs = vec![
+            settings.scum_install_path.clone(),
+            settings.server_install_path.clone(),
+        ];
         // 链接模式下部署目录里还有硬链接与清单，先按清单回收，再断链接。
         if let Err(error) = reclaim_mods_with_wait(&self.paths, notify) {
             self.log(
@@ -920,10 +953,23 @@ impl AppState {
         if settings.keep_deployed_mods_on_exit {
             return Ok(None);
         }
-        let installs = vec![settings.scum_install_path, settings.server_install_path];
+        let installs = vec![
+            settings.scum_install_path.clone(),
+            settings.server_install_path.clone(),
+        ];
         let reclaimed = reclaim_mods_with_wait(&self.paths, notify);
         *self.pending_links.lock().unwrap() = find_pending_links(&self.paths, &installs);
         let reclaimed = reclaimed?;
+        let mods = self.mods.read().unwrap().clone();
+        if let Err(error) =
+            crate::mods::deploy::detach_enabled_game_links(&self.paths, &settings, &mods, false)
+        {
+            self.log(
+                "warn",
+                "deploy",
+                &format!("断开失效的游戏链接失败：{error:#}"),
+            );
+        }
         *self.last_deployed_at.lock().unwrap() = None;
         Ok(Some(reclaimed))
     }
@@ -1287,6 +1333,7 @@ mod tests {
             .clone();
 
         state.reorder_mods(&[beta.clone(), alpha.clone()]).unwrap();
+        state.set_mod_enabled(&alpha, true).unwrap();
         state
             .update_mod_metadata(
                 &beta,
@@ -1344,6 +1391,7 @@ mod tests {
             .iter()
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
+        state.set_mods_enabled(&ids, true).expect("先启用全部模组");
 
         let snapshot = state
             .set_mods_enabled(&ids[..2], false)
@@ -1362,6 +1410,55 @@ mod tests {
             1,
             "批量启停必须写入 mods_meta.json"
         );
+    }
+
+    #[test]
+    fn disabling_last_enabled_pak_detaches_game_link() {
+        let temp = TempRoot::new("state-disable-detaches-link");
+        let paths = temp.paths();
+        let install = paths.root.join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(install.join("SCUM").join("Binaries").join("Win64")).unwrap();
+        fs::write(paths.local_mods.join("Alpha.pak"), b"alpha").unwrap();
+        fs::write(
+            &paths.config_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "scumInstallPath": path_string(&install),
+                "useDeployLinks": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = AppState::from_paths(paths.clone()).unwrap();
+        let snapshot = state.scan(false).unwrap();
+        let id = snapshot
+            .mods
+            .iter()
+            .find(|item| item.file_name == "Alpha.pak")
+            .unwrap()
+            .id
+            .clone();
+        assert!(!snapshot.mods[0].enabled, "扫描不能替用户启用模组");
+
+        state.set_mod_enabled(&id, true).unwrap();
+        let snapshot = state.snapshot();
+        crate::mods::deploy::deploy_local_mods(&paths, &snapshot.settings, &snapshot.mods, false)
+            .unwrap()
+            .expect("启用的 PAK 应完成部署");
+        assert!(crate::mods::links::is_junction(&pak_dir));
+
+        state.set_mod_enabled(&id, false).unwrap();
+
+        assert!(
+            !crate::mods::links::is_junction(&pak_dir),
+            "最后一个启用的 PAK 停用后必须断开 ~mods 链接"
+        );
+        assert!(paths.local_mods.join("Alpha.pak").is_file());
     }
 
     #[test]

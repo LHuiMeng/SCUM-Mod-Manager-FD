@@ -384,6 +384,7 @@ pub fn deploy_local_mods(
         &crate::metadata::MetadataFile::default(),
     );
     let enabled: Vec<&ModEntry> = canonical_mods.iter().filter(|item| item.enabled).collect();
+    let has_enabled_paks = enabled.iter().any(|item| item.mod_type == "clientPak");
     let conflict_analysis = pak_scan::analyze_conflicts(&metadata, &canonical_mods);
     let merge_plan = merge_cache::create_plan(&canonical_mods, &conflict_analysis, &metadata)?;
     if merge_plan.is_none() {
@@ -431,25 +432,33 @@ pub fn deploy_local_mods(
     };
 
     reclaim_mods(paths)?;
+    detach_enabled_game_links(paths, settings, &canonical_mods, is_server)?;
     if enabled.is_empty() {
+        sync_ue4ss_state(paths, &canonical_mods)?;
         return Ok(None);
     }
-    if use_links {
-        prepare_link_layout(paths, &pak_dir, &deploy_root)?;
-    } else {
-        if crate::mods::links::is_junction(&pak_dir) {
-            // 从链接模式切回来：先把 junction 换回真实目录，再按复制模式部署。
-            crate::mods::links::remove_junction(&pak_dir)?;
+    if has_enabled_paks {
+        if use_links {
+            prepare_link_layout(paths, &pak_dir, &deploy_root)?;
+        } else {
+            if crate::mods::links::is_junction(&pak_dir) {
+                // 从链接模式切回来：先把 junction 换回真实目录，再按复制模式部署。
+                crate::mods::links::remove_junction(&pak_dir)?;
+            }
+            std::fs::create_dir_all(&pak_dir)
+                .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
         }
-        std::fs::create_dir_all(&pak_dir)
-            .with_context(|| format!("无法创建游戏模组目录 {}", pak_dir.display()))?;
     }
 
     let mut manifest = DeployedManifest {
         deployed_at: Utc::now().to_rfc3339(),
-        roots: vec![path_string(install), path_string(&deploy_root)],
+        roots: if has_enabled_paks {
+            vec![path_string(install), path_string(&deploy_root)]
+        } else {
+            vec![path_string(install)]
+        },
         use_links,
-        links: if use_links {
+        links: if use_links && has_enabled_paks {
             vec![path_string(&pak_dir)]
         } else {
             Vec::new()
@@ -867,6 +876,79 @@ fn prepare_link_layout(paths: &AppPaths, pak_dir: &Path, deployed_root: &Path) -
         )
     })?;
     Ok(())
+}
+
+fn detach_link_if_managed(link: &Path, expected_target: &Path) -> Result<()> {
+    if !crate::mods::links::is_junction(link) {
+        return Ok(());
+    }
+    if !crate::mods::links::junction_target(link)
+        .is_some_and(|target| same_path(&target, expected_target))
+    {
+        return Ok(());
+    }
+    crate::mods::links::remove_junction(link)
+        .with_context(|| format!("无法断开多余的链接 {}", link.display()))
+}
+
+/// 回收后断开不再对应任何启用模组的游戏链接。
+///
+/// 例如上次部署后用户把唯一启用的 PAK/UE4SS 全部停用，下次启动时链接不能继续留在游戏目录里。
+/// 只断本程序建立的、目标与预期部署目录一致的 junction，用户自建链接保持原样。
+pub fn detach_enabled_game_links(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    mods: &[ModEntry],
+    is_server: bool,
+) -> Result<()> {
+    let install = if is_server {
+        settings.server_install_path.trim()
+    } else {
+        settings.scum_install_path.trim()
+    };
+    if install.is_empty() {
+        return Ok(());
+    }
+    let install = Path::new(install);
+    let has_enabled_paks = mods
+        .iter()
+        .any(|item| item.enabled && item.mod_type == "clientPak");
+    let has_enabled_ue4ss = mods
+        .iter()
+        .any(|item| item.enabled && item.mod_type == "ue4ssMod");
+    let pak_dir = find_pak_dir(install).unwrap_or_else(|| {
+        install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods")
+    });
+    let deploy_root = paths
+        .root
+        .join("deployed")
+        .join(if is_server { "server" } else { "client" });
+    if !settings.use_deploy_links || !has_enabled_paks {
+        detach_link_if_managed(&pak_dir, &deploy_root)?;
+    }
+    if !is_server && (!settings.use_deploy_links || !has_enabled_ue4ss) {
+        if let Some(binaries) = find_binaries_dir(install) {
+            detach_link_if_managed(&binaries.join("ue4ss"), &paths.ue4ss_runtime.join("ue4ss"))?;
+        }
+    }
+    Ok(())
+}
+
+/// 启动扫描后清理旧版本遗留的托管链接。
+///
+/// 旧版本的元数据会把新扫描到的条目默认设成启用，即使用户从未手动打开过。
+/// 升级后的第一次启动仍可能读到这类记录；对已经没有任何启用项的类型，
+/// 先把本程序建立的 junction 断开，再让用户重新选择。
+pub fn detach_stale_game_links(paths: &AppPaths, settings: &AppSettings, mods: &[ModEntry]) {
+    for is_server in [false, true] {
+        if let Err(error) = detach_enabled_game_links(paths, settings, mods, is_server) {
+            eprintln!("启动时清理遗留游戏链接失败：{error:#}");
+        }
+    }
 }
 
 /// 只复制加载器 `dwmapi.dll`：Windows 只从 exe 同目录加载代理 DLL，这一个躲不开。
@@ -1362,6 +1444,192 @@ mod tests {
             b"pak-content"
         );
         assert!(source.is_file());
+    }
+
+    #[test]
+    fn disabled_mods_never_create_game_links() {
+        let temp = TempRoot::new("deploy-links-disabled");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let pak = paths.local_mods.join("Disabled.pak");
+        fs::write(&pak, b"disabled-pak").unwrap();
+        let module = paths.ue4ss_mods.join("DisabledScript");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("main.lua"), b"print('off')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![
+            mod_entry(&pak, false, "clientPak"),
+            mod_entry(&module, false, "ue4ssMod"),
+        ];
+
+        assert!(deploy_local_mods(&paths, &settings, &mods, false)
+            .unwrap()
+            .is_none());
+
+        assert!(!crate::mods::links::is_junction(&pak_dir));
+        assert!(!crate::mods::links::is_junction(&binaries.join("ue4ss")));
+        assert!(!binaries.join("ue4ss").exists());
+        assert!(!paths.deployment_manifest.exists());
+    }
+
+    #[test]
+    fn ue4ss_only_deployment_does_not_link_game_mods() {
+        let temp = TempRoot::new("deploy-links-ue4ss-only");
+        let paths = temp.paths();
+        write_framework_archive(&paths);
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let module = paths.ue4ss_mods.join("OnlyScript");
+        fs::create_dir_all(module.join("Scripts")).unwrap();
+        fs::write(module.join("Scripts").join("main.lua"), b"print('script')").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&module, true, "ue4ssMod")];
+
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+
+        assert!(
+            !crate::mods::links::is_junction(&pak_dir),
+            "没有启用的 PAK 时不能建立 ~mods 链接"
+        );
+        assert!(crate::mods::links::is_junction(&binaries.join("ue4ss")));
+        let manifest = read_manifest(&paths).expect("manifest should exist");
+        assert!(!manifest
+            .links
+            .iter()
+            .any(|link| super::same_path(Path::new(link), &pak_dir)));
+    }
+
+    #[test]
+    fn pak_only_deployment_does_not_link_ue4ss() {
+        let temp = TempRoot::new("deploy-links-pak-only");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let pak = paths.local_mods.join("OnlyPak.pak");
+        fs::write(&pak, b"pak-only").unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![mod_entry(&pak, true, "clientPak")];
+
+        deploy_local_mods(&paths, &settings, &mods, false).unwrap();
+
+        assert!(crate::mods::links::is_junction(&pak_dir));
+        assert!(
+            !crate::mods::links::is_junction(&binaries.join("ue4ss")),
+            "没有启用的 UE4SS 模组时不能建立 ue4ss 链接"
+        );
+        assert!(!binaries.join("ue4ss").exists());
+        let manifest = read_manifest(&paths).expect("manifest should exist");
+        assert!(!manifest
+            .links
+            .iter()
+            .any(|link| super::same_path(Path::new(link), &binaries.join("ue4ss"))));
+    }
+
+    #[test]
+    fn startup_cleanup_detaches_managed_links_for_empty_types() {
+        let temp = TempRoot::new("deploy-links-stale-cleanup");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let deploy_root = paths.root.join("deployed").join("client");
+        fs::create_dir_all(&deploy_root).unwrap();
+        fs::create_dir_all(paths.ue4ss_runtime.join("ue4ss")).unwrap();
+        crate::mods::links::create_junction(&pak_dir, &deploy_root).unwrap();
+        crate::mods::links::create_junction(
+            &binaries.join("ue4ss"),
+            &paths.ue4ss_runtime.join("ue4ss"),
+        )
+        .unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+
+        super::detach_stale_game_links(&paths, &settings, &[]);
+
+        assert!(!crate::mods::links::is_junction(&pak_dir));
+        assert!(!crate::mods::links::is_junction(&binaries.join("ue4ss")));
+        assert!(paths.ue4ss_runtime.join("ue4ss").is_dir());
+    }
+
+    #[test]
+    fn startup_cleanup_keeps_links_for_enabled_types() {
+        let temp = TempRoot::new("deploy-links-stale-keep");
+        let paths = temp.paths();
+        let install = temp.path().join("fake-scum");
+        let pak_dir = install
+            .join("SCUM")
+            .join("Content")
+            .join("Paks")
+            .join("~mods");
+        let binaries = install.join("SCUM").join("Binaries").join("Win64");
+        fs::create_dir_all(&pak_dir).unwrap();
+        fs::create_dir_all(&binaries).unwrap();
+        let deploy_root = paths.root.join("deployed").join("client");
+        fs::create_dir_all(&deploy_root).unwrap();
+        fs::create_dir_all(paths.ue4ss_runtime.join("ue4ss")).unwrap();
+        crate::mods::links::create_junction(&pak_dir, &deploy_root).unwrap();
+        crate::mods::links::create_junction(
+            &binaries.join("ue4ss"),
+            &paths.ue4ss_runtime.join("ue4ss"),
+        )
+        .unwrap();
+        let settings = AppSettings {
+            scum_install_path: path_string(&install),
+            use_deploy_links: true,
+            ..AppSettings::default()
+        };
+        let mods = vec![
+            mod_entry(&paths.local_mods.join("Enabled.pak"), true, "clientPak"),
+            mod_entry(&paths.ue4ss_mods.join("EnabledScript"), true, "ue4ssMod"),
+        ];
+
+        super::detach_stale_game_links(&paths, &settings, &mods);
+
+        assert!(crate::mods::links::is_junction(&pak_dir));
+        assert!(crate::mods::links::is_junction(&binaries.join("ue4ss")));
     }
 
     #[test]
